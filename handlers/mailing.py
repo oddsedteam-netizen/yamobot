@@ -1,8 +1,6 @@
-import asyncio
 import logging
 
 from aiogram import Router, F
-from aiogram.enums import ContentType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -30,14 +28,16 @@ class MailingFSM(StatesGroup):
 
 
 def back_to_bot_kb(bot_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")]
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")]
+        ]
+    )
 
 
 # ═══════════════ Рассылка для одного бота ═══════════════
 
-@router.callback_query(F.data.startswith("mailing_"))
+@router.callback_query(F.data.regexp(r"^mailing_\d+$"))
 async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
     bot_id = int(callback.data.split("_", 1)[1])
     user_id = callback.from_user.id
@@ -56,7 +56,7 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
                 await callback.message.edit_text(
                     f"📨 <b>Рассылка — {name}</b>\n\n"
                     f"❌ У бота нет активных пользователей.\n"
-                    f"Пользователи появятся когда нажмут /start у дочернего бота.",
+                    f"Пользователи появятся, когда нажмут /start у дочернего бота.",
                     reply_markup=back_to_bot_kb(bot_id)
                 )
             except Exception:
@@ -75,7 +75,7 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
         f"👥 Активных пользователей: <b>{len(users)}</b>\n\n"
         f"Отправь <b>сообщение для рассылки</b>.\n\n"
         f"Поддерживается:\n"
-        f"• текст (HTML-разметка)\n"
+        f"• текст (HTML)\n"
         f"• фото с подписью\n"
         f"• видео с подписью\n"
         f"• GIF\n"
@@ -105,6 +105,7 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
 
     bot_ids = [b["id"] for b in bots]
     total_users = 0
+
     for bid in bot_ids:
         users = get_child_users(bid, only_active=True)
         total_users += len(users)
@@ -115,9 +116,11 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
                 await callback.message.edit_text(
                     "📨 <b>Рассылка для всех ботов</b>\n\n"
                     "❌ Ни у одного бота нет активных пользователей.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_bots")]
-                    ])
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+                        ]
+                    )
                 )
             except Exception:
                 pass
@@ -144,9 +147,11 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
         try:
             await callback.message.edit_text(
                 text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
-                ])
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
+                    ]
+                )
             )
         except Exception:
             await callback.message.answer(text)
@@ -160,7 +165,6 @@ async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     bot_ids = data.get("mailing_bot_ids", [])
 
-    # Определяем тип контента
     media_type = ""
     media_id = ""
     text = ""
@@ -204,35 +208,43 @@ async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
         users = get_child_users(bid, only_active=True)
         total_users += len(users)
 
-    preview = text[:200] + "..." if len(text) > 200 else text
+    preview = text[:200] + "..." if text and len(text) > 200 else (text or "— без текста —")
     media_info = f"\n📎 Медиа: {media_type}" if media_type else ""
-
     cancel_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "select_all"
 
     await message.answer(
         f"📨 <b>Подтверди рассылку</b>\n\n"
         f"🤖 Ботов: <b>{len(bot_ids)}</b>\n"
-        f"👥 Получателей: <b>{total_users}</b>\n"
+        f"👥 Получателей: <b>{total_users}</b>"
         f"{media_info}\n\n"
         f"💬 Текст:\n{preview}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Отправить", callback_data="mailing_confirm")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_data)],
-        ])
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Отправить", callback_data="mailing_confirm")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_data)],
+            ]
+        )
     )
 
 
 # ═══════════════ Подтверждение и отправка ═══════════════
 
 @router.callback_query(F.data == "mailing_confirm", MailingFSM.confirm)
-async def cb_mailing_confirm(callback: CallbackQuery, state: FSMContext,
-                             child_manager: ChildManager) -> None:
+async def cb_mailing_confirm(
+    callback: CallbackQuery,
+    state: FSMContext,
+    child_manager: ChildManager
+) -> None:
     data = await state.get_data()
     bot_ids = data.get("mailing_bot_ids", [])
     mailing_text = data.get("mailing_text", "")
     media_type = data.get("mailing_media_type", "")
     media_id = data.get("mailing_media_id", "")
     await state.clear()
+
+    if not callback.message:
+        await callback.answer()
+        return
 
     status_msg = await callback.message.edit_text("📨 Рассылка запущена... ⏳")
     await callback.answer()
@@ -245,14 +257,12 @@ async def cb_mailing_confirm(callback: CallbackQuery, state: FSMContext,
         if not child_manager.is_running(bot_id):
             continue
 
-        async def progress_cb(sent, failed, total, current,
-                              _bot_id=bot_id, _bots_count=len(bot_ids)):
-            nonlocal grand_sent, grand_failed
+        async def progress_cb(sent, failed, total, current, _bot_id=bot_id):
             try:
                 pct = int(current / total * 100) if total else 0
                 await status_msg.edit_text(
                     f"📨 Рассылка...\n\n"
-                    f"🤖 Бот {_bot_id}\n"
+                    f"🤖 Бот: <code>{_bot_id}</code>\n"
                     f"📊 {pct}% ({current}/{total})\n"
                     f"✅ {sent}  ❌ {failed}"
                 )
@@ -260,23 +270,29 @@ async def cb_mailing_confirm(callback: CallbackQuery, state: FSMContext,
                 pass
 
         result = await child_manager.send_mailing(
-            bot_id, mailing_text, media_type, media_id, progress_cb
+            bot_id=bot_id,
+            text=mailing_text,
+            media_type=media_type,
+            media_id=media_id,
+            progress_callback=progress_cb
         )
 
         grand_sent += result["sent"]
         grand_failed += result["failed"]
         grand_total += result["total"]
 
-    back_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "back_main"
+    back_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "select_all"
 
     await status_msg.edit_text(
         f"📨 <b>Рассылка завершена!</b>\n\n"
-        f"🤖 Ботов: {len(bot_ids)}\n"
-        f"👥 Всего получателей: {grand_total}\n\n"
+        f"🤖 Ботов: <b>{len(bot_ids)}</b>\n"
+        f"👥 Всего получателей: <b>{grand_total}</b>\n\n"
         f"✅ Доставлено: <b>{grand_sent}</b>\n"
         f"❌ Не доставлено: <b>{grand_failed}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_data)],
-        ])
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_data)],
+            ]
+        )
     )

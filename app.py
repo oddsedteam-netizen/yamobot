@@ -26,6 +26,7 @@ def load_token() -> str:
         load_dotenv(dotenv_path=ENV_PATH, override=True, encoding="utf-8-sig")
 
     token = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
+    owner_id = os.getenv("OWNER_ID", "").strip()
 
     if not token:
         raise RuntimeError(

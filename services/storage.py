@@ -1,6 +1,7 @@
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
@@ -26,16 +27,16 @@ def ensure_db() -> None:
     conn = _get_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS bots (
-            id          INTEGER PRIMARY KEY,
-            owner_id    INTEGER NOT NULL,
-            token       TEXT NOT NULL,
-            username    TEXT DEFAULT '',
-            first_name  TEXT DEFAULT '',
+            id           INTEGER PRIMARY KEY,
+            owner_id     INTEGER NOT NULL,
+            token        TEXT NOT NULL,
+            username     TEXT DEFAULT '',
+            first_name   TEXT DEFAULT '',
             welcome_text TEXT DEFAULT '',
-            links       TEXT DEFAULT '[]',
-            stopped     INTEGER DEFAULT 0,
+            links        TEXT DEFAULT '[]',
+            stopped      INTEGER DEFAULT 0,
             antispam_mode TEXT DEFAULT 'off',
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS users (
@@ -67,6 +68,43 @@ def ensure_db() -> None:
             failed      INTEGER DEFAULT 0,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS admins (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            tag         TEXT NOT NULL,
+            active      INTEGER DEFAULT 1,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_tag_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            admin_user_id INTEGER NOT NULL,
+            old_tag     TEXT DEFAULT '',
+            new_tag     TEXT NOT NULL,
+            changed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            admin_user_id INTEGER NOT NULL,
+            direction   TEXT DEFAULT 'out',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS coowners (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id    INTEGER NOT NULL,
+            coowner_id  INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_id, coowner_id)
+        );
     """)
     conn.commit()
 
@@ -81,6 +119,31 @@ def get_user_bots(user_id: int) -> list[dict]:
         "SELECT * FROM bots WHERE owner_id = ?", (user_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_accessible_bots(user_id: int) -> list[dict]:
+    """Боты владельца + боты тех, кто добавил user_id как совладельца."""
+    conn = _get_conn()
+    own = conn.execute("SELECT * FROM bots WHERE owner_id = ?", (user_id,)).fetchall()
+
+    co_owners = conn.execute(
+        "SELECT owner_id FROM coowners WHERE coowner_id = ?", (user_id,)
+    ).fetchall()
+
+    result = [dict(r) for r in own]
+    for co in co_owners:
+        co_bots = conn.execute(
+            "SELECT * FROM bots WHERE owner_id = ?", (co["owner_id"],)
+        ).fetchall()
+        result.extend([dict(r) for r in co_bots])
+
+    seen = set()
+    unique = []
+    for b in result:
+        if b["id"] not in seen:
+            seen.add(b["id"])
+            unique.append(b)
+    return unique
 
 
 def add_user_bot(user_id: int, bot_info: dict) -> None:
@@ -102,8 +165,7 @@ def add_user_bot(user_id: int, bot_info: dict) -> None:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (bot_info["id"], user_id, bot_info["token"],
                  bot_info.get("username", ""), bot_info.get("first_name", ""),
-                 bot_info.get("welcome_text", ""), json.dumps(bot_info.get("links", [])),
-                 0)
+                 bot_info.get("welcome_text", ""), json.dumps(bot_info.get("links", [])), 0)
             )
         conn.commit()
 
@@ -111,22 +173,28 @@ def add_user_bot(user_id: int, bot_info: dict) -> None:
 def remove_user_bot(user_id: int, bot_id: int) -> bool:
     conn = _get_conn()
     with _lock:
-        cur = conn.execute(
-            "DELETE FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id)
-        )
+        cur = conn.execute("DELETE FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id))
         conn.execute("DELETE FROM users WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM stats WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM mailings WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM admins WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM admin_tag_history WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM admin_messages WHERE bot_id = ?", (bot_id,))
         conn.commit()
         return cur.rowcount > 0
 
 
 def get_bot_by_id(user_id: int, bot_id: int) -> dict | None:
     conn = _get_conn()
-    row = conn.execute(
-        "SELECT * FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id)
-    ).fetchone()
-    return dict(row) if row else None
+    row = conn.execute("SELECT * FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id)).fetchone()
+    if row:
+        return dict(row)
+    co = conn.execute("SELECT owner_id FROM coowners WHERE coowner_id = ?", (user_id,)).fetchall()
+    for c in co:
+        row = conn.execute("SELECT * FROM bots WHERE id = ? AND owner_id = ?", (bot_id, c["owner_id"])).fetchone()
+        if row:
+            return dict(row)
+    return None
 
 
 def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
@@ -138,10 +206,7 @@ def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
 def update_bot_field(user_id: int, bot_id: int, field: str, value) -> bool:
     conn = _get_conn()
     with _lock:
-        cur = conn.execute(
-            f"UPDATE bots SET {field} = ? WHERE id = ? AND owner_id = ?",
-            (value, bot_id, user_id)
-        )
+        cur = conn.execute(f"UPDATE bots SET {field} = ? WHERE id = ?", (value, bot_id))
         conn.commit()
         return cur.rowcount > 0
 
@@ -193,34 +258,23 @@ def add_child_user(bot_id: int, chat_id: int, username: str = "", first_name: st
 def mark_user_blocked(bot_id: int, chat_id: int) -> None:
     conn = _get_conn()
     with _lock:
-        conn.execute(
-            "UPDATE users SET blocked = 1 WHERE bot_id = ? AND chat_id = ?",
-            (bot_id, chat_id)
-        )
+        conn.execute("UPDATE users SET blocked = 1 WHERE bot_id = ? AND chat_id = ?", (bot_id, chat_id))
         conn.commit()
 
 
 def get_child_users(bot_id: int, only_active: bool = True) -> list[dict]:
     conn = _get_conn()
     if only_active:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE bot_id = ? AND blocked = 0", (bot_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM users WHERE bot_id = ? AND blocked = 0", (bot_id,)).fetchall()
     else:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE bot_id = ?", (bot_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM users WHERE bot_id = ?", (bot_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_child_users_count(bot_id: int) -> dict:
     conn = _get_conn()
-    total = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE bot_id = ?", (bot_id,)
-    ).fetchone()[0]
-    blocked = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE bot_id = ? AND blocked = 1", (bot_id,)
-    ).fetchone()[0]
+    total = conn.execute("SELECT COUNT(*) FROM users WHERE bot_id = ?", (bot_id,)).fetchone()[0]
+    blocked = conn.execute("SELECT COUNT(*) FROM users WHERE bot_id = ? AND blocked = 1", (bot_id,)).fetchone()[0]
     return {"total": total, "blocked": blocked, "active": total - blocked}
 
 
@@ -231,17 +285,14 @@ def get_child_users_count(bot_id: int) -> dict:
 def add_stat(bot_id: int, event: str, count: int = 1) -> None:
     conn = _get_conn()
     with _lock:
-        conn.execute(
-            "INSERT INTO stats (bot_id, event, count) VALUES (?, ?, ?)",
-            (bot_id, event, count)
-        )
+        conn.execute("INSERT INTO stats (bot_id, event, count) VALUES (?, ?, ?)", (bot_id, event, count))
         conn.commit()
 
 
 def get_stats(bot_id: int) -> dict:
     conn = _get_conn()
 
-    def _sum(evt: str) -> int:
+    def _sum(evt):
         row = conn.execute(
             "SELECT COALESCE(SUM(count), 0) FROM stats WHERE bot_id = ? AND event = ?",
             (bot_id, evt)
@@ -249,18 +300,9 @@ def get_stats(bot_id: int) -> dict:
         return row[0]
 
     users = get_child_users_count(bot_id)
-
-    mailings_count = conn.execute(
-        "SELECT COUNT(*) FROM mailings WHERE bot_id = ?", (bot_id,)
-    ).fetchone()[0]
-
-    mailings_sent = conn.execute(
-        "SELECT COALESCE(SUM(sent), 0) FROM mailings WHERE bot_id = ?", (bot_id,)
-    ).fetchone()[0]
-
-    mailings_failed = conn.execute(
-        "SELECT COALESCE(SUM(failed), 0) FROM mailings WHERE bot_id = ?", (bot_id,)
-    ).fetchone()[0]
+    mailings_count = conn.execute("SELECT COUNT(*) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
+    mailings_sent = conn.execute("SELECT COALESCE(SUM(sent), 0) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
+    mailings_failed = conn.execute("SELECT COALESCE(SUM(failed), 0) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
 
     return {
         "users_total": users["total"],
@@ -291,13 +333,11 @@ def get_all_stats(bot_ids: list[int]) -> dict:
 #  Рассылки
 # ═══════════════════════════════════════════════════════════
 
-def save_mailing(bot_id: int, text: str, media_type: str, media_id: str,
-                 sent: int, failed: int) -> None:
+def save_mailing(bot_id: int, text: str, media_type: str, media_id: str, sent: int, failed: int) -> None:
     conn = _get_conn()
     with _lock:
         conn.execute(
-            "INSERT INTO mailings (bot_id, text, media_type, media_id, sent, failed) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mailings (bot_id, text, media_type, media_id, sent, failed) VALUES (?, ?, ?, ?, ?, ?)",
             (bot_id, text, media_type, media_id, sent, failed)
         )
         conn.commit()
@@ -309,11 +349,187 @@ def save_mailing(bot_id: int, text: str, media_type: str, media_id: str,
 
 def get_antispam_mode(bot_id: int) -> str:
     conn = _get_conn()
-    row = conn.execute(
-        "SELECT antispam_mode FROM bots WHERE id = ?", (bot_id,)
-    ).fetchone()
+    row = conn.execute("SELECT antispam_mode FROM bots WHERE id = ?", (bot_id,)).fetchone()
     return row[0] if row else "off"
 
 
 def set_antispam_mode(user_id: int, bot_id: int, mode: str) -> bool:
     return update_bot_field(user_id, bot_id, "antispam_mode", mode)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Админы
+# ═══════════════════════════════════════════════════════════
+
+def add_admin(bot_id: int, user_id: int, username: str, tag: str) -> bool:
+    conn = _get_conn()
+    with _lock:
+        try:
+            conn.execute(
+                "INSERT INTO admins (bot_id, user_id, username, tag) VALUES (?, ?, ?, ?)",
+                (bot_id, user_id, username, tag)
+            )
+            conn.execute(
+                "INSERT INTO admin_tag_history (bot_id, admin_user_id, old_tag, new_tag) VALUES (?, ?, ?, ?)",
+                (bot_id, user_id, "", tag)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_admin(bot_id: int, user_id: int) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_admins(bot_id: int) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM admins WHERE bot_id = ?", (bot_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_admin_by_tag(bot_id: int, tag: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM admins WHERE bot_id = ? AND tag = ?", (bot_id, tag)).fetchone()
+    return dict(row) if row else None
+
+
+def get_admin_by_user_id(bot_id: int, user_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def update_admin_tag(bot_id: int, user_id: int, new_tag: str) -> bool:
+    conn = _get_conn()
+    with _lock:
+        old = conn.execute(
+            "SELECT tag FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id)
+        ).fetchone()
+        if not old:
+            return False
+        old_tag = old[0]
+        conn.execute(
+            "UPDATE admins SET tag = ? WHERE bot_id = ? AND user_id = ?",
+            (new_tag, bot_id, user_id)
+        )
+        conn.execute(
+            "INSERT INTO admin_tag_history (bot_id, admin_user_id, old_tag, new_tag) VALUES (?, ?, ?, ?)",
+            (bot_id, user_id, old_tag, new_tag)
+        )
+        conn.commit()
+        return True
+
+
+def get_admin_tag_history(bot_id: int, user_id: int) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM admin_tag_history WHERE bot_id = ? AND admin_user_id = ? ORDER BY changed_at",
+        (bot_id, user_id)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_admin_message(bot_id: int, admin_user_id: int, direction: str = "out") -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO admin_messages (bot_id, admin_user_id, direction) VALUES (?, ?, ?)",
+            (bot_id, admin_user_id, direction)
+        )
+        conn.commit()
+
+
+def get_admin_message_stats(bot_id: int, admin_user_id: int) -> dict:
+    conn = _get_conn()
+    now = datetime.utcnow()
+
+    day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _count(since: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM admin_messages WHERE bot_id = ? AND admin_user_id = ? AND created_at >= ?",
+            (bot_id, admin_user_id, since)
+        ).fetchone()
+        return row[0]
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM admin_messages WHERE bot_id = ? AND admin_user_id = ?",
+        (bot_id, admin_user_id)
+    ).fetchone()[0]
+
+    return {
+        "total": total,
+        "day": _count(day_ago),
+        "week": _count(week_ago),
+        "month": _count(month_ago),
+    }
+
+
+def get_all_admins_stats(bot_id: int) -> list[dict]:
+    admins = get_admins(bot_id)
+    result = []
+    for a in admins:
+        stats = get_admin_message_stats(bot_id, a["user_id"])
+        result.append({
+            "admin": a,
+            "stats": stats,
+        })
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+#  Совладельцы
+# ═══════════════════════════════════════════════════════════
+
+def add_coowner(owner_id: int, coowner_id: int, username: str = "") -> bool:
+    conn = _get_conn()
+    with _lock:
+        try:
+            conn.execute(
+                "INSERT INTO coowners (owner_id, coowner_id, username) VALUES (?, ?, ?)",
+                (owner_id, coowner_id, username)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_coowner(owner_id: int, coowner_id: int) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "DELETE FROM coowners WHERE owner_id = ? AND coowner_id = ?",
+            (owner_id, coowner_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_coowners(owner_id: int) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM coowners WHERE owner_id = ?", (owner_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def is_coowner(owner_id: int, user_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id FROM coowners WHERE owner_id = ? AND coowner_id = ?",
+        (owner_id, user_id)
+    ).fetchone()
+    return row is not None
+
+
+def can_access(user_id: int, bot_owner_id: int) -> bool:
+    if user_id == bot_owner_id:
+        return True
+    return is_coowner(bot_owner_id, user_id)

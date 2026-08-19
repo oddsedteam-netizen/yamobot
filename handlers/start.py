@@ -23,6 +23,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Мои боты", callback_data="my_bots")],
             [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")],
+            [InlineKeyboardButton(text="👥 Совлад", callback_data="coowners")],
         ]
     )
 

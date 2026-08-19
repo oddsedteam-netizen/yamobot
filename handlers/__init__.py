@@ -7,6 +7,8 @@ from handlers.bot_actions import router as bot_actions_router
 from handlers.select_all import router as select_all_router
 from handlers.editor import router as editor_router
 from handlers.mailing import router as mailing_router
+from handlers.admins import router as admins_router
+from handlers.coowners import router as coowners_router
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
@@ -15,5 +17,7 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(add_bot_router)
     dp.include_router(editor_router)
     dp.include_router(mailing_router)
+    dp.include_router(admins_router)
+    dp.include_router(coowners_router)
     dp.include_router(bot_actions_router)
     dp.include_router(select_all_router)
