@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Router, F
+from aiogram.enums import ContentType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -11,7 +12,12 @@ from aiogram.types import (
     Message,
 )
 
-from services.storage import get_bot_by_id, bot_display_name
+from services.storage import (
+    get_bot_by_id,
+    get_user_bots,
+    bot_display_name,
+    get_child_users,
+)
 from services.child_manager import ChildManager
 
 router = Router()
@@ -19,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 class MailingFSM(StatesGroup):
-    waiting_chat_ids = State()
     waiting_message = State()
     confirm = State()
 
@@ -29,6 +34,8 @@ def back_to_bot_kb(bot_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")]
     ])
 
+
+# ═══════════════ Рассылка для одного бота ═══════════════
 
 @router.callback_query(F.data.startswith("mailing_"))
 async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -40,15 +47,41 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("⚠️ Бот не найден")
         return
 
-    await state.set_state(MailingFSM.waiting_chat_ids)
-    await state.update_data(mailing_bot_id=bot_id)
-
+    users = get_child_users(bot_id, only_active=True)
     name = bot_display_name(bot_info)
+
+    if not users:
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    f"📨 <b>Рассылка — {name}</b>\n\n"
+                    f"❌ У бота нет активных пользователей.\n"
+                    f"Пользователи появятся когда нажмут /start у дочернего бота.",
+                    reply_markup=back_to_bot_kb(bot_id)
+                )
+            except Exception:
+                pass
+        await callback.answer()
+        return
+
+    await state.set_state(MailingFSM.waiting_message)
+    await state.update_data(
+        mailing_bot_ids=[bot_id],
+        mailing_mode="single"
+    )
+
     text = (
         f"📨 <b>Рассылка — {name}</b>\n\n"
-        f"Отправь список chat_id через запятую или каждый с новой строки.\n\n"
-        f"Пример:\n<code>123456789\n987654321</code>\n\n"
-        f"Чтобы узнать chat_id, пользователи могут написать /start дочернему боту."
+        f"👥 Активных пользователей: <b>{len(users)}</b>\n\n"
+        f"Отправь <b>сообщение для рассылки</b>.\n\n"
+        f"Поддерживается:\n"
+        f"• текст (HTML-разметка)\n"
+        f"• фото с подписью\n"
+        f"• видео с подписью\n"
+        f"• GIF\n"
+        f"• документ\n"
+        f"• стикер\n"
+        f"• премиум-эмодзи"
     )
 
     if callback.message:
@@ -59,116 +92,191 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(MailingFSM.waiting_chat_ids)
-async def fsm_chat_ids(message: Message, state: FSMContext) -> None:
-    raw = message.text or ""
-    # Парсим chat_id
-    ids = []
-    for part in raw.replace(",", "\n").split("\n"):
-        part = part.strip()
-        if part.lstrip("-").isdigit():
-            ids.append(int(part))
+# ═══════════════ Рассылка для всех ботов ═══════════════
 
-    if not ids:
-        await message.answer(
-            "❌ Не удалось распознать chat_id.\n"
-            "Отправь числа через запятую или каждый с новой строки."
-        )
+@router.callback_query(F.data == "all_mailing")
+async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    bots = get_user_bots(user_id)
+
+    if not bots:
+        await callback.answer("⚠️ Нет ботов")
         return
 
-    data = await state.get_data()
-    bot_id = data.get("mailing_bot_id")
+    bot_ids = [b["id"] for b in bots]
+    total_users = 0
+    for bid in bot_ids:
+        users = get_child_users(bid, only_active=True)
+        total_users += len(users)
 
-    await state.update_data(chat_ids=ids)
+    if total_users == 0:
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "📨 <b>Рассылка для всех ботов</b>\n\n"
+                    "❌ Ни у одного бота нет активных пользователей.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_bots")]
+                    ])
+                )
+            except Exception:
+                pass
+        await callback.answer()
+        return
+
     await state.set_state(MailingFSM.waiting_message)
-
-    await message.answer(
-        f"✅ Получено <b>{len(ids)}</b> chat_id.\n\n"
-        f"Теперь отправь <b>текст рассылки</b>.\n"
-        f"Поддерживается HTML и премиум-эмодзи.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bot_{bot_id}")]
-        ])
+    await state.update_data(
+        mailing_bot_ids=bot_ids,
+        mailing_mode="all"
     )
 
+    text = (
+        f"📨 <b>Рассылка для ВСЕХ ботов</b>\n\n"
+        f"🤖 Ботов: <b>{len(bots)}</b>\n"
+        f"👥 Всего активных пользователей: <b>{total_users}</b>\n\n"
+        f"Отправь <b>сообщение для рассылки</b>.\n\n"
+        f"Поддерживается:\n"
+        f"• текст, фото, видео, GIF, документ, стикер\n"
+        f"• премиум-эмодзи"
+    )
+
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
+                ])
+            )
+        except Exception:
+            await callback.message.answer(text)
+    await callback.answer()
+
+
+# ═══════════════ Получение сообщения для рассылки ═══════════════
 
 @router.message(MailingFSM.waiting_message)
 async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
-    mailing_text = message.html_text or message.text or ""
+    data = await state.get_data()
+    bot_ids = data.get("mailing_bot_ids", [])
 
-    if not mailing_text.strip():
-        await message.answer("❌ Текст не может быть пустым.")
+    # Определяем тип контента
+    media_type = ""
+    media_id = ""
+    text = ""
+
+    if message.photo:
+        media_type = "photo"
+        media_id = message.photo[-1].file_id
+        text = message.html_text or message.caption or ""
+    elif message.video:
+        media_type = "video"
+        media_id = message.video.file_id
+        text = message.html_text or message.caption or ""
+    elif message.animation:
+        media_type = "animation"
+        media_id = message.animation.file_id
+        text = message.html_text or message.caption or ""
+    elif message.document:
+        media_type = "document"
+        media_id = message.document.file_id
+        text = message.html_text or message.caption or ""
+    elif message.sticker:
+        media_type = "sticker"
+        media_id = message.sticker.file_id
+        text = ""
+    else:
+        text = message.html_text or message.text or ""
+
+    if not text and not media_id:
+        await message.answer("❌ Пустое сообщение. Отправь текст или медиа.")
         return
 
-    data = await state.get_data()
-    bot_id = data.get("mailing_bot_id")
-    chat_ids = data.get("chat_ids", [])
-
-    await state.update_data(mailing_text=mailing_text)
+    await state.update_data(
+        mailing_text=text,
+        mailing_media_type=media_type,
+        mailing_media_id=media_id
+    )
     await state.set_state(MailingFSM.confirm)
+
+    total_users = 0
+    for bid in bot_ids:
+        users = get_child_users(bid, only_active=True)
+        total_users += len(users)
+
+    preview = text[:200] + "..." if len(text) > 200 else text
+    media_info = f"\n📎 Медиа: {media_type}" if media_type else ""
+
+    cancel_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "select_all"
 
     await message.answer(
         f"📨 <b>Подтверди рассылку</b>\n\n"
-        f"Получателей: <b>{len(chat_ids)}</b>\n\n"
-        f"Текст:\n{mailing_text}",
+        f"🤖 Ботов: <b>{len(bot_ids)}</b>\n"
+        f"👥 Получателей: <b>{total_users}</b>\n"
+        f"{media_info}\n\n"
+        f"💬 Текст:\n{preview}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Отправить", callback_data="mailing_confirm")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bot_{bot_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_data)],
         ])
     )
 
+
+# ═══════════════ Подтверждение и отправка ═══════════════
 
 @router.callback_query(F.data == "mailing_confirm", MailingFSM.confirm)
 async def cb_mailing_confirm(callback: CallbackQuery, state: FSMContext,
                              child_manager: ChildManager) -> None:
     data = await state.get_data()
-    bot_id = data.get("mailing_bot_id")
-    chat_ids = data.get("chat_ids", [])
+    bot_ids = data.get("mailing_bot_ids", [])
     mailing_text = data.get("mailing_text", "")
+    media_type = data.get("mailing_media_type", "")
+    media_id = data.get("mailing_media_id", "")
     await state.clear()
 
-    if not child_manager.is_running(bot_id):
-        if callback.message:
-            await callback.message.edit_text(
-                "⚠️ Бот не запущен. Сначала запусти его.",
-                reply_markup=back_to_bot_kb(bot_id)
-            )
-        await callback.answer()
-        return
+    status_msg = await callback.message.edit_text("📨 Рассылка запущена... ⏳")
+    await callback.answer()
 
-    await callback.answer("📨 Рассылка запущена...")
+    grand_sent = 0
+    grand_failed = 0
+    grand_total = 0
 
-    # Отправляем
-    success = 0
-    fail = 0
+    for bot_id in bot_ids:
+        if not child_manager.is_running(bot_id):
+            continue
 
-    status_msg = await callback.message.edit_text("📨 Рассылка в процессе... 0%")
-
-    for i, chat_id in enumerate(chat_ids):
-        sent = await child_manager.send_message(bot_id, chat_id, mailing_text)
-        if sent:
-            success += 1
-        else:
-            fail += 1
-
-        # Обновляем прогресс каждые 5 сообщений
-        if (i + 1) % 5 == 0 or (i + 1) == len(chat_ids):
-            pct = int((i + 1) / len(chat_ids) * 100)
+        async def progress_cb(sent, failed, total, current,
+                              _bot_id=bot_id, _bots_count=len(bot_ids)):
+            nonlocal grand_sent, grand_failed
             try:
+                pct = int(current / total * 100) if total else 0
                 await status_msg.edit_text(
-                    f"📨 Рассылка... {pct}%\n"
-                    f"✅ {success}  ❌ {fail}"
+                    f"📨 Рассылка...\n\n"
+                    f"🤖 Бот {_bot_id}\n"
+                    f"📊 {pct}% ({current}/{total})\n"
+                    f"✅ {sent}  ❌ {failed}"
                 )
             except Exception:
                 pass
 
-        # Задержка чтобы не словить rate limit
-        await asyncio.sleep(0.05)
+        result = await child_manager.send_mailing(
+            bot_id, mailing_text, media_type, media_id, progress_cb
+        )
+
+        grand_sent += result["sent"]
+        grand_failed += result["failed"]
+        grand_total += result["total"]
+
+    back_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "back_main"
 
     await status_msg.edit_text(
         f"📨 <b>Рассылка завершена!</b>\n\n"
-        f"✅ Доставлено: {success}\n"
-        f"❌ Ошибок: {fail}\n"
-        f"📊 Всего: {len(chat_ids)}",
-        reply_markup=back_to_bot_kb(bot_id)
+        f"🤖 Ботов: {len(bot_ids)}\n"
+        f"👥 Всего получателей: {grand_total}\n\n"
+        f"✅ Доставлено: <b>{grand_sent}</b>\n"
+        f"❌ Не доставлено: <b>{grand_failed}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_data)],
+        ])
     )
