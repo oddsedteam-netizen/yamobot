@@ -533,3 +533,149 @@ def can_access(user_id: int, bot_owner_id: int) -> bool:
     if user_id == bot_owner_id:
         return True
     return is_coowner(bot_owner_id, user_id)
+
+# ═══════════════════════════════════════════════════════════
+#  Топики обратной связи
+# ═══════════════════════════════════════════════════════════
+
+def ensure_topics_table() -> None:
+    conn = _get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS feedback_chats (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            group_chat_id INTEGER NOT NULL,
+            UNIQUE(bot_id, group_chat_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_topics (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            user_chat_id    INTEGER NOT NULL,
+            group_chat_id   INTEGER NOT NULL,
+            topic_id        INTEGER NOT NULL,
+            admin_user_id   INTEGER DEFAULT 0,
+            admin_tag       TEXT DEFAULT '',
+            status          TEXT DEFAULT 'open',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, user_chat_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            topic_id        INTEGER NOT NULL,
+            group_chat_id   INTEGER NOT NULL,
+            user_chat_id    INTEGER NOT NULL,
+            direction       TEXT DEFAULT 'in',
+            group_msg_id    INTEGER DEFAULT 0,
+            user_msg_id     INTEGER DEFAULT 0,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+
+
+def set_feedback_chat(bot_id: int, group_chat_id: int) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO feedback_chats (bot_id, group_chat_id) VALUES (?, ?)",
+            (bot_id, group_chat_id)
+        )
+        conn.commit()
+
+
+def get_feedback_chat(bot_id: int) -> int | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT group_chat_id FROM feedback_chats WHERE bot_id = ?", (bot_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_topic_by_user(bot_id: int, user_chat_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM feedback_topics WHERE bot_id = ? AND user_chat_id = ?",
+        (bot_id, user_chat_id)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_topic_by_topic_id(bot_id: int, group_chat_id: int, topic_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM feedback_topics WHERE bot_id = ? AND group_chat_id = ? AND topic_id = ?",
+        (bot_id, group_chat_id, topic_id)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_topic_record(bot_id: int, user_chat_id: int, group_chat_id: int, topic_id: int) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO feedback_topics "
+            "(bot_id, user_chat_id, group_chat_id, topic_id, admin_user_id, admin_tag, status) "
+            "VALUES (?, ?, ?, ?, 0, '', 'open')",
+            (bot_id, user_chat_id, group_chat_id, topic_id)
+        )
+        conn.commit()
+
+
+def assign_admin_to_topic(bot_id: int, topic_id: int, group_chat_id: int,
+                          admin_user_id: int, admin_tag: str) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE feedback_topics SET admin_user_id = ?, admin_tag = ?, status = 'assigned' "
+            "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ?",
+            (admin_user_id, admin_tag, bot_id, topic_id, group_chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def reset_topic_admin(bot_id: int, topic_id: int, group_chat_id: int) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE feedback_topics SET admin_user_id = 0, admin_tag = '', status = 'open' "
+            "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ?",
+            (bot_id, topic_id, group_chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def save_feedback_message(bot_id: int, topic_id: int, group_chat_id: int,
+                          user_chat_id: int, direction: str,
+                          group_msg_id: int = 0, user_msg_id: int = 0) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO feedback_messages "
+            "(bot_id, topic_id, group_chat_id, user_chat_id, direction, group_msg_id, user_msg_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (bot_id, topic_id, group_chat_id, user_chat_id, direction, group_msg_id, user_msg_id)
+        )
+        conn.commit()
+
+
+def get_feedback_msg_by_group_msg(bot_id: int, group_chat_id: int, group_msg_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM feedback_messages WHERE bot_id = ? AND group_chat_id = ? AND group_msg_id = ?",
+        (bot_id, group_chat_id, group_msg_id)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_feedback_msg_by_user_msg(bot_id: int, user_chat_id: int, user_msg_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM feedback_messages WHERE bot_id = ? AND user_chat_id = ? AND user_msg_id = ?",
+        (bot_id, user_chat_id, user_msg_id)
+    ).fetchone()
+    return dict(row) if row else None
