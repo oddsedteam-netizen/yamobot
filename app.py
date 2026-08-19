@@ -21,19 +21,22 @@ logging.basicConfig(
 
 
 def load_token() -> str:
-    alt = BASE_DIR / ".env.txt"
-    if not ENV_PATH.exists():
-        if alt.exists():
-            raise RuntimeError("Найден .env.txt — переименуй в .env")
-        raise RuntimeError(f"Файл .env не найден: {ENV_PATH}")
+    # Для локального запуска можно оставить поддержку .env
+    if ENV_PATH.exists():
+        load_dotenv(dotenv_path=ENV_PATH, override=True, encoding="utf-8-sig")
 
-    load_dotenv(dotenv_path=ENV_PATH, override=True, encoding="utf-8-sig")
     token = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 
     if not token:
-        raise RuntimeError("BOT_TOKEN пуст в .env")
+        raise RuntimeError(
+            "Не найден BOT_TOKEN.\n"
+            "Для BotHost добавь переменную окружения BOT_TOKEN в панели.\n"
+            "Для локального запуска можно использовать файл .env"
+        )
+
     if ":" not in token:
         raise RuntimeError("BOT_TOKEN некорректен")
+
     return token
 
 
@@ -46,7 +49,6 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
-
     child_manager = ChildManager()
 
     dp["child_manager"] = child_manager
@@ -60,7 +62,10 @@ async def main() -> None:
         await child_manager.start_all_children()
 
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
+        )
     finally:
         await child_manager.stop_all_children()
         await bot.session.close()

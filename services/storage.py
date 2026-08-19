@@ -18,6 +18,7 @@ def load_bots() -> dict:
     _ensure_data_dir()
     if not DB_PATH.exists():
         return {}
+
     try:
         with open(DB_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -41,6 +42,7 @@ def get_user_bots(user_id: int) -> list[dict]:
 def add_user_bot(user_id: int, bot_info: dict) -> None:
     data = load_bots()
     key = str(user_id)
+
     if key not in data:
         data[key] = []
 
@@ -57,14 +59,17 @@ def add_user_bot(user_id: int, bot_info: dict) -> None:
 def remove_user_bot(user_id: int, bot_id: int) -> bool:
     data = load_bots()
     key = str(user_id)
+
     if key not in data:
         return False
 
     before = len(data[key])
     data[key] = [b for b in data[key] if b["id"] != bot_id]
+
     if len(data[key]) < before:
         save_bots(data)
         return True
+
     return False
 
 
@@ -76,6 +81,7 @@ def get_bot_by_id(user_id: int, bot_id: int) -> dict | None:
 def update_bot_field(user_id: int, bot_id: int, field: str, value) -> bool:
     data = load_bots()
     key = str(user_id)
+
     if key not in data:
         return False
 
@@ -84,18 +90,20 @@ def update_bot_field(user_id: int, bot_id: int, field: str, value) -> bool:
             b[field] = value
             save_bots(data)
             return True
+
     return False
 
 
 def get_all_bots_flat() -> list[dict]:
-    """Все боты всех юзеров — для запуска дочерок."""
     data = load_bots()
     result = []
+
     for user_id, bots in data.items():
         for b in bots:
             b_copy = dict(b)
             b_copy["owner_id"] = int(user_id)
             result.append(b_copy)
+
     return result
 
 
