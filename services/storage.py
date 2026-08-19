@@ -71,30 +71,28 @@ def ensure_db() -> None:
 
         CREATE TABLE IF NOT EXISTS admins (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id      INTEGER NOT NULL,
             user_id     INTEGER NOT NULL,
             username    TEXT DEFAULT '',
             tag         TEXT NOT NULL,
             active      INTEGER DEFAULT 1,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(bot_id, user_id)
+            UNIQUE(user_id)
         );
 
         CREATE TABLE IF NOT EXISTS admin_tag_history (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id      INTEGER NOT NULL,
-            admin_user_id INTEGER NOT NULL,
-            old_tag     TEXT DEFAULT '',
-            new_tag     TEXT NOT NULL,
-            changed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_user_id   INTEGER NOT NULL,
+            old_tag         TEXT DEFAULT '',
+            new_tag         TEXT NOT NULL,
+            changed_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS admin_messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id      INTEGER NOT NULL,
-            admin_user_id INTEGER NOT NULL,
-            direction   TEXT DEFAULT 'out',
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            admin_user_id   INTEGER NOT NULL,
+            direction       TEXT DEFAULT 'out',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS coowners (
@@ -104,6 +102,38 @@ def ensure_db() -> None:
             username    TEXT DEFAULT '',
             added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(owner_id, coowner_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_chats (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            group_chat_id   INTEGER NOT NULL,
+            UNIQUE(bot_id, group_chat_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_topics (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            user_chat_id    INTEGER NOT NULL,
+            group_chat_id   INTEGER NOT NULL,
+            topic_id        INTEGER NOT NULL,
+            admin_user_id   INTEGER DEFAULT 0,
+            admin_tag       TEXT DEFAULT '',
+            status          TEXT DEFAULT 'open',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, user_chat_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS feedback_messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id          INTEGER NOT NULL,
+            topic_id        INTEGER NOT NULL,
+            group_chat_id   INTEGER NOT NULL,
+            user_chat_id    INTEGER NOT NULL,
+            direction       TEXT DEFAULT 'in',
+            group_msg_id    INTEGER DEFAULT 0,
+            user_msg_id     INTEGER DEFAULT 0,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
     conn.commit()
@@ -115,28 +145,18 @@ def ensure_db() -> None:
 
 def get_user_bots(user_id: int) -> list[dict]:
     conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM bots WHERE owner_id = ?", (user_id,)
-    ).fetchall()
+    rows = conn.execute("SELECT * FROM bots WHERE owner_id = ?", (user_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def get_accessible_bots(user_id: int) -> list[dict]:
-    """Боты владельца + боты тех, кто добавил user_id как совладельца."""
     conn = _get_conn()
     own = conn.execute("SELECT * FROM bots WHERE owner_id = ?", (user_id,)).fetchall()
-
-    co_owners = conn.execute(
-        "SELECT owner_id FROM coowners WHERE coowner_id = ?", (user_id,)
-    ).fetchall()
-
+    co_owners = conn.execute("SELECT owner_id FROM coowners WHERE coowner_id = ?", (user_id,)).fetchall()
     result = [dict(r) for r in own]
     for co in co_owners:
-        co_bots = conn.execute(
-            "SELECT * FROM bots WHERE owner_id = ?", (co["owner_id"],)
-        ).fetchall()
+        co_bots = conn.execute("SELECT * FROM bots WHERE owner_id = ?", (co["owner_id"],)).fetchall()
         result.extend([dict(r) for r in co_bots])
-
     seen = set()
     unique = []
     for b in result:
@@ -149,10 +169,7 @@ def get_accessible_bots(user_id: int) -> list[dict]:
 def add_user_bot(user_id: int, bot_info: dict) -> None:
     conn = _get_conn()
     with _lock:
-        existing = conn.execute(
-            "SELECT id FROM bots WHERE id = ?", (bot_info["id"],)
-        ).fetchone()
-
+        existing = conn.execute("SELECT id FROM bots WHERE id = ?", (bot_info["id"],)).fetchone()
         if existing:
             conn.execute(
                 "UPDATE bots SET token=?, username=?, first_name=?, owner_id=? WHERE id=?",
@@ -177,9 +194,10 @@ def remove_user_bot(user_id: int, bot_id: int) -> bool:
         conn.execute("DELETE FROM users WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM stats WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM mailings WHERE bot_id = ?", (bot_id,))
-        conn.execute("DELETE FROM admins WHERE bot_id = ?", (bot_id,))
-        conn.execute("DELETE FROM admin_tag_history WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM admin_messages WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM feedback_chats WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM feedback_topics WHERE bot_id = ?", (bot_id,))
+        conn.execute("DELETE FROM feedback_messages WHERE bot_id = ?", (bot_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -358,20 +376,20 @@ def set_antispam_mode(user_id: int, bot_id: int, mode: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-#  Админы
+#  Админы (глобальные — привязаны ко всем ботам)
 # ═══════════════════════════════════════════════════════════
 
-def add_admin(bot_id: int, user_id: int, username: str, tag: str) -> bool:
+def add_admin(user_id: int, username: str, tag: str) -> bool:
     conn = _get_conn()
     with _lock:
         try:
             conn.execute(
-                "INSERT INTO admins (bot_id, user_id, username, tag) VALUES (?, ?, ?, ?)",
-                (bot_id, user_id, username, tag)
+                "INSERT INTO admins (user_id, username, tag) VALUES (?, ?, ?)",
+                (user_id, username, tag)
             )
             conn.execute(
-                "INSERT INTO admin_tag_history (bot_id, admin_user_id, old_tag, new_tag) VALUES (?, ?, ?, ?)",
-                (bot_id, user_id, "", tag)
+                "INSERT INTO admin_tag_history (admin_user_id, old_tag, new_tag) VALUES (?, ?, ?)",
+                (user_id, "", tag)
             )
             conn.commit()
             return True
@@ -379,58 +397,53 @@ def add_admin(bot_id: int, user_id: int, username: str, tag: str) -> bool:
             return False
 
 
-def remove_admin(bot_id: int, user_id: int) -> bool:
+def remove_admin(user_id: int) -> bool:
     conn = _get_conn()
     with _lock:
-        cur = conn.execute("DELETE FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id))
+        cur = conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
         conn.commit()
         return cur.rowcount > 0
 
 
-def get_admins(bot_id: int) -> list[dict]:
+def get_admins_all() -> list[dict]:
     conn = _get_conn()
-    rows = conn.execute("SELECT * FROM admins WHERE bot_id = ?", (bot_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM admins").fetchall()
     return [dict(r) for r in rows]
 
 
-def get_admin_by_tag(bot_id: int, tag: str) -> dict | None:
+def get_admin_by_tag(tag: str) -> dict | None:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM admins WHERE bot_id = ? AND tag = ?", (bot_id, tag)).fetchone()
+    row = conn.execute("SELECT * FROM admins WHERE tag = ?", (tag,)).fetchone()
     return dict(row) if row else None
 
 
-def get_admin_by_user_id(bot_id: int, user_id: int) -> dict | None:
+def get_admin_by_user_id(user_id: int) -> dict | None:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id)).fetchone()
+    row = conn.execute("SELECT * FROM admins WHERE user_id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
 
 
-def update_admin_tag(bot_id: int, user_id: int, new_tag: str) -> bool:
+def update_admin_tag(user_id: int, new_tag: str) -> bool:
     conn = _get_conn()
     with _lock:
-        old = conn.execute(
-            "SELECT tag FROM admins WHERE bot_id = ? AND user_id = ?", (bot_id, user_id)
-        ).fetchone()
+        old = conn.execute("SELECT tag FROM admins WHERE user_id = ?", (user_id,)).fetchone()
         if not old:
             return False
         old_tag = old[0]
+        conn.execute("UPDATE admins SET tag = ? WHERE user_id = ?", (new_tag, user_id))
         conn.execute(
-            "UPDATE admins SET tag = ? WHERE bot_id = ? AND user_id = ?",
-            (new_tag, bot_id, user_id)
-        )
-        conn.execute(
-            "INSERT INTO admin_tag_history (bot_id, admin_user_id, old_tag, new_tag) VALUES (?, ?, ?, ?)",
-            (bot_id, user_id, old_tag, new_tag)
+            "INSERT INTO admin_tag_history (admin_user_id, old_tag, new_tag) VALUES (?, ?, ?)",
+            (user_id, old_tag, new_tag)
         )
         conn.commit()
         return True
 
 
-def get_admin_tag_history(bot_id: int, user_id: int) -> list[dict]:
+def get_admin_tag_history(user_id: int) -> list[dict]:
     conn = _get_conn()
     rows = conn.execute(
-        "SELECT * FROM admin_tag_history WHERE bot_id = ? AND admin_user_id = ? ORDER BY changed_at",
-        (bot_id, user_id)
+        "SELECT * FROM admin_tag_history WHERE admin_user_id = ? ORDER BY changed_at",
+        (user_id,)
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -445,24 +458,23 @@ def add_admin_message(bot_id: int, admin_user_id: int, direction: str = "out") -
         conn.commit()
 
 
-def get_admin_message_stats(bot_id: int, admin_user_id: int) -> dict:
+def get_admin_message_stats(admin_user_id: int) -> dict:
     conn = _get_conn()
     now = datetime.utcnow()
-
     day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
     def _count(since: str) -> int:
         row = conn.execute(
-            "SELECT COUNT(*) FROM admin_messages WHERE bot_id = ? AND admin_user_id = ? AND created_at >= ?",
-            (bot_id, admin_user_id, since)
+            "SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ? AND created_at >= ?",
+            (admin_user_id, since)
         ).fetchone()
         return row[0]
 
     total = conn.execute(
-        "SELECT COUNT(*) FROM admin_messages WHERE bot_id = ? AND admin_user_id = ?",
-        (bot_id, admin_user_id)
+        "SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ?",
+        (admin_user_id,)
     ).fetchone()[0]
 
     return {
@@ -473,14 +485,25 @@ def get_admin_message_stats(bot_id: int, admin_user_id: int) -> dict:
     }
 
 
-def get_all_admins_stats(bot_id: int) -> list[dict]:
-    admins = get_admins(bot_id)
+def get_admin_active_topics(admin_user_id: int) -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM feedback_topics WHERE admin_user_id = ? AND status = 'assigned'",
+        (admin_user_id,)
+    ).fetchone()
+    return row[0]
+
+
+def get_all_admins_stats() -> list[dict]:
+    admins = get_admins_all()
     result = []
     for a in admins:
-        stats = get_admin_message_stats(bot_id, a["user_id"])
+        stats = get_admin_message_stats(a["user_id"])
+        topics = get_admin_active_topics(a["user_id"])
         result.append({
             "admin": a,
             "stats": stats,
+            "active_topics": topics,
         })
     return result
 
@@ -506,10 +529,7 @@ def add_coowner(owner_id: int, coowner_id: int, username: str = "") -> bool:
 def remove_coowner(owner_id: int, coowner_id: int) -> bool:
     conn = _get_conn()
     with _lock:
-        cur = conn.execute(
-            "DELETE FROM coowners WHERE owner_id = ? AND coowner_id = ?",
-            (owner_id, coowner_id)
-        )
+        cur = conn.execute("DELETE FROM coowners WHERE owner_id = ? AND coowner_id = ?", (owner_id, coowner_id))
         conn.commit()
         return cur.rowcount > 0
 
@@ -529,52 +549,9 @@ def is_coowner(owner_id: int, user_id: int) -> bool:
     return row is not None
 
 
-def can_access(user_id: int, bot_owner_id: int) -> bool:
-    if user_id == bot_owner_id:
-        return True
-    return is_coowner(bot_owner_id, user_id)
-
 # ═══════════════════════════════════════════════════════════
 #  Топики обратной связи
 # ═══════════════════════════════════════════════════════════
-
-def ensure_topics_table() -> None:
-    conn = _get_conn()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS feedback_chats (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id      INTEGER NOT NULL,
-            group_chat_id INTEGER NOT NULL,
-            UNIQUE(bot_id, group_chat_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS feedback_topics (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id          INTEGER NOT NULL,
-            user_chat_id    INTEGER NOT NULL,
-            group_chat_id   INTEGER NOT NULL,
-            topic_id        INTEGER NOT NULL,
-            admin_user_id   INTEGER DEFAULT 0,
-            admin_tag       TEXT DEFAULT '',
-            status          TEXT DEFAULT 'open',
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(bot_id, user_chat_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS feedback_messages (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id          INTEGER NOT NULL,
-            topic_id        INTEGER NOT NULL,
-            group_chat_id   INTEGER NOT NULL,
-            user_chat_id    INTEGER NOT NULL,
-            direction       TEXT DEFAULT 'in',
-            group_msg_id    INTEGER DEFAULT 0,
-            user_msg_id     INTEGER DEFAULT 0,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-
 
 def set_feedback_chat(bot_id: int, group_chat_id: int) -> None:
     conn = _get_conn()
@@ -588,9 +565,7 @@ def set_feedback_chat(bot_id: int, group_chat_id: int) -> None:
 
 def get_feedback_chat(bot_id: int) -> int | None:
     conn = _get_conn()
-    row = conn.execute(
-        "SELECT group_chat_id FROM feedback_chats WHERE bot_id = ?", (bot_id,)
-    ).fetchone()
+    row = conn.execute("SELECT group_chat_id FROM feedback_chats WHERE bot_id = ?", (bot_id,)).fetchone()
     return row[0] if row else None
 
 

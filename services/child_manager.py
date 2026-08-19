@@ -23,12 +23,12 @@ from services.storage import (
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
-    get_admins,
     get_admin_by_user_id,
+    get_admin_message_stats,
+    get_admin_active_topics,
     mark_user_blocked,
     save_mailing,
     get_antispam_mode,
-    ensure_topics_table,
     set_feedback_chat,
     get_feedback_chat,
     get_topic_by_user,
@@ -57,52 +57,49 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _forward_content(source_msg: Message, bot: Bot,
-                           chat_id: int, reply_to: int | None = None) -> Message | None:
-    """Пересылает любой контент от source_msg в chat_id."""
-    kwargs = {"chat_id": chat_id}
+async def _send_to_topic(source_msg: Message, bot: Bot,
+                         group_chat_id: int, topic_id: int,
+                         reply_to: int | None = None) -> Message | None:
+    kwargs = {
+        "chat_id": group_chat_id,
+        "message_thread_id": topic_id,
+    }
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
 
     try:
         if source_msg.photo:
             return await bot.send_photo(
-                **kwargs,
-                photo=source_msg.photo[-1].file_id,
+                **kwargs, photo=source_msg.photo[-1].file_id,
                 caption=source_msg.html_text or source_msg.caption or "",
             )
         elif source_msg.video:
             return await bot.send_video(
-                **kwargs,
-                video=source_msg.video.file_id,
+                **kwargs, video=source_msg.video.file_id,
                 caption=source_msg.html_text or source_msg.caption or "",
             )
         elif source_msg.animation:
             return await bot.send_animation(
-                **kwargs,
-                animation=source_msg.animation.file_id,
+                **kwargs, animation=source_msg.animation.file_id,
                 caption=source_msg.html_text or source_msg.caption or "",
             )
         elif source_msg.document:
             return await bot.send_document(
-                **kwargs,
-                document=source_msg.document.file_id,
+                **kwargs, document=source_msg.document.file_id,
                 caption=source_msg.html_text or source_msg.caption or "",
             )
         elif source_msg.sticker:
             return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
         elif source_msg.voice:
             return await bot.send_voice(
-                **kwargs,
-                voice=source_msg.voice.file_id,
+                **kwargs, voice=source_msg.voice.file_id,
                 caption=source_msg.caption or "",
             )
         elif source_msg.video_note:
             return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
         elif source_msg.audio:
             return await bot.send_audio(
-                **kwargs,
-                audio=source_msg.audio.file_id,
+                **kwargs, audio=source_msg.audio.file_id,
                 caption=source_msg.html_text or source_msg.caption or "",
             )
         else:
@@ -110,7 +107,57 @@ async def _forward_content(source_msg: Message, bot: Bot,
             if text:
                 return await bot.send_message(**kwargs, text=text)
     except Exception as e:
-        logger.error("Ошибка пересылки контента: %s", e)
+        logger.error("Ошибка отправки в топик: %s", e)
+    return None
+
+
+async def _send_to_user(source_msg: Message, bot: Bot,
+                        chat_id: int, reply_to: int | None = None) -> Message | None:
+    kwargs = {"chat_id": chat_id}
+    if reply_to:
+        kwargs["reply_to_message_id"] = reply_to
+
+    try:
+        if source_msg.photo:
+            return await bot.send_photo(
+                **kwargs, photo=source_msg.photo[-1].file_id,
+                caption=source_msg.html_text or source_msg.caption or "",
+            )
+        elif source_msg.video:
+            return await bot.send_video(
+                **kwargs, video=source_msg.video.file_id,
+                caption=source_msg.html_text or source_msg.caption or "",
+            )
+        elif source_msg.animation:
+            return await bot.send_animation(
+                **kwargs, animation=source_msg.animation.file_id,
+                caption=source_msg.html_text or source_msg.caption or "",
+            )
+        elif source_msg.document:
+            return await bot.send_document(
+                **kwargs, document=source_msg.document.file_id,
+                caption=source_msg.html_text or source_msg.caption or "",
+            )
+        elif source_msg.sticker:
+            return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
+        elif source_msg.voice:
+            return await bot.send_voice(
+                **kwargs, voice=source_msg.voice.file_id,
+                caption=source_msg.caption or "",
+            )
+        elif source_msg.video_note:
+            return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
+        elif source_msg.audio:
+            return await bot.send_audio(
+                **kwargs, audio=source_msg.audio.file_id,
+                caption=source_msg.html_text or source_msg.caption or "",
+            )
+        else:
+            text = source_msg.html_text or source_msg.text or ""
+            if text:
+                return await bot.send_message(**kwargs, text=text)
+    except Exception as e:
+        logger.error("Ошибка отправки юзеру: %s", e)
     return None
 
 
@@ -120,8 +167,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     sticker_counts: dict[int, list[float]] = defaultdict(list)
     last_message_time: dict[int, float] = {}
-
-    ensure_topics_table()
 
     # ═══════════════ /start в ЛС ═══════════════
 
@@ -143,18 +188,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         await message.answer(welcome, reply_markup=kb)
         add_stat(bot_id, "message_out")
 
-    # ═══════════════ Бот добавлен в группу ═══════════════
+    # ═══════════════ /connect в группе ═══════════════
 
     @child_dp.message(Command("connect"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
     async def cmd_connect_group(message: Message) -> None:
         chat = message.chat
         set_feedback_chat(bot_id, chat.id)
         await message.answer(
-            f"✅ Чат <b>{chat.title}</b> подключён как чат обратной связи.\n\n"
-            f"Теперь сообщения от пользователей будут создавать топики здесь."
+            f"✅ Чат <b>{chat.title}</b> подключён как чат обратной связи.\n"
+            f"Сообщения от пользователей будут создавать топики здесь."
         )
 
-    # ═══════════════ Команда /otkaz в топике ═══════════════
+    # ═══════════════ /otkaz в топике ═══════════════
 
     @child_dp.message(
         Command("otkaz"),
@@ -164,12 +209,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     async def cmd_otkaz(message: Message, thread_id: int) -> None:
         group_chat_id = message.chat.id
         topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-
         if not topic:
             return
 
         user_chat_id = topic["user_chat_id"]
-
         reset_topic_admin(bot_id, thread_id, group_chat_id)
 
         try:
@@ -191,24 +234,54 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 )]
             ])
         )
+        await message.answer("✅ Пользователю отправлено уведомление.")
 
-        await message.answer("✅ Пользователю отправлено уведомление об отказе.")
+    # ═══════════════ "кто я" в general ═══════════════
+
+    @child_dp.message(
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.text.lower() == "кто я"
+    )
+    async def cmd_who_am_i(message: Message) -> None:
+        # Только если НЕ в топике (general)
+        if message.message_thread_id:
+            return
+
+        admin = get_admin_by_user_id(message.from_user.id)
+        if not admin:
+            await message.reply("❌ Ты не зарегистрирован как админ.")
+            return
+
+        stats = get_admin_message_stats(admin["user_id"])
+        topics_count = get_admin_active_topics(admin["user_id"])
+
+        text = (
+            f"👤 <b>Твой профиль</b>\n\n"
+            f"🏷 Тег: <b>#{admin['tag']}</b>\n"
+            f"📛 Username: @{admin['username']}\n\n"
+            f"📊 <b>Сообщения:</b>\n"
+            f"  📅 День: <b>{stats['day']}</b>\n"
+            f"  📅 Неделя: <b>{stats['week']}</b>\n"
+            f"  📅 Месяц: <b>{stats['month']}</b>\n"
+            f"  📊 Всего: <b>{stats['total']}</b>\n\n"
+            f"👥 ПЗ за тобой: <b>{topics_count}</b>"
+        )
+        await message.reply(text)
 
     # ═══════════════ Callback: "я беру" ═══════════════
 
     @child_dp.callback_query(F.data.startswith("take_user_"))
     async def cb_take_user(callback: CallbackQuery) -> None:
         parts = callback.data.split("_")
-        # take_user_{topic_id}_{group_chat_id}
         topic_id = int(parts[2])
         group_chat_id = int(parts[3])
 
-        admin = get_admin_by_user_id(bot_id, callback.from_user.id)
+        admin = get_admin_by_user_id(callback.from_user.id)
 
         if admin:
             tag = admin["tag"]
         else:
-            tag = callback.from_user.first_name or callback.from_user.username or str(callback.from_user.id)
+            tag = callback.from_user.first_name or str(callback.from_user.id)
 
         assign_admin_to_topic(bot_id, topic_id, group_chat_id, callback.from_user.id, tag)
 
@@ -221,11 +294,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         except Exception as e:
             logger.warning("Не удалось переименовать топик: %s", e)
 
-        add_admin_message(bot_id, callback.from_user.id, "action")
+        if admin:
+            add_admin_message(bot_id, callback.from_user.id, "action")
 
-        await callback.message.edit_text(
-            f"✅ Админ <b>#{tag}</b> взял пользователя."
-        )
+        try:
+            await callback.message.edit_text(f"✅ Админ <b>#{tag}</b> взял пользователя.")
+        except Exception:
+            pass
         await callback.answer(f"Ты взял пользователя. Тег: #{tag}")
 
     # ═══════════════ Callback: "найти админа" ═══════════════
@@ -259,15 +334,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             ])
         )
 
-        await callback.message.edit_text("✅ Запрос отправлен. Ожидайте нового админа.")
+        try:
+            await callback.message.edit_text("✅ Запрос отправлен. Ожидайте нового админа.")
+        except Exception:
+            pass
         await callback.answer()
 
-    # ═══════════════ Callback: смена админа от юзера ═══════════════
+    # ═══════════════ Callback: подтверждение смены ═══════════════
 
     @child_dp.callback_query(F.data.startswith("confirm_change_"))
     async def cb_confirm_change(callback: CallbackQuery) -> None:
         parts = callback.data.split("_")
-        # confirm_change_yes/no_{topic_id}_{group_chat_id}
         answer = parts[2]
         topic_id = int(parts[3])
         group_chat_id = int(parts[4])
@@ -296,9 +373,15 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 ])
             )
 
-            await callback.message.edit_text("✅ Запрос на смену админа отправлен.")
+            try:
+                await callback.message.edit_text("✅ Запрос на смену админа отправлен.")
+            except Exception:
+                pass
         else:
-            await callback.message.edit_text("👌 Оставляем текущего админа.")
+            try:
+                await callback.message.edit_text("👌 Оставляем текущего админа.")
+            except Exception:
+                pass
 
         await callback.answer()
 
@@ -315,7 +398,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         user_chat_id = message.from_user.id
 
-        # Проверка "сменить админа"
+        # "сменить админа"
         if message.text and message.text.strip().lower() == "сменить админа":
             topic = get_topic_by_user(bot_id, user_chat_id)
             if topic and topic["admin_user_id"]:
@@ -346,7 +429,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if antispam == "manual":
             last = last_message_time.get(user_chat_id, 0)
             if now - last < 60:
-                await message.answer("⏳ Пожалуйста, подождите минуту перед следующим сообщением.")
+                await message.answer("⏳ Подождите минуту перед следующим сообщением.")
                 return
             last_message_time[user_chat_id] = now
 
@@ -354,20 +437,19 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             sticker_counts[user_chat_id].append(now)
             sticker_counts[user_chat_id] = [t for t in sticker_counts[user_chat_id] if now - t < 30]
             if len(sticker_counts[user_chat_id]) >= 5:
-                await message.answer("🛡 Вы отправили слишком много стикеров. Подождите.")
+                await message.answer("🛡 Слишком много стикеров.")
                 sticker_counts[user_chat_id] = []
                 return
 
-        # Получаем чат обратной связи
+        # Чат обратной связи
         group_chat_id = get_feedback_chat(bot_id)
         if not group_chat_id:
             return
 
-        # Ищем существующий топик
         topic = get_topic_by_user(bot_id, user_chat_id)
 
         if not topic:
-            # Создаём новый топик
+            # Создаём топик
             user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
             try:
                 forum_topic = await bot_obj.create_forum_topic(
@@ -381,13 +463,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
             create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
 
-            topic = get_topic_by_user(bot_id, user_chat_id)
-
-            # Пересылаем первое сообщение
-            sent = await _forward_content(message, bot_obj, group_chat_id, reply_to=None)
-
-            # Отправляем в топик
-            first_msg = await bot_obj.send_message(
+            # Инфо о юзере + кнопка "Я беру"
+            await bot_obj.send_message(
                 chat_id=group_chat_id,
                 message_thread_id=topic_id,
                 text=f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>",
@@ -399,28 +476,20 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 ])
             )
 
-            # Пересылаем контент в топик
-            forwarded = await _forward_content(message, bot_obj, group_chat_id, reply_to=None)
-
-            if forwarded:
-                # Хак: отправляем в топик через thread_id
-                try:
-                    content_msg = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
-                    if content_msg:
-                        save_feedback_message(
-                            bot_id, topic_id, group_chat_id, user_chat_id,
-                            "in", content_msg.message_id, message.message_id
-                        )
-                except Exception as e:
-                    logger.error("Ошибка отправки в топик: %s", e)
+            # Первое сообщение в топик
+            sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
+            if sent:
+                save_feedback_message(
+                    bot_id, topic_id, group_chat_id, user_chat_id,
+                    "in", sent.message_id, message.message_id
+                )
 
             add_stat(bot_id, "message_out")
             return
 
-        # Существующий топик — пересылаем сообщение
+        # Существующий топик
         topic_id = topic["topic_id"]
 
-        # Ищем reply
         reply_to_group = None
         if message.reply_to_message:
             orig = get_feedback_msg_by_user_msg(bot_id, user_chat_id, message.reply_to_message.message_id)
@@ -435,10 +504,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 "in", sent.message_id, message.message_id
             )
 
-        # Считаем сообщение админа если он назначен
-        if topic.get("admin_user_id"):
-            add_admin_message(bot_id, topic["admin_user_id"], "in")
-
     # ═══════════════ Сообщения из топика → юзеру ═══════════════
 
     @child_dp.message(
@@ -446,37 +511,32 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         F.message_thread_id.as_("thread_id")
     )
     async def group_topic_message(message: Message, thread_id: int) -> None:
-        # Игнорируем ботов и системные
         if message.from_user and message.from_user.is_bot:
             return
 
         group_chat_id = message.chat.id
         topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-
         if not topic:
             return
 
         user_chat_id = topic["user_chat_id"]
 
-        # Команда /otkaz обрабатывается отдельно
-        if message.text and message.text.startswith("/otkaz"):
+        if message.text and message.text.startswith("/"):
             return
 
         add_stat(bot_id, "message_out")
 
-        # Считаем сообщение админа
-        admin = get_admin_by_user_id(bot_id, message.from_user.id)
+        admin = get_admin_by_user_id(message.from_user.id)
         if admin:
             add_admin_message(bot_id, message.from_user.id, "out")
 
-        # Ищем reply
         reply_to_user = None
         if message.reply_to_message:
             orig = get_feedback_msg_by_group_msg(bot_id, group_chat_id, message.reply_to_message.message_id)
             if orig:
                 reply_to_user = orig["user_msg_id"]
 
-        sent = await _forward_content(message, bot_obj, user_chat_id, reply_to_user)
+        sent = await _send_to_user(message, bot_obj, user_chat_id, reply_to_user)
 
         if sent:
             save_feedback_message(
@@ -484,68 +544,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 "out", message.message_id, sent.message_id
             )
 
+    # ═══════════════ Игнорируем general ═══════════════
+
+    @child_dp.message(
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        ~F.message_thread_id
+    )
+    async def ignore_general(message: Message) -> None:
+        # Сообщения в general без thread_id — игнорируем
+        # кроме команд и "кто я" которые уже обработаны выше
+        pass
+
     return child_dp
-
-
-async def _send_to_topic(source_msg: Message, bot: Bot,
-                         group_chat_id: int, topic_id: int,
-                         reply_to: int | None = None) -> Message | None:
-    """Отправляет контент в конкретный топик."""
-    kwargs = {
-        "chat_id": group_chat_id,
-        "message_thread_id": topic_id,
-    }
-    if reply_to:
-        kwargs["reply_to_message_id"] = reply_to
-
-    try:
-        if source_msg.photo:
-            return await bot.send_photo(
-                **kwargs,
-                photo=source_msg.photo[-1].file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
-        elif source_msg.video:
-            return await bot.send_video(
-                **kwargs,
-                video=source_msg.video.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
-        elif source_msg.animation:
-            return await bot.send_animation(
-                **kwargs,
-                animation=source_msg.animation.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
-        elif source_msg.document:
-            return await bot.send_document(
-                **kwargs,
-                document=source_msg.document.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
-        elif source_msg.sticker:
-            return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
-        elif source_msg.voice:
-            return await bot.send_voice(
-                **kwargs,
-                voice=source_msg.voice.file_id,
-                caption=source_msg.caption or "",
-            )
-        elif source_msg.video_note:
-            return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
-        elif source_msg.audio:
-            return await bot.send_audio(
-                **kwargs,
-                audio=source_msg.audio.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
-        else:
-            text = source_msg.html_text or source_msg.text or ""
-            if text:
-                return await bot.send_message(**kwargs, text=text)
-    except Exception as e:
-        logger.error("Ошибка отправки в топик: %s", e)
-    return None
 
 
 class ChildManager:
@@ -571,7 +581,6 @@ class ChildManager:
             logger.info("Подключаю дочерний бот: @%s (%s)", me.username, me.id)
 
             child_dp = _make_child_dp(bot_data, child_bot)
-
             await child_bot.delete_webhook(drop_pending_updates=True)
 
             task = asyncio.create_task(
@@ -585,7 +594,6 @@ class ChildManager:
 
             logger.info("Дочерний бот @%s запущен", me.username)
             return True
-
         except Exception as e:
             logger.error("Не удалось запустить бот %s: %s", bot_id, e)
             return False
