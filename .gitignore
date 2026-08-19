@@ -1,0 +1,24 @@
+# Токен и секреты
+.env
+.env.txt
+
+# Данные ботов
+data/
+
+# Виртуальное окружение
+venv/
+
+# Python кэш
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Логи
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp

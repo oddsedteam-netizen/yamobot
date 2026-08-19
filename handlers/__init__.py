@@ -1,0 +1,19 @@
+from aiogram import Dispatcher
+
+from handlers.start import router as start_router
+from handlers.my_bots import router as my_bots_router
+from handlers.add_bot import router as add_bot_router
+from handlers.bot_actions import router as bot_actions_router
+from handlers.select_all import router as select_all_router
+from handlers.editor import router as editor_router
+from handlers.mailing import router as mailing_router
+
+
+def register_all_handlers(dp: Dispatcher) -> None:
+    dp.include_router(start_router)
+    dp.include_router(my_bots_router)
+    dp.include_router(add_bot_router)
+    dp.include_router(editor_router)
+    dp.include_router(mailing_router)
+    dp.include_router(bot_actions_router)
+    dp.include_router(select_all_router)
