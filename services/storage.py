@@ -709,6 +709,17 @@ def is_user_banned(bot_id: int, chat_id: int) -> bool:
     return bool(row and row[0])
 
 
+def unban_user(bot_id: int, chat_id: int) -> bool:
+    """Снимает бан с юзера."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE users SET blocked = 0 WHERE bot_id = ? AND chat_id = ?",
+            (bot_id, chat_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
 # ═══════════════════════════════════════════════════════════
 #  Глобальные приветствие и линки для всех ботов юзера
 # ═══════════════════════════════════════════════════════════

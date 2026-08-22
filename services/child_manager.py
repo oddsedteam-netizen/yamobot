@@ -21,6 +21,7 @@ from services.storage import (
     add_stat,
     add_admin_message,
     ban_user,
+    unban_user,
     is_user_banned,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
@@ -218,6 +219,73 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         reset_topic_admin(bot_id, thread_id, group_chat_id)
         await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> заблокирован.")
+
+    # ═══════════════ /unban в топике ═══════════════
+
+    @child_dp.message(
+        Command("unban"),
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.message_thread_id.as_("thread_id")
+    )
+    async def cmd_unban(message: Message, thread_id: int) -> None:
+        group_chat_id = message.chat.id
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
+        if not topic:
+            return
+
+        user_chat_id = topic["user_chat_id"]
+
+        # Снимаем бан
+        success = unban_user(bot_id, user_chat_id)
+        if not success:
+            await message.answer("⚠️ Пользователь не найден в базе.")
+            return
+
+        # Отправляем юзеру сообщение
+        try:
+            await bot_obj.send_message(
+                chat_id=user_chat_id,
+                text="✅ Вас разбанили в боте, можете снова писать."
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить разбан-уведомление: %s", e)
+
+        # Сбрасываем админа
+        reset_topic_admin(bot_id, thread_id, group_chat_id)
+
+        # Переименовываем топик
+        try:
+            await bot_obj.edit_forum_topic(
+                chat_id=group_chat_id,
+                message_thread_id=thread_id,
+                name="⏳ без админа"
+            )
+        except Exception:
+            pass
+
+        # Открываем топик если был закрыт
+        try:
+            await bot_obj.reopen_forum_topic(
+                chat_id=group_chat_id,
+                message_thread_id=thread_id
+            )
+        except Exception:
+            pass
+
+        # Отправляем кнопку "Я беру"
+        await bot_obj.send_message(
+            chat_id=group_chat_id,
+            message_thread_id=thread_id,
+            text=f"🔓 Пользователь <code>{user_chat_id}</code> разбанен.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✋ Я беру",
+                    callback_data=f"take_user_{thread_id}_{group_chat_id}"
+                )]
+            ])
+        )
+
+        await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> разбанен.")
 
     # ═══════════════ /otkaz в топике ═══════════════
 
