@@ -20,6 +20,8 @@ from services.storage import (
     add_child_user,
     add_stat,
     add_admin_message,
+    ban_user,
+    is_user_banned,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
@@ -60,48 +62,33 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
 async def _send_to_topic(source_msg: Message, bot: Bot,
                          group_chat_id: int, topic_id: int,
                          reply_to: int | None = None) -> Message | None:
-    kwargs = {
-        "chat_id": group_chat_id,
-        "message_thread_id": topic_id,
-    }
+    kwargs = {"chat_id": group_chat_id, "message_thread_id": topic_id}
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
 
     try:
         if source_msg.photo:
-            return await bot.send_photo(
-                **kwargs, photo=source_msg.photo[-1].file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.video:
-            return await bot.send_video(
-                **kwargs, video=source_msg.video.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_video(**kwargs, video=source_msg.video.file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.animation:
-            return await bot.send_animation(
-                **kwargs, animation=source_msg.animation.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
+                                             caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.document:
-            return await bot.send_document(
-                **kwargs, document=source_msg.document.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_document(**kwargs, document=source_msg.document.file_id,
+                                            caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.sticker:
             return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
         elif source_msg.voice:
-            return await bot.send_voice(
-                **kwargs, voice=source_msg.voice.file_id,
-                caption=source_msg.caption or "",
-            )
+            return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
+                                         caption=source_msg.caption or "")
         elif source_msg.video_note:
             return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
         elif source_msg.audio:
-            return await bot.send_audio(
-                **kwargs, audio=source_msg.audio.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         else:
             text = source_msg.html_text or source_msg.text or ""
             if text:
@@ -119,39 +106,27 @@ async def _send_to_user(source_msg: Message, bot: Bot,
 
     try:
         if source_msg.photo:
-            return await bot.send_photo(
-                **kwargs, photo=source_msg.photo[-1].file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.video:
-            return await bot.send_video(
-                **kwargs, video=source_msg.video.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_video(**kwargs, video=source_msg.video.file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.animation:
-            return await bot.send_animation(
-                **kwargs, animation=source_msg.animation.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
+                                             caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.document:
-            return await bot.send_document(
-                **kwargs, document=source_msg.document.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_document(**kwargs, document=source_msg.document.file_id,
+                                            caption=source_msg.html_text or source_msg.caption or "")
         elif source_msg.sticker:
             return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
         elif source_msg.voice:
-            return await bot.send_voice(
-                **kwargs, voice=source_msg.voice.file_id,
-                caption=source_msg.caption or "",
-            )
+            return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
+                                         caption=source_msg.caption or "")
         elif source_msg.video_note:
             return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
         elif source_msg.audio:
-            return await bot.send_audio(
-                **kwargs, audio=source_msg.audio.file_id,
-                caption=source_msg.html_text or source_msg.caption or "",
-            )
+            return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
+                                         caption=source_msg.html_text or source_msg.caption or "")
         else:
             text = source_msg.html_text or source_msg.text or ""
             if text:
@@ -166,12 +141,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     bot_id = bot_data["id"]
 
     sticker_counts: dict[int, list[float]] = defaultdict(list)
+    sticker_warnings: dict[int, bool] = defaultdict(bool)
     last_message_time: dict[int, float] = {}
 
     # ═══════════════ /start в ЛС ═══════════════
 
     @child_dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
     async def child_start(message: Message) -> None:
+        if is_user_banned(bot_id, message.from_user.id):
+            return
+
         add_child_user(
             bot_id, message.from_user.id,
             message.from_user.username or "",
@@ -195,9 +174,50 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         chat = message.chat
         set_feedback_chat(bot_id, chat.id)
         await message.answer(
-            f"✅ Чат <b>{chat.title}</b> подключён как чат обратной связи.\n"
+            f"✅ Чат <b>{chat.title}</b> подключён.\n"
             f"Сообщения от пользователей будут создавать топики здесь."
         )
+
+    # ═══════════════ /ban в топике ═══════════════
+
+    @child_dp.message(
+        Command("ban"),
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.message_thread_id.as_("thread_id")
+    )
+    async def cmd_ban(message: Message, thread_id: int) -> None:
+        group_chat_id = message.chat.id
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
+        if not topic:
+            return
+
+        user_chat_id = topic["user_chat_id"]
+        ban_user(bot_id, user_chat_id)
+
+        try:
+            await bot_obj.send_message(
+                chat_id=user_chat_id,
+                text="🚫 Вас заблокировали в данном боте навсегда. Всего доброго."
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить бан-уведомление: %s", e)
+
+        try:
+            await bot_obj.edit_forum_topic(
+                chat_id=group_chat_id, message_thread_id=thread_id, name="🚫 забанен"
+            )
+        except Exception:
+            pass
+
+        try:
+            await bot_obj.close_forum_topic(
+                chat_id=group_chat_id, message_thread_id=thread_id
+            )
+        except Exception:
+            pass
+
+        reset_topic_admin(bot_id, thread_id, group_chat_id)
+        await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> заблокирован.")
 
     # ═══════════════ /otkaz в топике ═══════════════
 
@@ -217,21 +237,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         try:
             await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id,
-                message_thread_id=thread_id,
-                name="🔄 смена админа"
+                chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
             )
-        except Exception as e:
-            logger.warning("Не удалось переименовать топик: %s", e)
+        except Exception:
+            pass
 
         await bot_obj.send_message(
             chat_id=user_chat_id,
             text="⚠️ Ваш администратор отказался от вас.\nПодобрать нового?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🔍 Найти админа",
-                    callback_data=f"find_admin_{thread_id}_{group_chat_id}"
-                )]
+                [InlineKeyboardButton(text="🔍 Найти админа",
+                                       callback_data=f"find_admin_{thread_id}_{group_chat_id}")]
             ])
         )
         await message.answer("✅ Пользователю отправлено уведомление.")
@@ -243,7 +259,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         F.text.lower() == "кто я"
     )
     async def cmd_who_am_i(message: Message) -> None:
-        # Только если НЕ в топике (general)
         if message.message_thread_id:
             return
 
@@ -277,7 +292,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         group_chat_id = int(parts[3])
 
         admin = get_admin_by_user_id(callback.from_user.id)
-
         if admin:
             tag = admin["tag"]
         else:
@@ -287,9 +301,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         try:
             await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id,
-                message_thread_id=topic_id,
-                name=f"#{tag}"
+                chat_id=group_chat_id, message_thread_id=topic_id, name=f"#{tag}"
             )
         except Exception as e:
             logger.warning("Не удалось переименовать топик: %s", e)
@@ -315,27 +327,22 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         try:
             await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id,
-                message_thread_id=topic_id,
-                name="⏳ без админа"
+                chat_id=group_chat_id, message_thread_id=topic_id, name="⏳ без админа"
             )
         except Exception:
             pass
 
         await bot_obj.send_message(
-            chat_id=group_chat_id,
-            message_thread_id=topic_id,
+            chat_id=group_chat_id, message_thread_id=topic_id,
             text="🔔 Пользователь запросил нового админа!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="✋ Я беру",
-                    callback_data=f"take_user_{topic_id}_{group_chat_id}"
-                )]
+                [InlineKeyboardButton(text="✋ Я беру",
+                                       callback_data=f"take_user_{topic_id}_{group_chat_id}")]
             ])
         )
 
         try:
-            await callback.message.edit_text("✅ Запрос отправлен. Ожидайте нового админа.")
+            await callback.message.edit_text("✅ Запрос отправлен.")
         except Exception:
             pass
         await callback.answer()
@@ -354,22 +361,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
             try:
                 await bot_obj.edit_forum_topic(
-                    chat_id=group_chat_id,
-                    message_thread_id=topic_id,
-                    name="🔄 смена админа"
+                    chat_id=group_chat_id, message_thread_id=topic_id, name="🔄 смена админа"
                 )
             except Exception:
                 pass
 
             await bot_obj.send_message(
-                chat_id=group_chat_id,
-                message_thread_id=topic_id,
+                chat_id=group_chat_id, message_thread_id=topic_id,
                 text="🔔 Пользователь запросил смену админа!",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="✋ Я беру",
-                        callback_data=f"take_user_{topic_id}_{group_chat_id}"
-                    )]
+                    [InlineKeyboardButton(text="✋ Я беру",
+                                           callback_data=f"take_user_{topic_id}_{group_chat_id}")]
                 ])
             )
 
@@ -389,6 +391,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.message(F.chat.type == ChatType.PRIVATE)
     async def private_message(message: Message) -> None:
+        if is_user_banned(bot_id, message.from_user.id):
+            return
+
         add_stat(bot_id, "message_in")
         add_child_user(
             bot_id, message.from_user.id,
@@ -398,7 +403,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         user_chat_id = message.from_user.id
 
-        # "сменить админа"
+        # Обработка "сменить админа"
         if message.text and message.text.strip().lower() == "сменить админа":
             topic = get_topic_by_user(bot_id, user_chat_id)
             if topic and topic["admin_user_id"]:
@@ -406,14 +411,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     "❓ Вы уверены, что хотите сменить админа?",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                         [
-                            InlineKeyboardButton(
-                                text="✅ Да",
-                                callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"
-                            ),
-                            InlineKeyboardButton(
-                                text="❌ Нет",
-                                callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"
-                            ),
+                            InlineKeyboardButton(text="✅ Да",
+                                                  callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
+                            InlineKeyboardButton(text="❌ Нет",
+                                                  callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
                         ]
                     ])
                 )
@@ -422,26 +423,67 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 await message.answer("У вас сейчас нет назначенного админа.")
                 return
 
-        # Антиспам
+        # Настройки антиспама
         now = time.time()
         antispam = get_antispam_mode(bot_id)
 
         if antispam == "manual":
             last = last_message_time.get(user_chat_id, 0)
             if now - last < 60:
-                await message.answer("⏳ Подождите минуту перед следующим сообщением.")
+                await message.answer("⏳ Подождите минуту.")
                 return
             last_message_time[user_chat_id] = now
 
-        if antispam == "auto" and message.content_type == ContentType.STICKER:
-            sticker_counts[user_chat_id].append(now)
-            sticker_counts[user_chat_id] = [t for t in sticker_counts[user_chat_id] if now - t < 30]
-            if len(sticker_counts[user_chat_id]) >= 5:
-                await message.answer("🛡 Слишком много стикеров.")
-                sticker_counts[user_chat_id] = []
-                return
+        # Авто-антиспам (с предупреждением и блокировкой)
+        if antispam == "auto":
+            if message.content_type == ContentType.STICKER:
+                sticker_counts[user_chat_id].append(now)
+                sticker_counts[user_chat_id] = [t for t in sticker_counts[user_chat_id] if now - t < 30]
 
-        # Чат обратной связи
+                has_warning = sticker_warnings[user_chat_id]
+
+                if len(sticker_counts[user_chat_id]) >= 5:
+                    if not has_warning:
+                        # Этап 1: Предупреждение
+                        sticker_warnings[user_chat_id] = True
+                        sticker_counts[user_chat_id] = []  # Очищаем счётчик для отслеживания следующих 5 стикеров
+                        await message.answer(
+                            "⚠️ <b>Предупреждение!</b>\n\n"
+                            "Пожалуйста, прекратите спам стикерами. "
+                            "Если вы отправите ещё 5 стикеров подряд, вы будете заблокированы навсегда!"
+                        )
+                        return
+                    else:
+                        # Этап 2: Бан навсегда
+                        ban_user(bot_id, user_chat_id)
+                        sticker_counts[user_chat_id] = []
+                        sticker_warnings[user_chat_id] = False
+
+                        try:
+                            await message.answer("🚫 Вас заблокировали в данном боте навсегда. Всего доброго.")
+                        except Exception:
+                            pass
+
+                        # Находим топик и закрываем его с плашкой "бан спам"
+                        topic = get_topic_by_user(bot_id, user_chat_id)
+                        if topic:
+                            g_id = topic["group_chat_id"]
+                            t_id = topic["topic_id"]
+                            reset_topic_admin(bot_id, t_id, g_id)
+                            try:
+                                await bot_obj.edit_forum_topic(
+                                    chat_id=g_id, message_thread_id=t_id, name="🚫 бан спам"
+                                )
+                                await bot_obj.close_forum_topic(
+                                    chat_id=g_id, message_thread_id=t_id
+                                )
+                            except Exception:
+                                pass
+                        return
+            else:
+                # Если отправлен текст — сбрасываем контигуальный счетчик стикеров
+                sticker_counts[user_chat_id] = []
+
         group_chat_id = get_feedback_chat(bot_id)
         if not group_chat_id:
             return
@@ -449,12 +491,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         topic = get_topic_by_user(bot_id, user_chat_id)
 
         if not topic:
-            # Создаём топик
             user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
             try:
                 forum_topic = await bot_obj.create_forum_topic(
-                    chat_id=group_chat_id,
-                    name="⏳ без админа"
+                    chat_id=group_chat_id, name="⏳ без админа"
                 )
                 topic_id = forum_topic.message_thread_id
             except Exception as e:
@@ -463,31 +503,23 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
             create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
 
-            # Инфо о юзере + кнопка "Я беру"
             await bot_obj.send_message(
-                chat_id=group_chat_id,
-                message_thread_id=topic_id,
+                chat_id=group_chat_id, message_thread_id=topic_id,
                 text=f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="✋ Я беру",
-                        callback_data=f"take_user_{topic_id}_{group_chat_id}"
-                    )]
+                    [InlineKeyboardButton(text="✋ Я беру",
+                                           callback_data=f"take_user_{topic_id}_{group_chat_id}")]
                 ])
             )
 
-            # Первое сообщение в топик
             sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
             if sent:
-                save_feedback_message(
-                    bot_id, topic_id, group_chat_id, user_chat_id,
-                    "in", sent.message_id, message.message_id
-                )
+                save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                                       "in", sent.message_id, message.message_id)
 
             add_stat(bot_id, "message_out")
             return
 
-        # Существующий топик
         topic_id = topic["topic_id"]
 
         reply_to_group = None
@@ -499,10 +531,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id, reply_to_group)
 
         if sent:
-            save_feedback_message(
-                bot_id, topic_id, group_chat_id, user_chat_id,
-                "in", sent.message_id, message.message_id
-            )
+            save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                                   "in", sent.message_id, message.message_id)
 
     # ═══════════════ Сообщения из топика → юзеру ═══════════════
 
@@ -539,10 +569,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         sent = await _send_to_user(message, bot_obj, user_chat_id, reply_to_user)
 
         if sent:
-            save_feedback_message(
-                bot_id, thread_id, group_chat_id, user_chat_id,
-                "out", message.message_id, sent.message_id
-            )
+            save_feedback_message(bot_id, thread_id, group_chat_id, user_chat_id,
+                                   "out", message.message_id, sent.message_id)
 
     # ═══════════════ Игнорируем general ═══════════════
 
@@ -551,8 +579,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         ~F.message_thread_id
     )
     async def ignore_general(message: Message) -> None:
-        # Сообщения в general без thread_id — игнорируем
-        # кроме команд и "кто я" которые уже обработаны выше
         pass
 
     return child_dp
@@ -569,30 +595,23 @@ class ChildManager:
         token = bot_data.get("token", "")
 
         if bot_id in self._tasks and not self._tasks[bot_id].done():
-            logger.info("Дочерний бот %s уже запущен", bot_id)
             return True
 
         try:
-            child_bot = Bot(
-                token=token,
-                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-            )
+            child_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             me = await child_bot.get_me()
-            logger.info("Подключаю дочерний бот: @%s (%s)", me.username, me.id)
+            logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
             child_dp = _make_child_dp(bot_data, child_bot)
             await child_bot.delete_webhook(drop_pending_updates=True)
 
-            task = asyncio.create_task(
-                child_dp.start_polling(child_bot),
-                name=f"child_{bot_id}"
-            )
+            task = asyncio.create_task(child_dp.start_polling(child_bot), name=f"child_{bot_id}")
 
             self._tasks[bot_id] = task
             self._bots[bot_id] = child_bot
             self._dispatchers[bot_id] = child_dp
 
-            logger.info("Дочерний бот @%s запущен", me.username)
+            logger.info("Бот @%s запущен", me.username)
             return True
         except Exception as e:
             logger.error("Не удалось запустить бот %s: %s", bot_id, e)
@@ -617,7 +636,6 @@ class ChildManager:
         if bot:
             await bot.session.close()
 
-        logger.info("Дочерний бот %s остановлен", bot_id)
         return True
 
     async def restart_child(self, bot_data: dict) -> bool:

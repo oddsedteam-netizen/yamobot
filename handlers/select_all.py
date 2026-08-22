@@ -12,15 +12,14 @@ router = Router()
 
 
 def select_all_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📨 Рассылка", callback_data="all_mailing")],
-            [InlineKeyboardButton(text="📊 Общая статистика", callback_data="all_stats")],
-            [InlineKeyboardButton(text="⛔ Остановить все", callback_data="all_stop")],
-            [InlineKeyboardButton(text="▶️ Запустить все", callback_data="all_start_all")],
-            [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots")],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Рассылка", callback_data="all_mailing")],
+        [InlineKeyboardButton(text="✏️ Редактор", callback_data="all_editor")],
+        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="all_stats")],
+        [InlineKeyboardButton(text="⛔ Остановить все", callback_data="all_stop")],
+        [InlineKeyboardButton(text="▶️ Запустить все", callback_data="all_start_all")],
+        [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots")],
+    ])
 
 
 @router.callback_query(F.data == "select_all")
@@ -29,11 +28,8 @@ async def cb_select_all(callback: CallbackQuery) -> None:
     bots = get_user_bots(user_id)
 
     names = "\n".join(f"  • {bot_display_name(b)}" for b in bots)
-    text = (
-        f"📌 <b>Все боты</b> ({len(bots)} шт.)\n\n"
-        f"{names}\n\n"
-        f"Выбери действие:"
-    )
+    text = f"📌 <b>Все боты</b> ({len(bots)})\n\n{names}\n\nВыбери действие:"
+
     if callback.message:
         try:
             await callback.message.edit_text(text, reply_markup=select_all_kb())
@@ -59,8 +55,8 @@ async def cb_all_stats(callback: CallbackQuery) -> None:
         f"👥 Всего пользователей: <b>{s['users_total']}</b>\n"
         f"🚫 Заблокировали: <b>{s['users_blocked']}</b>\n"
         f"✅ Активных: <b>{s['users_active']}</b>\n\n"
-        f"📩 Получено сообщений: <b>{s['messages_in']}</b>\n"
-        f"📤 Отправлено сообщений: <b>{s['messages_out']}</b>\n\n"
+        f"📩 Получено: <b>{s['messages_in']}</b>\n"
+        f"📤 Отправлено: <b>{s['messages_out']}</b>\n\n"
         f"📨 Рассылок: <b>{s['mailings_count']}</b>\n"
         f"  ├ Доставлено: <b>{s['mailings_sent']}</b>\n"
         f"  └ Не доставлено: <b>{s['mailings_failed']}</b>"
@@ -80,8 +76,7 @@ async def cb_all_stats(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "all_stop")
-async def cb_all_stop(callback: CallbackQuery,
-                      child_manager: ChildManager) -> None:
+async def cb_all_stop(callback: CallbackQuery, child_manager: ChildManager) -> None:
     user_id = callback.from_user.id
     bots = get_user_bots(user_id)
 
@@ -104,8 +99,7 @@ async def cb_all_stop(callback: CallbackQuery,
 
 
 @router.callback_query(F.data == "all_start_all")
-async def cb_all_start(callback: CallbackQuery,
-                       child_manager: ChildManager) -> None:
+async def cb_all_start(callback: CallbackQuery, child_manager: ChildManager) -> None:
     user_id = callback.from_user.id
     bots = get_user_bots(user_id)
 

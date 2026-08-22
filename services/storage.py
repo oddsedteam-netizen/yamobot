@@ -654,3 +654,84 @@ def get_feedback_msg_by_user_msg(bot_id: int, user_chat_id: int, user_msg_id: in
         (bot_id, user_chat_id, user_msg_id)
     ).fetchone()
     return dict(row) if row else None
+
+# ═══════════════════════════════════════════════════════════
+#  Импорт пользователей + баны
+# ═══════════════════════════════════════════════════════════
+
+def import_users_bulk(bot_id: int, users_list: list[dict]) -> int:
+    """
+    Массовый импорт пользователей.
+    users_list: [{"chat_id": 123, "username": "x", "first_name": "Y"}, ...]
+    Возвращает количество добавленных.
+    """
+    conn = _get_conn()
+    added = 0
+    with _lock:
+        for u in users_list:
+            try:
+                chat_id = int(u.get("chat_id", 0))
+                if not chat_id:
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO users (bot_id, chat_id, username, first_name) VALUES (?, ?, ?, ?)",
+                    (bot_id, chat_id, u.get("username", ""), u.get("first_name", ""))
+                )
+                if cur.rowcount > 0:
+                    added += 1
+            except (ValueError, TypeError):
+                continue
+        conn.commit()
+    return added
+
+
+def ban_user(bot_id: int, chat_id: int) -> None:
+    """Помечает юзера как заблокированного (не будет получать рассылки)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (bot_id, chat_id, username, first_name, blocked) VALUES (?, ?, '', '', 1)",
+            (bot_id, chat_id)
+        )
+        conn.execute(
+            "UPDATE users SET blocked = 1 WHERE bot_id = ? AND chat_id = ?",
+            (bot_id, chat_id)
+        )
+        conn.commit()
+
+
+def is_user_banned(bot_id: int, chat_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT blocked FROM users WHERE bot_id = ? AND chat_id = ?",
+        (bot_id, chat_id)
+    ).fetchone()
+    return bool(row and row[0])
+
+
+# ═══════════════════════════════════════════════════════════
+#  Глобальные приветствие и линки для всех ботов юзера
+# ═══════════════════════════════════════════════════════════
+
+def set_welcome_for_all(user_id: int, welcome_text: str) -> int:
+    """Устанавливает приветствие для всех ботов юзера."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE bots SET welcome_text = ? WHERE owner_id = ?",
+            (welcome_text, user_id)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def set_links_for_all(user_id: int, links: list[dict]) -> int:
+    """Устанавливает линки для всех ботов юзера."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE bots SET links = ? WHERE owner_id = ?",
+            (json.dumps(links, ensure_ascii=False), user_id)
+        )
+        conn.commit()
+        return cur.rowcount
