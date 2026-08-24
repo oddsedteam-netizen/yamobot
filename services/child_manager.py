@@ -365,7 +365,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         else:
             tag = callback.from_user.first_name or str(callback.from_user.id)
 
-        assign_admin_to_topic(bot_id, topic_id, group_chat_id, callback.from_user.id, tag)
+        # Назначаем и получаем инфу
+        result = assign_admin_to_topic(bot_id, topic_id, group_chat_id, callback.from_user.id, tag)
 
         try:
             await bot_obj.edit_forum_topic(
@@ -377,10 +378,28 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if admin:
             add_admin_message(bot_id, callback.from_user.id, "action")
 
+        # Только редактируем текст — НЕ удаляем инфу о юзере
         try:
-            await callback.message.edit_text(f"✅ Админ <b>#{tag}</b> взял пользователя.")
+            # Если это было сообщение с кнопкой "Я беру" — просто убираем кнопку
+            if callback.message and callback.message.reply_markup:
+                # Оставляем оригинальный текст, но добавляем строку
+                original_text = callback.message.html_text or callback.message.text or ""
+                new_text = f"{original_text}\n\n✅ Взял: <b>#{tag}</b>"
+                await callback.message.edit_text(new_text, reply_markup=None)
         except Exception:
             pass
+
+        # Если это была смена админа — уведомляем
+        if result["is_change"]:
+            try:
+                await bot_obj.send_message(
+                    chat_id=group_chat_id,
+                    message_thread_id=topic_id,
+                    text=f"🔄 Админ сменился на <b>#{tag}</b>"
+                )
+            except Exception:
+                pass
+
         await callback.answer(f"Ты взял пользователя. Тег: #{tag}")
 
     # ═══════════════ Callback: "найти админа" ═══════════════

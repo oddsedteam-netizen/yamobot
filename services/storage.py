@@ -600,16 +600,34 @@ def create_topic_record(bot_id: int, user_chat_id: int, group_chat_id: int, topi
 
 
 def assign_admin_to_topic(bot_id: int, topic_id: int, group_chat_id: int,
-                          admin_user_id: int, admin_tag: str) -> bool:
+                          admin_user_id: int, admin_tag: str) -> dict:
+    """
+    Возвращает {'ok': bool, 'prev_admin_id': int, 'is_change': bool}
+    """
     conn = _get_conn()
     with _lock:
+        # Смотрим текущего админа
+        prev = conn.execute(
+            "SELECT admin_user_id FROM feedback_topics "
+            "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ?",
+            (bot_id, topic_id, group_chat_id)
+        ).fetchone()
+
+        prev_admin_id = prev[0] if prev else 0
+        is_change = prev_admin_id != 0 and prev_admin_id != admin_user_id
+
         cur = conn.execute(
             "UPDATE feedback_topics SET admin_user_id = ?, admin_tag = ?, status = 'assigned' "
             "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ?",
             (admin_user_id, admin_tag, bot_id, topic_id, group_chat_id)
         )
         conn.commit()
-        return cur.rowcount > 0
+
+        return {
+            "ok": cur.rowcount > 0,
+            "prev_admin_id": prev_admin_id,
+            "is_change": is_change,
+        }
 
 
 def reset_topic_admin(bot_id: int, topic_id: int, group_chat_id: int) -> bool:
@@ -746,3 +764,72 @@ def set_links_for_all(user_id: int, links: list[dict]) -> int:
         )
         conn.commit()
         return cur.rowcount
+
+# ═══════════════════════════════════════════════════════════
+#  ПЗ (топики) — расширенные функции
+# ═══════════════════════════════════════════════════════════
+
+def get_all_topics_for_bot(bot_id: int) -> list[dict]:
+    """Все топики бота."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM feedback_topics WHERE bot_id = ? ORDER BY created_at DESC",
+        (bot_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_topic_by_user_id_search(bot_id: int, user_chat_id: int) -> dict | None:
+    """Ищет топик по user_chat_id."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM feedback_topics WHERE bot_id = ? AND user_chat_id = ?",
+        (bot_id, user_chat_id)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_pz_stats(bot_id: int, user_chat_id: int) -> dict:
+    """Полная стата по ПЗ."""
+    conn = _get_conn()
+
+    # Кол-во сообщений от юзера
+    from_user = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND user_chat_id = ? AND direction = 'in'",
+        (bot_id, user_chat_id)
+    ).fetchone()[0]
+
+    # Кол-во сообщений админам (в ответ)
+    to_user = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND user_chat_id = ? AND direction = 'out'",
+        (bot_id, user_chat_id)
+    ).fetchone()[0]
+
+    # Первое сообщение
+    first = conn.execute(
+        "SELECT created_at FROM feedback_messages WHERE bot_id = ? AND user_chat_id = ? ORDER BY created_at ASC LIMIT 1",
+        (bot_id, user_chat_id)
+    ).fetchone()
+
+    # Последнее сообщение
+    last = conn.execute(
+        "SELECT created_at FROM feedback_messages WHERE bot_id = ? AND user_chat_id = ? ORDER BY created_at DESC LIMIT 1",
+        (bot_id, user_chat_id)
+    ).fetchone()
+
+    return {
+        "messages_from_user": from_user,
+        "messages_to_user": to_user,
+        "first_message_at": first[0] if first else None,
+        "last_message_at": last[0] if last else None,
+    }
+
+
+def get_user_info_from_pz(bot_id: int, user_chat_id: int) -> dict | None:
+    """Инфа о юзере из таблицы users."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM users WHERE bot_id = ? AND chat_id = ?",
+        (bot_id, user_chat_id)
+    ).fetchone()
+    return dict(row) if row else None
