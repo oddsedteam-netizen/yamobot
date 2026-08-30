@@ -9,8 +9,6 @@ from aiogram.types import (
 )
 
 from services.storage import (
-    get_bot_by_id,
-    bot_display_name,
     get_admins_all,
     add_admin,
     remove_admin,
@@ -35,99 +33,229 @@ class AdminFSM(StatesGroup):
 
 # ═══════════════ Клавиатуры ═══════════════
 
-def admins_menu_kb(bot_id: int) -> InlineKeyboardMarkup:
+def admins_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статистика админов", callback_data=f"admstats_{bot_id}")],
-            [InlineKeyboardButton(text="📋 Список админов", callback_data=f"admlist_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")],
+            [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list")],
+            [InlineKeyboardButton(text="📊 Статистика админов", callback_data="gadmins_stats")],
+            [InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")],
+            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del")],
+            [InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit")],
+            [InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search")],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
         ]
     )
 
 
-def admins_list_kb(bot_id: int) -> InlineKeyboardMarkup:
+def admins_list_kb(extra_rows: list[list[InlineKeyboardButton]] | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if extra_rows:
+        rows.extend(extra_rows)
+    rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить админа", callback_data=f"admadd_{bot_id}")],
-            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"admdel_{bot_id}")],
-            [InlineKeyboardButton(text="✏️ Редактор тегов", callback_data=f"admedit_{bot_id}")],
-            [InlineKeyboardButton(text="🔍 Найти по тегу", callback_data=f"admsearch_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admins_{bot_id}")],
+            [InlineKeyboardButton(text="✏️ Изменить тег", callback_data=f"gadmins_editone_{admin_user_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"gadmins_delone_{admin_user_id}")],
+            [InlineKeyboardButton(text="⬅️ К списку", callback_data="gadmins_list")],
         ]
     )
+
+
+async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
 
 
 # ═══════════════ Главное меню админов ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admins_\d+$"))
+@router.callback_query(F.data == "gadmins")
 async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
-
-    bot_info = get_bot_by_id(user_id, bot_id)
-    if not bot_info:
-        await callback.answer("⚠️ Бот не найден")
-        return
-
-    name = bot_display_name(bot_info)
     admins = get_admins_all()
 
     text = (
-        f"👤 <b>Админы — {name}</b>\n\n"
+        f"👤 <b>Управление админами</b>\n\n"
         f"Всего админов (глобально): <b>{len(admins)}</b>\n\n"
         f"Админы привязаны ко всем ботам.\n\n"
         f"Выбери действие:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=admins_menu_kb(bot_id))
-        except Exception:
-            await callback.message.answer(text, reply_markup=admins_menu_kb(bot_id))
-    await callback.answer()
+    await _render(callback, text, admins_menu_kb())
 
 
 # ═══════════════ Список ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admlist_\d+$"))
+@router.callback_query(F.data == "gadmins_list")
 async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    bot_id = int(callback.data.split("_", 1)[1])
 
     admins = get_admins_all()
 
     if admins:
         lines = []
-        for a in admins:
+        extra_rows = []
+        for i, a in enumerate(admins, 1):
             uname = f"@{a['username']}" if a['username'] else f"ID:{a['user_id']}"
-            status = "✅ активен" if a["active"] else "❌ неактивен"
+            status = "🟢 активен" if a["active"] else "🔴 неактивен"
             topics = get_admin_active_topics(a["user_id"])
-            lines.append(f"  {uname} #{a['tag']} — {status} (ПЗ: {topics})")
+            lines.append(f"{i}. <b>#{a['tag']}</b>  {uname}")
+            lines.append(f"   {status} · ПЗ за ним: <b>{topics}</b>")
+            lines.append("")
+            extra_rows.append([
+                InlineKeyboardButton(
+                    text=f"{i}. #{a['tag']} — {uname}",
+                    callback_data=f"gadmins_view_{a['user_id']}"
+                )
+            ])
 
-        admin_list = "\n".join(lines)
+        admin_list = "\n".join(lines).rstrip()
         text = (
-            f"📋 <b>Список админов</b>\n\n"
-            f"{admin_list}\n\n"
-            f"Для подробной инфо — «Найти по тегу»."
+            f"📋 <b>Список админов</b> ({len(admins)})\n\n"
+            f"{admin_list}\n"
+            f"Нажми на админа — откроется его карточка с действиями."
         )
+        kb = admins_list_kb(extra_rows)
     else:
         text = "📋 <b>Список админов</b>\n\nПока нет ни одного админа."
+        kb = admins_list_kb()
+
+    await _render(callback, text, kb)
+# ═══════════════ Карточка админа ═══════════════
+
+@router.callback_query(F.data.regexp(r"^gadmins_view_\d+$"))
+async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    admin_user_id = int(callback.data.split("_")[-1])
+
+    admin = get_admin_by_user_id(admin_user_id)
+    if not admin:
+        await callback.answer("❌ Админ не найден")
+        return
+
+    uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
+    status = "🟢 активен" if admin["active"] else "🔴 неактивен"
+
+    stats = get_admin_message_stats(admin["user_id"])
+    topics = get_admin_active_topics(admin["user_id"])
+    history = get_admin_tag_history(admin["user_id"])
+
+    history_text = ""
+    if history:
+        history_lines = []
+        for h in history:
+            old = f"#{h['old_tag']}" if h['old_tag'] else "—"
+            history_lines.append(f"  {old} → #{h['new_tag']} ({h['changed_at'][:10]})")
+        history_text = "\n\n🏷 <b>История тегов:</b>\n" + "\n".join(history_lines)
+
+    text = (
+        f"👤 <b>Админ — #{admin['tag']}</b>\n\n"
+        f"📛 Username: <b>{uname}</b>\n"
+        f"🆔 ID: <code>{admin['user_id']}</code>\n"
+        f"🏷 Тег: <b>#{admin['tag']}</b>\n"
+        f"📌 Статус: {status}\n"
+        f"📅 Добавлен: {admin['created_at'][:10]}\n\n"
+        f"📊 <b>Сообщения:</b>\n"
+        f"  📅 День: <b>{stats['day']}</b>  📅 Неделя: <b>{stats['week']}</b>\n"
+        f"  📅 Месяц: <b>{stats['month']}</b>  📊 Всего: <b>{stats['total']}</b>\n"
+        f"👥 ПЗ за ним: <b>{topics}</b>"
+        f"{history_text}"
+    )
+
+    await _render(callback, text, admin_detail_kb(admin_user_id))
+
+
+# ═══════════════ Действия с конкретным админом ═══════════════
+
+@router.callback_query(F.data.regexp(r"^gadmins_editone_\d+$"))
+async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
+    admin_user_id = int(callback.data.split("_")[-1])
+
+    admin = get_admin_by_user_id(admin_user_id)
+    if not admin:
+        await callback.answer("❌ Админ не найден")
+        return
+
+    await state.set_state(AdminFSM.waiting_edit_tag)
+    await state.update_data(admin_edit_user_id=admin_user_id)
+
+    text = (
+        f"✏️ <b>Новый тег для #{admin['tag']}</b>\n\n"
+        f"Введи новый тег (без решётки):\n"
+        f"Пример: <code>маркетинг</code>"
+    )
 
     if callback.message:
         try:
-            await callback.message.edit_text(text, reply_markup=admins_list_kb(bot_id))
+            await callback.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")]
+                ])
+            )
         except Exception:
-            await callback.message.answer(text, reply_markup=admins_list_kb(bot_id))
+            await callback.message.answer(text)
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^gadmins_delone_\d+$"))
+async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    admin_user_id = int(callback.data.split("_")[-1])
+
+    admin = get_admin_by_user_id(admin_user_id)
+    if not admin:
+        await callback.answer("❌ Админ не найден")
+        return
+
+    uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
+    text = (
+        f"🗑 <b>Удалить админа?</b>\n\n"
+        f"👤 {uname}\n"
+        f"🏷 #{admin['tag']}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"gadmins_delconfirm_{admin_user_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")],
+    ])
+
+    await _render(callback, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^gadmins_delconfirm_\d+$"))
+async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    admin_user_id = int(callback.data.split("_")[-1])
+
+    admin = get_admin_by_user_id(admin_user_id)
+    uname = f"@{admin['username']}" if admin and admin['username'] else f"ID:{admin_user_id}"
+    tag = admin["tag"] if admin else "?"
+
+    remove_admin(admin_user_id)
+
+    text = f"✅ <b>Админ удалён!</b>\n\n👤 {uname}\n🏷 #{tag}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+    ])
+
+    await _render(callback, text, kb)
 
 
 # ═══════════════ Статистика ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admstats_\d+$"))
-async def cb_admins_stats(callback: CallbackQuery) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-
+@router.callback_query(F.data == "gadmins_stats")
+async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     all_stats = get_all_admins_stats()
 
     if not all_stats:
@@ -147,33 +275,22 @@ async def cb_admins_stats(callback: CallbackQuery) -> None:
                 f"    📊 Всего: <b>{s['total']}</b>  "
                 f"👥 ПЗ: <b>{t}</b>"
             )
-
         stats_text = "\n\n".join(lines)
         text = f"📊 <b>Статистика админов</b>\n\n{stats_text}"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admstats_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admins_{bot_id}")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="gadmins_stats")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ]
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
-
-
+    await _render(callback, text, kb)
 # ═══════════════ Добавить ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admadd_\d+$"))
+@router.callback_query(F.data == "gadmins_add")
 async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-
     await state.set_state(AdminFSM.waiting_add_admin)
-    await state.update_data(admin_bot_id=bot_id)
 
     text = (
         "➕ <b>Добавить админа</b>\n\n"
@@ -188,7 +305,7 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admlist_{bot_id}")]
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
                 ])
             )
         except Exception:
@@ -198,9 +315,6 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminFSM.waiting_add_admin)
 async def fsm_add_admin(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    bot_id = data.get("admin_bot_id")
-
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=2)
 
@@ -236,32 +350,29 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
             f"🏷 #{tag}\n\n"
             f"Админ привязан ко всем ботам.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")],
-                [InlineKeyboardButton(text="⬅️ К боту", callback_data=f"bot_{bot_id}")],
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
             ])
         )
     else:
         await message.answer(
             "⚠️ Этот пользователь уже добавлен как админ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")]
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")]
             ])
         )
 
 
 # ═══════════════ Удалить ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admdel_\d+$"))
+@router.callback_query(F.data == "gadmins_del")
 async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-
     admins = get_admins_all()
     if not admins:
         await callback.answer("Нет админов")
         return
 
     await state.set_state(AdminFSM.waiting_delete_admin)
-    await state.update_data(admin_bot_id=bot_id)
 
     lines = []
     for a in admins:
@@ -282,7 +393,7 @@ async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admlist_{bot_id}")]
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
                 ])
             )
         except Exception:
@@ -292,9 +403,6 @@ async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminFSM.waiting_delete_admin)
 async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    bot_id = data.get("admin_bot_id")
-
     tag = (message.text or "").strip().lstrip("#")
     if not tag:
         await message.answer("❌ Тег не может быть пустым.")
@@ -312,20 +420,16 @@ async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ <b>Админ удалён!</b>\n\n👤 {uname} #{tag}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ К боту", callback_data=f"bot_{bot_id}")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ])
     )
-
-
 # ═══════════════ Редактор тегов ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admedit_\d+$"))
+@router.callback_query(F.data == "gadmins_edit")
 async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-
     await state.set_state(AdminFSM.waiting_edit_tag)
-    await state.update_data(admin_bot_id=bot_id)
+    await state.update_data(admin_edit_user_id=None)
 
     text = (
         "✏️ <b>Редактор тегов</b>\n\n"
@@ -338,7 +442,7 @@ async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admlist_{bot_id}")]
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
                 ])
             )
         except Exception:
@@ -349,7 +453,30 @@ async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminFSM.waiting_edit_tag)
 async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    bot_id = data.get("admin_bot_id")
+    admin_eid = data.get("admin_edit_user_id")
+
+    # Редактирование тега из карточки конкретного админа (вводим только новый тег)
+    if admin_eid is not None:
+        admin = get_admin_by_user_id(admin_eid)
+        new_tag = (message.text or "").strip().lstrip("#")
+        if not admin or not new_tag:
+            await message.answer("❌ Некорректный тег. Введи тег ещё раз.")
+            return
+
+        old_tag = admin["tag"]
+        update_admin_tag(admin_eid, new_tag)
+        await state.clear()
+        uname = f"@{admin['username']}" if admin.get("username") else f"ID:{admin_eid}"
+        await message.answer(
+            f"✅ <b>Тег обновлён!</b>\n\n"
+            f"👤 {uname}\n"
+            f"🏷 #{old_tag} → #{new_tag}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+            ])
+        )
+        return
 
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=1)
@@ -373,22 +500,20 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
 
     await message.answer(
         f"✅ <b>Тег обновлён!</b>\n\n"
-        f"👤 {uname}\n🏷 #{old_tag} → #{new_tag}",
+        f"👤 {uname}\n"
+        f"🏷 #{old_tag} → #{new_tag}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ К боту", callback_data=f"bot_{bot_id}")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ])
     )
 
 
 # ═══════════════ Поиск по тегу ═══════════════
 
-@router.callback_query(F.data.regexp(r"^admsearch_\d+$"))
+@router.callback_query(F.data == "gadmins_search")
 async def cb_search_tag(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-
     await state.set_state(AdminFSM.waiting_search_tag)
-    await state.update_data(admin_bot_id=bot_id)
 
     text = "🔍 <b>Поиск по тегу</b>\n\nОтправь тег.\nПример: <code>продажи</code>"
 
@@ -397,7 +522,7 @@ async def cb_search_tag(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(
                 text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admlist_{bot_id}")]
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
                 ])
             )
         except Exception:
@@ -407,9 +532,6 @@ async def cb_search_tag(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminFSM.waiting_search_tag)
 async def fsm_search_tag(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    bot_id = data.get("admin_bot_id")
-
     tag = (message.text or "").strip().lstrip("#")
     if not tag:
         await message.answer("❌ Тег не может быть пустым.")
@@ -422,7 +544,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"⚠️ Админ с тегом <b>#{tag}</b> не найден.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")]
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")]
             ])
         )
         return
@@ -461,8 +583,8 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
     await message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data=f"admlist_{bot_id}")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data=f"admstats_{bot_id}")],
-            [InlineKeyboardButton(text="⬅️ К боту", callback_data=f"bot_{bot_id}")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ])
     )

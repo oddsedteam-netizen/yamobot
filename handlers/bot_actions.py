@@ -33,7 +33,6 @@ def single_bot_kb(bot_id: int, is_running: bool) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=stop_text, callback_data=stop_data)],
             [InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_{bot_id}")],
             [InlineKeyboardButton(text="✏️ Редактор", callback_data=f"editor_{bot_id}")],
-            [InlineKeyboardButton(text="👤 Админы", callback_data=f"admins_{bot_id}")],
             [InlineKeyboardButton(text="📋 ПЗ", callback_data=f"pz_{bot_id}")],
             [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"action_delete_{bot_id}")],
             [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots")],

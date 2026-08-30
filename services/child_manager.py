@@ -12,8 +12,11 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
     CallbackQuery,
+    MessageEntity,
+    ReplyKeyboardMarkup,
 )
 
 from services.storage import (
@@ -60,6 +63,16 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _user_actions_kb() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура действий для пользователя."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="сменить админа")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 async def _send_to_topic(source_msg: Message, bot: Bot,
                          group_chat_id: int, topic_id: int,
                          reply_to: int | None = None) -> Message | None:
@@ -100,7 +113,8 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
 
 
 async def _send_to_user(source_msg: Message, bot: Bot,
-                        chat_id: int, reply_to: int | None = None) -> Message | None:
+                        chat_id: int, reply_to: int | None = None,
+                        bot_id: int | None = None) -> Message | None:
     kwargs = {"chat_id": chat_id}
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
@@ -132,9 +146,49 @@ async def _send_to_user(source_msg: Message, bot: Bot,
             text = source_msg.html_text or source_msg.text or ""
             if text:
                 return await bot.send_message(**kwargs, text=text)
+    except TelegramForbiddenError:
+        # Юзер заблокировал/забанил бота — обрабатываем топик
+        if bot_id:
+            await _handle_user_blocked(bot, bot_id, chat_id)
+        return None
     except Exception as e:
         logger.error("Ошибка отправки юзеру: %s", e)
     return None
+
+
+async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None:
+    """Юзер забанил бота: помечаем заблокированным, переименовываем и закрываем топик,
+    уведомляем админа в этом же топике."""
+    try:
+        mark_user_blocked(bot_id, user_chat_id)
+    except Exception:
+        pass
+
+    topic = get_topic_by_user(bot_id, user_chat_id)
+    if not topic:
+        return
+
+    g_id = topic["group_chat_id"]
+    t_id = topic["topic_id"]
+    reset_topic_admin(bot_id, t_id, g_id)
+
+    try:
+        await bot.edit_forum_topic(chat_id=g_id, message_thread_id=t_id, name="🚫 забанил бота")
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(
+            chat_id=g_id, message_thread_id=t_id,
+            text=f"🚫 Пользователь <code>{user_chat_id}</code> забанил бота.\nТопик закрыт."
+        )
+    except Exception:
+        pass
+
+    try:
+        await bot.close_forum_topic(chat_id=g_id, message_thread_id=t_id)
+    except Exception:
+        pass
 
 
 def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
@@ -166,6 +220,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
         kb = _build_welcome_kb(fresh)
         await message.answer(welcome, reply_markup=kb)
+        try:
+            await message.answer(
+                "📌 Клавиатура действий:",
+                reply_markup=_user_actions_kb(),
+            )
+        except Exception:
+            pass
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -320,36 +381,48 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         )
         await message.answer("✅ Пользователю отправлено уведомление.")
 
-    # ═══════════════ "кто я" в general ═══════════════
+    # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
 
     @child_dp.message(
+        Command("smena"),
         F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-        F.text.lower() == "кто я"
+        F.message_thread_id.as_("thread_id")
     )
-    async def cmd_who_am_i(message: Message) -> None:
-        if message.message_thread_id:
+    async def cmd_smena(message: Message, thread_id: int) -> None:
+        group_chat_id = message.chat.id
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
+        if not topic:
             return
 
-        admin = get_admin_by_user_id(message.from_user.id)
-        if not admin:
-            await message.reply("❌ Ты не зарегистрирован как админ.")
-            return
+        user_chat_id = topic["user_chat_id"]
+        reset_topic_admin(bot_id, thread_id, group_chat_id)
 
-        stats = get_admin_message_stats(admin["user_id"])
-        topics_count = get_admin_active_topics(admin["user_id"])
+        # Уведомляем самого юзера, что его админа меняют
+        try:
+            await bot_obj.send_message(
+                chat_id=user_chat_id,
+                text="🔄 Вашего администратора меняют. С вами скоро свяжется новый админ."
+            )
+        except Exception:
+            pass
 
-        text = (
-            f"👤 <b>Твой профиль</b>\n\n"
-            f"🏷 Тег: <b>#{admin['tag']}</b>\n"
-            f"📛 Username: @{admin['username']}\n\n"
-            f"📊 <b>Сообщения:</b>\n"
-            f"  📅 День: <b>{stats['day']}</b>\n"
-            f"  📅 Неделя: <b>{stats['week']}</b>\n"
-            f"  📅 Месяц: <b>{stats['month']}</b>\n"
-            f"  📊 Всего: <b>{stats['total']}</b>\n\n"
-            f"👥 ПЗ за тобой: <b>{topics_count}</b>"
+        try:
+            await bot_obj.edit_forum_topic(
+                chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
+            )
+        except Exception:
+            pass
+
+        await bot_obj.send_message(
+            chat_id=group_chat_id, message_thread_id=thread_id,
+            text="🔔 Пользователь запросил смену админа!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✋ Я беру",
+                                       callback_data=f"take_user_{thread_id}_{group_chat_id}")]
+            ])
         )
-        await message.reply(text)
+        await message.answer("✅ Запрос на смену админа отправлен.")
+
 
     # ═══════════════ Callback: "я беру" ═══════════════
 
@@ -653,7 +726,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             if orig:
                 reply_to_user = orig["user_msg_id"]
 
-        sent = await _send_to_user(message, bot_obj, user_chat_id, reply_to_user)
+        sent = await _send_to_user(message, bot_obj, user_chat_id, reply_to_user, bot_id=bot_id)
 
         if sent:
             save_feedback_message(bot_id, thread_id, group_chat_id, user_chat_id,
@@ -749,10 +822,14 @@ class ChildManager:
 
     async def send_mailing(self, bot_id: int, text: str,
                            media_type: str = "", media_id: str = "",
-                           progress_callback=None) -> dict:
+                           entities=None, progress_callback=None) -> dict:
         bot = self._bots.get(bot_id)
         if not bot:
             return {"sent": 0, "failed": 0, "total": 0}
+
+        msg_entities = None
+        if entities:
+            msg_entities = [MessageEntity(**e) for e in entities]
 
         users = get_child_users(bot_id, only_active=True)
         total = len(users)
@@ -763,21 +840,30 @@ class ChildManager:
             chat_id = user["chat_id"]
             try:
                 if media_type == "photo" and media_id:
-                    await bot.send_photo(chat_id=chat_id, photo=media_id, caption=text)
+                    await bot.send_photo(chat_id=chat_id, photo=media_id,
+                                         caption=text, caption_entities=msg_entities,
+                                         parse_mode=None)
                 elif media_type == "video" and media_id:
-                    await bot.send_video(chat_id=chat_id, video=media_id, caption=text)
+                    await bot.send_video(chat_id=chat_id, video=media_id,
+                                         caption=text, caption_entities=msg_entities,
+                                         parse_mode=None)
                 elif media_type == "document" and media_id:
-                    await bot.send_document(chat_id=chat_id, document=media_id, caption=text)
+                    await bot.send_document(chat_id=chat_id, document=media_id,
+                                            caption=text, caption_entities=msg_entities,
+                                            parse_mode=None)
                 elif media_type == "animation" and media_id:
-                    await bot.send_animation(chat_id=chat_id, animation=media_id, caption=text)
+                    await bot.send_animation(chat_id=chat_id, animation=media_id,
+                                             caption=text, caption_entities=msg_entities,
+                                             parse_mode=None)
                 elif media_type == "sticker" and media_id:
                     await bot.send_sticker(chat_id=chat_id, sticker=media_id)
                 else:
-                    await bot.send_message(chat_id=chat_id, text=text)
+                    await bot.send_message(chat_id=chat_id, text=text,
+                                           entities=msg_entities, parse_mode=None)
                 sent += 1
                 add_stat(bot_id, "message_out")
             except TelegramForbiddenError:
-                mark_user_blocked(bot_id, chat_id)
+                await _handle_user_blocked(bot, bot_id, chat_id)
                 failed += 1
             except Exception as e:
                 logger.warning("Ошибка отправки %s -> %s: %s", bot_id, chat_id, e)

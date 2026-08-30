@@ -1,3 +1,4 @@
+import html
 import logging
 
 from aiogram import Router, F
@@ -20,6 +21,28 @@ from services.child_manager import ChildManager
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+def _entities_to_dicts(entities) -> list[dict]:
+    """Сериализуем сущности сообщения для передачи в рассылку
+    (сохраняет premium-эмодзи и всё форматирование)."""
+    result = []
+    for e in entities or []:
+        if getattr(e, "type", "") == "text_mention":
+            # text_mention требует вложенный объект user — его нельзя
+            # безопасно восстановить, поэтому пропускаем (просто текст)
+            continue
+        result.append(e.model_dump(exclude_none=True))
+    return result
+
+
+def _preview(text: str, limit: int = 200) -> str:
+    if not text:
+        return "— без текста —"
+    shown = text[:limit]
+    if len(text) > limit:
+        shown += "..."
+    return html.escape(shown)
 
 
 class MailingFSM(StatesGroup):
@@ -97,10 +120,24 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "all_mailing")
 async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
-    bots = get_user_bots(user_id)
+    bots = [b for b in get_user_bots(user_id) if not b.get("stopped")]
 
     if not bots:
-        await callback.answer("⚠️ Нет ботов")
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "📨 <b>Рассылка для всех ботов</b>\n\n"
+                    "⚠️ Нет запущенных ботов.\n"
+                    "Остановленные боты не участвуют в рассылке.",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+                        ]
+                    )
+                )
+            except Exception:
+                pass
+        await callback.answer()
         return
 
     bot_ids = [b["id"] for b in bots]
@@ -167,37 +204,45 @@ async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
 
     media_type = ""
     media_id = ""
-    text = ""
+    raw_text = ""
+    entities: list[dict] = []
 
     if message.photo:
         media_type = "photo"
         media_id = message.photo[-1].file_id
-        text = message.html_text or message.caption or ""
+        raw_text = message.caption or ""
+        entities = _entities_to_dicts(message.caption_entities)
     elif message.video:
         media_type = "video"
         media_id = message.video.file_id
-        text = message.html_text or message.caption or ""
+        raw_text = message.caption or ""
+        entities = _entities_to_dicts(message.caption_entities)
     elif message.animation:
         media_type = "animation"
         media_id = message.animation.file_id
-        text = message.html_text or message.caption or ""
+        raw_text = message.caption or ""
+        entities = _entities_to_dicts(message.caption_entities)
     elif message.document:
         media_type = "document"
         media_id = message.document.file_id
-        text = message.html_text or message.caption or ""
+        raw_text = message.caption or ""
+        entities = _entities_to_dicts(message.caption_entities)
     elif message.sticker:
         media_type = "sticker"
         media_id = message.sticker.file_id
-        text = ""
+        raw_text = ""
+        entities = []
     else:
-        text = message.html_text or message.text or ""
+        raw_text = message.text or ""
+        entities = _entities_to_dicts(message.entities)
 
-    if not text and not media_id:
+    if not raw_text and not media_id:
         await message.answer("❌ Пустое сообщение. Отправь текст или медиа.")
         return
 
     await state.update_data(
-        mailing_text=text,
+        mailing_text=raw_text,
+        mailing_entities=entities,
         mailing_media_type=media_type,
         mailing_media_id=media_id
     )
@@ -208,7 +253,7 @@ async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
         users = get_child_users(bid, only_active=True)
         total_users += len(users)
 
-    preview = text[:200] + "..." if text and len(text) > 200 else (text or "— без текста —")
+    preview = _preview(raw_text)
     media_info = f"\n📎 Медиа: {media_type}" if media_type else ""
     cancel_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "select_all"
 
@@ -240,6 +285,7 @@ async def cb_mailing_confirm(
     mailing_text = data.get("mailing_text", "")
     media_type = data.get("mailing_media_type", "")
     media_id = data.get("mailing_media_id", "")
+    mailing_entities = data.get("mailing_entities", []) or []
     await state.clear()
 
     if not callback.message:
@@ -274,6 +320,7 @@ async def cb_mailing_confirm(
             text=mailing_text,
             media_type=media_type,
             media_id=media_id,
+            entities=mailing_entities,
             progress_callback=progress_cb
         )
 

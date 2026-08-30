@@ -10,9 +10,6 @@ from services.storage import (
     bot_display_name,
     get_stats,
     get_all_stats,
-    get_admins_all,
-    get_admin_active_topics,
-    get_all_admins_stats,
     get_all_topics_for_bot,
 )
 from services.child_manager import ChildManager
@@ -72,60 +69,6 @@ async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstats")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
-    ])
-
-    await _render(callback, text, kb)
-
-# ═══════════════ Админы (глобально) ═══════════════
-
-@router.callback_query(F.data == "gadmins")
-async def cb_global_admins(callback: CallbackQuery) -> None:
-    admins = get_admins_all()
-
-    if admins:
-        lines = []
-        for a in admins:
-            uname = f"@{a['username']}" if a["username"] else f"ID:{a['user_id']}"
-            status = "✅ активен" if a["active"] else "❌ неактивен"
-            topics = get_admin_active_topics(a["user_id"])
-            lines.append(f"  {uname} #{a['tag']} — {status} (ПЗ: {topics})")
-        text = "👤 <b>Админы</b> (глобально)\n\n" + "\n".join(lines)
-    else:
-        text = "👤 <b>Админы</b>\n\nПока нет ни одного админа."
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика админов", callback_data="gadmstats")],
-        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
-    ])
-
-    await _render(callback, text, kb)
-
-@router.callback_query(F.data == "gadmstats")
-async def cb_global_admins_stats(callback: CallbackQuery) -> None:
-    all_stats = get_all_admins_stats()
-
-    if not all_stats:
-        text = "📊 <b>Статистика админов</b>\n\nНет админов."
-    else:
-        lines = []
-        for item in all_stats:
-            a = item["admin"]
-            s = item["stats"]
-            t = item["active_topics"]
-            lines.append(
-                f"  #{a['tag']}\n"
-                f"    📅 День: <b>{s['day']}</b>  "
-                f"📅 Неделя: <b>{s['week']}</b>  "
-                f"📅 Месяц: <b>{s['month']}</b>\n"
-                f"    📊 Всего: <b>{s['total']}</b>  "
-                f"👥 ПЗ: <b>{t}</b>"
-            )
-        text = "📊 <b>Статистика админов</b>\n\n" + "\n\n".join(lines)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gadmstats")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="gadmins")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")],
     ])
 
     await _render(callback, text, kb)
