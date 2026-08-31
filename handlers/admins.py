@@ -19,6 +19,7 @@ from services.storage import (
     get_admin_message_stats,
     get_admin_active_topics,
     get_all_admins_stats,
+    create_admin_invite,
 )
 
 router = Router()
@@ -39,6 +40,7 @@ def admins_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list")],
             [InlineKeyboardButton(text="📊 Статистика админов", callback_data="gadmins_stats")],
             [InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")],
+            [InlineKeyboardButton(text="🔗 Добавить админа ссылкой", callback_data="gadmins_addlink")],
             [InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del")],
             [InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit")],
             [InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search")],
@@ -290,6 +292,47 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
 
     await _render(callback, text, kb)
 # ═══════════════ Добавить ═══════════════
+
+@router.callback_query(F.data == "gadmins_addlink")
+async def cb_add_admin_by_link(callback: CallbackQuery) -> None:
+    owner_id = callback.from_user.id
+    token = create_admin_invite(owner_id)
+
+    try:
+        me = await callback.bot.get_me()
+        username = me.username or ""
+    except Exception:
+        username = ""
+
+    if username:
+        link = f"https://t.me/{username}?start=addadmin_{token}"
+    else:
+        link = ""
+        text = (
+            "⚠️ <b>Не удалось создать ссылку.</b>\n\n"
+            "Не удалось получить username бота. Попробуй ещё раз."
+        )
+
+    if link:
+        text = (
+            "🔗 <b>Добавить админа ссылкой</b>\n\n"
+            "Отправь эту ссылку человеку, которого хочешь сделать админом. "
+            "Когда он перейдёт по ней, бот попросит его ввести тег и привяжет его к твоим ботам.\n\n"
+            f"<code>{link}</code>\n\n"
+            "⬇️ Или нажми, чтобы скопировать:"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Скопировать ссылку", url=link)],
+            [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        ])
+
+    await _render(callback, text, kb)
+
 
 @router.callback_query(F.data == "gadmins_add")
 async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:

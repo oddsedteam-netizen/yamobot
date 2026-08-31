@@ -1,5 +1,6 @@
 import json
 import logging
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -165,6 +166,12 @@ def ensure_db() -> None:
             bot_id       INTEGER PRIMARY KEY,
             owner_id     INTEGER NOT NULL,
             buttons      TEXT DEFAULT '[]'
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_invites (
+            token       TEXT PRIMARY KEY,
+            owner_id    INTEGER NOT NULL,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
     _migrate_admin_scope(conn)
@@ -780,6 +787,36 @@ def get_bot_keyboard_by_bot(bot_id: int) -> list[dict]:
     except (json.JSONDecodeError, TypeError):
         return default_bot_keyboard()
     return buttons if isinstance(buttons, list) else default_bot_keyboard()
+# ═══════════════════════════════════════════════════════════
+#  Приглашения админов по ссылке
+# ═══════════════════════════════════════════════════════════
+
+def create_admin_invite(owner_id: int) -> str:
+    """Создаёт одноразовый токен-приглашение админа."""
+    token = secrets.token_urlsafe(16)
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO admin_invites (token, owner_id) VALUES (?, ?)",
+            (token, owner_id)
+        )
+        conn.commit()
+    return token
+
+
+def get_admin_invite_owner(token: str) -> int | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT owner_id FROM admin_invites WHERE token = ?", (token,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def consume_admin_invite(token: str) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute("DELETE FROM admin_invites WHERE token = ?", (token,))
+        conn.commit()
 
 
 def set_bot_keyboard(owner_id: int, bot_id: int, buttons: list[dict]) -> bool:

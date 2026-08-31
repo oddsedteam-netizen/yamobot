@@ -219,13 +219,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
-        kb = _build_welcome_kb(fresh)
-        await message.answer(welcome, reply_markup=kb)
         try:
-            await message.answer(
-                "📌 Клавиатура действий:",
-                reply_markup=_user_actions_kb(),
-            )
+            await message.answer(welcome, reply_markup=_user_actions_kb())
         except Exception:
             pass
         add_stat(bot_id, "message_out")
