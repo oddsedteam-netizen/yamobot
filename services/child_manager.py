@@ -71,12 +71,13 @@ ACTIONS_ADMIN_TEXT = "сменить админа"
 def _build_reply_kb(bot_id: int) -> ReplyKeyboardMarkup | None:
     """Нижняя reply-клавиатура действий (настраивается владельцем бота)."""
     buttons = get_bot_keyboard_by_bot(bot_id)
-    if not buttons:
-        return None
     rows: list[list[KeyboardButton]] = []
     for b in buttons:
-        text = b.get("text") or ACTIONS_ADMIN_TEXT
-        rows.append([KeyboardButton(text=text)])
+        if b.get("kind") != "admin":
+            continue
+        rows.append([KeyboardButton(text=b.get("text") or ACTIONS_ADMIN_TEXT)])
+    if not rows:
+        return None
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
@@ -232,12 +233,12 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         kb = _build_welcome_kb(fresh)
         reply = _build_reply_kb(bot_id)
         try:
-            await message.answer(welcome, reply_markup=reply)
+            await message.answer(welcome, reply_markup=kb)
         except Exception:
             pass
-        if kb:
+        if reply:
             try:
-                await message.answer("🔗 Полезные ссылки:", reply_markup=kb)
+                await message.answer("📌 Клавиатура действий:", reply_markup=reply)
             except Exception:
                 pass
         add_stat(bot_id, "message_out")
@@ -595,18 +596,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             else:
                 await message.answer("У вас сейчас нет назначенного админа.")
                 return
-
-        # Обработка настраиваемых кнопок-ссылок (нижняя клавиатура)
-        if message.text:
-            for b in get_bot_keyboard_by_bot(bot_id):
-                if b.get("kind") == "url" and b.get("text"):
-                    if message.text.strip() == b["text"].strip():
-                        url = b.get("url", "")
-                        if url:
-                            await message.answer(url)
-                        else:
-                            await message.answer("Ссылка для этой кнопки не задана.")
-                        return
 
         # Настройки антиспама
         now = time.time()
