@@ -68,22 +68,20 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
 ACTIONS_ADMIN_TEXT = "сменить админа"
 
 
-def _build_actions_kb(bot_id: int) -> InlineKeyboardMarkup | None:
-    """Инлайн-клавиатура действий (настраивается владельцем бота)."""
+def _build_reply_kb(bot_id: int) -> ReplyKeyboardMarkup | None:
+    """Нижняя reply-клавиатура действий (настраивается владельцем бота)."""
     buttons = get_bot_keyboard_by_bot(bot_id)
-    rows: list[list[InlineKeyboardButton]] = []
-    for b in buttons:
-        kind = b.get("kind")
-        text = b.get("text", ACTIONS_ADMIN_TEXT)
-        if kind == "url":
-            url = b.get("url", "")
-            if url:
-                rows.append([InlineKeyboardButton(text=text, url=url)])
-        else:
-            rows.append([InlineKeyboardButton(text=text, callback_data="child_change_admin")])
-    if not rows:
+    if not buttons:
         return None
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows: list[list[KeyboardButton]] = []
+    for b in buttons:
+        text = b.get("text") or ACTIONS_ADMIN_TEXT
+        rows.append([KeyboardButton(text=text)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие…",
+    )
 
 
 async def _send_to_topic(source_msg: Message, bot: Bot,
@@ -232,17 +230,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
         kb = _build_welcome_kb(fresh)
-        actions = _build_actions_kb(bot_id)
-        rows: list[list[InlineKeyboardButton]] = []
-        if kb:
-            rows.extend(kb.inline_keyboard)
-        if actions:
-            rows.extend(actions.inline_keyboard)
-        markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        reply = _build_reply_kb(bot_id)
         try:
-            await message.answer(welcome, reply_markup=markup)
+            await message.answer(welcome, reply_markup=reply)
         except Exception:
             pass
+        if kb:
+            try:
+                await message.answer("🔗 Полезные ссылки:", reply_markup=kb)
+            except Exception:
+                pass
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -442,27 +439,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     # ═══════════════ Callback: "я беру" ═══════════════
 
-    @child_dp.callback_query(F.data == "child_change_admin")
-    async def cb_child_change_admin(callback: CallbackQuery) -> None:
-        topic = get_topic_by_user(bot_id, callback.from_user.id)
-        if topic and topic["admin_user_id"]:
-            await callback.message.edit_text(
-                "❓ Вы уверены, что хотите сменить админа?",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ Да",
-                            callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
-                        InlineKeyboardButton(
-                            text="❌ Нет",
-                            callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
-                    ]
-                ])
-            )
-        else:
-            await callback.message.edit_text("У вас сейчас нет назначенного админа.")
-        await callback.answer()
-
     @child_dp.callback_query(F.data.startswith("take_user_"))
     async def cb_take_user(callback: CallbackQuery) -> None:
         parts = callback.data.split("_")
@@ -619,6 +595,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             else:
                 await message.answer("У вас сейчас нет назначенного админа.")
                 return
+
+        # Обработка настраиваемых кнопок-ссылок (нижняя клавиатура)
+        if message.text:
+            for b in get_bot_keyboard_by_bot(bot_id):
+                if b.get("kind") == "url" and b.get("text"):
+                    if message.text.strip() == b["text"].strip():
+                        url = b.get("url", "")
+                        if url:
+                            await message.answer(url)
+                        else:
+                            await message.answer("Ссылка для этой кнопки не задана.")
+                        return
 
         # Настройки антиспама
         now = time.time()
