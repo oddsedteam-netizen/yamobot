@@ -23,6 +23,30 @@ def _get_conn() -> sqlite3.Connection:
     return _conn
 
 
+def _migrate_admin_scope(conn: sqlite3.Connection) -> None:
+    """Добавляет owner_id в admins и меняет уникальность на (owner_id, user_id)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(admins)").fetchall()]
+    if "owner_id" in cols:
+        return
+    conn.executescript("""
+        CREATE TABLE admins_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id    INTEGER NOT NULL DEFAULT 0,
+            user_id     INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            tag         TEXT NOT NULL,
+            active      INTEGER DEFAULT 1,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_id, user_id)
+        );
+        INSERT INTO admins_new (owner_id, user_id, username, tag, active, created_at)
+            SELECT 0, user_id, username, tag, active, created_at FROM admins;
+        DROP TABLE admins;
+        ALTER TABLE admins_new RENAME TO admins;
+    """)
+    conn.commit()
+
+
 def ensure_db() -> None:
     conn = _get_conn()
     conn.executescript("""
@@ -72,11 +96,12 @@ def ensure_db() -> None:
         CREATE TABLE IF NOT EXISTS admins (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id     INTEGER NOT NULL,
+            owner_id     INTEGER NOT NULL DEFAULT 0,
             username    TEXT DEFAULT '',
             tag         TEXT NOT NULL,
             active      INTEGER DEFAULT 1,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id)
+            UNIQUE(owner_id, user_id)
         );
 
         CREATE TABLE IF NOT EXISTS admin_tag_history (
@@ -135,7 +160,14 @@ def ensure_db() -> None:
             user_msg_id     INTEGER DEFAULT 0,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS bot_keyboards (
+            bot_id       INTEGER PRIMARY KEY,
+            owner_id     INTEGER NOT NULL,
+            buttons      TEXT DEFAULT '[]'
+        );
     """)
+    _migrate_admin_scope(conn)
     conn.commit()
 
 
@@ -379,13 +411,13 @@ def set_antispam_mode(user_id: int, bot_id: int, mode: str) -> bool:
 #  Админы (глобальные — привязаны ко всем ботам)
 # ═══════════════════════════════════════════════════════════
 
-def add_admin(user_id: int, username: str, tag: str) -> bool:
+def add_admin(owner_id: int, user_id: int, username: str, tag: str) -> bool:
     conn = _get_conn()
     with _lock:
         try:
             conn.execute(
-                "INSERT INTO admins (user_id, username, tag) VALUES (?, ?, ?)",
-                (user_id, username, tag)
+                "INSERT INTO admins (owner_id, user_id, username, tag) VALUES (?, ?, ?, ?)",
+                (owner_id, user_id, username, tag)
             )
             conn.execute(
                 "INSERT INTO admin_tag_history (admin_user_id, old_tag, new_tag) VALUES (?, ?, ?)",
@@ -397,40 +429,45 @@ def add_admin(user_id: int, username: str, tag: str) -> bool:
             return False
 
 
-def remove_admin(user_id: int) -> bool:
+def remove_admin(owner_id: int, user_id: int) -> bool:
     conn = _get_conn()
     with _lock:
-        cur = conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        cur = conn.execute("DELETE FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id))
         conn.commit()
         return cur.rowcount > 0
 
 
-def get_admins_all() -> list[dict]:
+def get_admins_all(owner_id: int) -> list[dict]:
     conn = _get_conn()
-    rows = conn.execute("SELECT * FROM admins").fetchall()
+    rows = conn.execute("SELECT * FROM admins WHERE owner_id = ?", (owner_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_admin_by_tag(tag: str) -> dict | None:
+def get_admin_by_tag(owner_id: int, tag: str) -> dict | None:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM admins WHERE tag = ?", (tag,)).fetchone()
+    row = conn.execute("SELECT * FROM admins WHERE owner_id = ? AND tag = ?", (owner_id, tag)).fetchone()
     return dict(row) if row else None
 
 
-def get_admin_by_user_id(user_id: int) -> dict | None:
+def get_admin_by_user_id(owner_id: int, user_id: int) -> dict | None:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+    row = conn.execute("SELECT * FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id)).fetchone()
     return dict(row) if row else None
 
 
-def update_admin_tag(user_id: int, new_tag: str) -> bool:
+def update_admin_tag(owner_id: int, user_id: int, new_tag: str) -> bool:
     conn = _get_conn()
     with _lock:
-        old = conn.execute("SELECT tag FROM admins WHERE user_id = ?", (user_id,)).fetchone()
+        old = conn.execute(
+            "SELECT tag FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id)
+        ).fetchone()
         if not old:
             return False
         old_tag = old[0]
-        conn.execute("UPDATE admins SET tag = ? WHERE user_id = ?", (new_tag, user_id))
+        conn.execute(
+            "UPDATE admins SET tag = ? WHERE owner_id = ? AND user_id = ?",
+            (new_tag, owner_id, user_id)
+        )
         conn.execute(
             "INSERT INTO admin_tag_history (admin_user_id, old_tag, new_tag) VALUES (?, ?, ?)",
             (user_id, old_tag, new_tag)
@@ -439,8 +476,13 @@ def update_admin_tag(user_id: int, new_tag: str) -> bool:
         return True
 
 
-def get_admin_tag_history(user_id: int) -> list[dict]:
+def get_admin_tag_history(owner_id: int, user_id: int) -> list[dict]:
     conn = _get_conn()
+    admin = conn.execute(
+        "SELECT id FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id)
+    ).fetchone()
+    if not admin:
+        return []
     rows = conn.execute(
         "SELECT * FROM admin_tag_history WHERE admin_user_id = ? ORDER BY changed_at",
         (user_id,)
@@ -458,23 +500,41 @@ def add_admin_message(bot_id: int, admin_user_id: int, direction: str = "out") -
         conn.commit()
 
 
-def get_admin_message_stats(admin_user_id: int) -> dict:
+def get_bot_owner(bot_id: int) -> int | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT owner_id FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _owner_bot_ids(owner_id: int) -> list[int]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT id FROM bots WHERE owner_id = ?", (owner_id,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_admin_message_stats(owner_id: int, admin_user_id: int) -> dict:
     conn = _get_conn()
     now = datetime.utcnow()
     day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return {"total": 0, "day": 0, "week": 0, "month": 0}
+    placeholders = ",".join("?" for _ in bot_ids)
+    params = bot_ids
+
     def _count(since: str) -> int:
         row = conn.execute(
-            "SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ? AND created_at >= ?",
-            (admin_user_id, since)
+            f"SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ? AND created_at >= ? AND bot_id IN ({placeholders})",
+            (admin_user_id, since, *params)
         ).fetchone()
         return row[0]
 
     total = conn.execute(
-        "SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ?",
-        (admin_user_id,)
+        f"SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ? AND bot_id IN ({placeholders})",
+        (admin_user_id, *params)
     ).fetchone()[0]
 
     return {
@@ -485,21 +545,25 @@ def get_admin_message_stats(admin_user_id: int) -> dict:
     }
 
 
-def get_admin_active_topics(admin_user_id: int) -> int:
+def get_admin_active_topics(owner_id: int, admin_user_id: int) -> int:
     conn = _get_conn()
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return 0
+    placeholders = ",".join("?" for _ in bot_ids)
     row = conn.execute(
-        "SELECT COUNT(*) FROM feedback_topics WHERE admin_user_id = ? AND status = 'assigned'",
-        (admin_user_id,)
+        f"SELECT COUNT(*) FROM feedback_topics WHERE admin_user_id = ? AND status = 'assigned' AND bot_id IN ({placeholders})",
+        (admin_user_id, *bot_ids)
     ).fetchone()
     return row[0]
 
 
-def get_all_admins_stats() -> list[dict]:
-    admins = get_admins_all()
+def get_all_admins_stats(owner_id: int) -> list[dict]:
+    admins = get_admins_all(owner_id)
     result = []
     for a in admins:
-        stats = get_admin_message_stats(a["user_id"])
-        topics = get_admin_active_topics(a["user_id"])
+        stats = get_admin_message_stats(owner_id, a["user_id"])
+        topics = get_admin_active_topics(owner_id, a["user_id"])
         result.append({
             "admin": a,
             "stats": stats,
@@ -674,6 +738,59 @@ def get_feedback_msg_by_user_msg(bot_id: int, user_chat_id: int, user_msg_id: in
     return dict(row) if row else None
 
 # ═══════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════
+#  Клавиатура ботов (настраиваемые кнопки)
+# ═══════════════════════════════════════════════════════════
+
+ACTION_ADMIN = "admin"
+
+def default_bot_keyboard() -> list[dict]:
+    """Клавиатура по умолчанию: только «сменить админа»."""
+    return [{"kind": "admin", "text": "сменить админа"}]
+
+
+def get_bot_keyboard_raw(bot_id: int) -> str:
+    conn = _get_conn()
+    row = conn.execute("SELECT buttons FROM bot_keyboards WHERE bot_id = ?", (bot_id,)).fetchone()
+    return row[0] if row else ""
+
+
+def get_bot_keyboard(owner_id: int, bot_id: int) -> list[dict]:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT buttons FROM bot_keyboards WHERE bot_id = ? AND owner_id = ?", (bot_id, owner_id)
+    ).fetchone()
+    if not row:
+        return default_bot_keyboard()
+    try:
+        buttons = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return default_bot_keyboard()
+    return buttons if isinstance(buttons, list) else default_bot_keyboard()
+
+
+def get_bot_keyboard_by_bot(bot_id: int) -> list[dict]:
+    """Для дочернего бота: клавиатура вне зависимости от того, кто владелец."""
+    conn = _get_conn()
+    row = conn.execute("SELECT buttons FROM bot_keyboards WHERE bot_id = ?", (bot_id,)).fetchone()
+    if not row:
+        return default_bot_keyboard()
+    try:
+        buttons = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return default_bot_keyboard()
+    return buttons if isinstance(buttons, list) else default_bot_keyboard()
+
+
+def set_bot_keyboard(owner_id: int, bot_id: int, buttons: list[dict]) -> bool:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_keyboards (bot_id, owner_id, buttons) VALUES (?, ?, ?)",
+            (bot_id, owner_id, json.dumps(buttons, ensure_ascii=False))
+        )
+        conn.commit()
+        return True
 #  Импорт пользователей + баны
 # ═══════════════════════════════════════════════════════════
 

@@ -27,6 +27,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📊 Статистика", callback_data="gstats")],
             [InlineKeyboardButton(text="👤 Админы", callback_data="gadmins")],
             [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
+            [InlineKeyboardButton(text="⌨️ Клавиатура", callback_data="keyboard_menu")],
+            [InlineKeyboardButton(text="❓ FAQ", callback_data="faq")],
         ]
     )
 
@@ -51,4 +53,31 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.edit_text(WELCOME_TEXT, reply_markup=main_menu_kb())
         except Exception:
             await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    await callback.answer()
+
+
+FAQ_TEXT = (
+    "❓ <b>Как пользоваться YamoBot</b>\n\n"
+    "1️⃣ <b>🤖 Мои боты</b> — зайди сюда, чтобы увидеть все подключённые боты. "
+    "Нажми на бота, чтобы открыть его меню: рассылка, антиспам, статистика, редактор, ПЗ.\n\n"
+    "2️⃣ <b>➕ Добавить бота</b> — пришли токен от @BotFather. Бот будет добавлен и запущен.\n\n"
+    "3️⃣ <b>📊 Статистика</b> — общая статистика по всем ботам.\n\n"
+    "4️⃣ <b>👤 Админы</b> — добавь админов, которые будут отвечать пользователям в ПЗ. "
+    "Каждому админу можно задать тег. Нажми на админа, чтобы изменить тег или удалить.\n\n"
+    "5️⃣ <b>📋 ПЗ</b> — обращения пользователей. Пришли боту в личку — создастся топик "
+    "в подключённой группе (команда /connect). Админ может нажать «Я беру» (/take).\n\n"
+    "6️⃣ <b>⌨️ Клавиатура</b> — настрой, какие кнопки показывать в каждом боте: "
+    "кнопку «сменить админа» и свои кнопки-ссылки (например, на канал).\n\n"
+    "7️⃣ <b>👥 Совладельцы</b> — добавь людей, которые увидят твоих ботов и статистику.\n\n"
+    "Все данные привязаны к твоему аккаунту. Чужие боты и админы тебе не видны."
+)
+
+
+@router.callback_query(F.data == "faq")
+async def cb_faq(callback: CallbackQuery) -> None:
+    if callback.message:
+        try:
+            await callback.message.edit_text(FAQ_TEXT, reply_markup=main_menu_kb())
+        except Exception:
+            await callback.message.answer(FAQ_TEXT, reply_markup=main_menu_kb())
     await callback.answer()

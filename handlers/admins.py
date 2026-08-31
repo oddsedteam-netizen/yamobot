@@ -81,11 +81,12 @@ async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) 
 @router.callback_query(F.data == "gadmins")
 async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    admins = get_admins_all()
+    owner_id = callback.from_user.id
+    admins = get_admins_all(owner_id)
 
     text = (
         f"👤 <b>Управление админами</b>\n\n"
-        f"Всего админов (глобально): <b>{len(admins)}</b>\n\n"
+        f"Всего админов: <b>{len(admins)}</b>\n\n"
         f"Админы привязаны ко всем ботам.\n\n"
         f"Выбери действие:"
     )
@@ -99,7 +100,8 @@ async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
-    admins = get_admins_all()
+    owner_id = callback.from_user.id
+    admins = get_admins_all(owner_id)
 
     if admins:
         lines = []
@@ -107,7 +109,7 @@ async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
         for i, a in enumerate(admins, 1):
             uname = f"@{a['username']}" if a['username'] else f"ID:{a['user_id']}"
             status = "🟢 активен" if a["active"] else "🔴 неактивен"
-            topics = get_admin_active_topics(a["user_id"])
+            topics = get_admin_active_topics(owner_id, a["user_id"])
             lines.append(f"{i}. <b>#{a['tag']}</b>  {uname}")
             lines.append(f"   {status} · ПЗ за ним: <b>{topics}</b>")
             lines.append("")
@@ -137,7 +139,8 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     admin_user_id = int(callback.data.split("_")[-1])
 
-    admin = get_admin_by_user_id(admin_user_id)
+    owner_id = callback.from_user.id
+    admin = get_admin_by_user_id(owner_id, admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
         return
@@ -145,9 +148,9 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
     status = "🟢 активен" if admin["active"] else "🔴 неактивен"
 
-    stats = get_admin_message_stats(admin["user_id"])
-    topics = get_admin_active_topics(admin["user_id"])
-    history = get_admin_tag_history(admin["user_id"])
+    stats = get_admin_message_stats(owner_id, admin["user_id"])
+    topics = get_admin_active_topics(owner_id, admin["user_id"])
+    history = get_admin_tag_history(owner_id, admin["user_id"])
 
     history_text = ""
     if history:
@@ -180,7 +183,7 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
     admin_user_id = int(callback.data.split("_")[-1])
 
-    admin = get_admin_by_user_id(admin_user_id)
+    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
         return
@@ -212,7 +215,7 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
     await state.clear()
     admin_user_id = int(callback.data.split("_")[-1])
 
-    admin = get_admin_by_user_id(admin_user_id)
+    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
         return
@@ -236,11 +239,11 @@ async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     admin_user_id = int(callback.data.split("_")[-1])
 
-    admin = get_admin_by_user_id(admin_user_id)
+    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
     uname = f"@{admin['username']}" if admin and admin['username'] else f"ID:{admin_user_id}"
     tag = admin["tag"] if admin else "?"
 
-    remove_admin(admin_user_id)
+    remove_admin(callback.from_user.id, admin_user_id)
 
     text = f"✅ <b>Админ удалён!</b>\n\n👤 {uname}\n🏷 #{tag}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -256,7 +259,7 @@ async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "gadmins_stats")
 async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    all_stats = get_all_admins_stats()
+    all_stats = get_all_admins_stats(callback.from_user.id)
 
     if not all_stats:
         text = "📊 <b>Статистика админов</b>\n\nНет админов."
@@ -339,7 +342,7 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    success = add_admin(admin_user_id, username, tag)
+    success = add_admin(message.from_user.id, admin_user_id, username, tag)
     await state.clear()
 
     if success:
@@ -367,7 +370,7 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "gadmins_del")
 async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    admins = get_admins_all()
+    admins = get_admins_all(callback.from_user.id)
     if not admins:
         await callback.answer("Нет админов")
         return
@@ -408,13 +411,13 @@ async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    admin = get_admin_by_tag(tag)
+    admin = get_admin_by_tag(message.from_user.id, tag)
     if not admin:
         await message.answer(f"⚠️ Админ с тегом <b>#{tag}</b> не найден.")
         return
 
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
-    remove_admin(admin["user_id"])
+    remove_admin(message.from_user.id, admin["user_id"])
     await state.clear()
 
     await message.answer(
@@ -457,14 +460,14 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
 
     # Редактирование тега из карточки конкретного админа (вводим только новый тег)
     if admin_eid is not None:
-        admin = get_admin_by_user_id(admin_eid)
+        admin = get_admin_by_user_id(message.from_user.id, admin_eid)
         new_tag = (message.text or "").strip().lstrip("#")
         if not admin or not new_tag:
             await message.answer("❌ Некорректный тег. Введи тег ещё раз.")
             return
 
         old_tag = admin["tag"]
-        update_admin_tag(admin_eid, new_tag)
+        update_admin_tag(message.from_user.id, admin_eid, new_tag)
         await state.clear()
         uname = f"@{admin['username']}" if admin.get("username") else f"ID:{admin_eid}"
         await message.answer(
@@ -488,12 +491,12 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
     old_tag = parts[0].strip().lstrip("#")
     new_tag = parts[1].strip().lstrip("#")
 
-    admin = get_admin_by_tag(old_tag)
+    admin = get_admin_by_tag(message.from_user.id, old_tag)
     if not admin:
         await message.answer(f"⚠️ Админ с тегом <b>#{old_tag}</b> не найден.")
         return
 
-    update_admin_tag(admin["user_id"], new_tag)
+    update_admin_tag(message.from_user.id, admin["user_id"], new_tag)
     await state.clear()
 
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
@@ -537,7 +540,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    admin = get_admin_by_tag(tag)
+    admin = get_admin_by_tag(message.from_user.id, tag)
     await state.clear()
 
     if not admin:
@@ -552,9 +555,9 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
     status = "✅ активен" if admin["active"] else "❌ неактивен"
 
-    stats = get_admin_message_stats(admin["user_id"])
-    topics = get_admin_active_topics(admin["user_id"])
-    history = get_admin_tag_history(admin["user_id"])
+    stats = get_admin_message_stats(message.from_user.id, admin["user_id"])
+    topics = get_admin_active_topics(message.from_user.id, admin["user_id"])
+    history = get_admin_tag_history(message.from_user.id, admin["user_id"])
 
     history_text = ""
     if history:

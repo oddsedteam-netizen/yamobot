@@ -45,6 +45,8 @@ from services.storage import (
     save_feedback_message,
     get_feedback_msg_by_group_msg,
     get_feedback_msg_by_user_msg,
+    get_bot_owner,
+    get_bot_keyboard_by_bot,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,14 +65,25 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _user_actions_kb() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура действий для пользователя."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="сменить админа")],
-        ],
-        resize_keyboard=True,
-    )
+ACTIONS_ADMIN_TEXT = "сменить админа"
+
+
+def _build_actions_kb(bot_id: int) -> InlineKeyboardMarkup | None:
+    """Инлайн-клавиатура действий (настраивается владельцем бота)."""
+    buttons = get_bot_keyboard_by_bot(bot_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    for b in buttons:
+        kind = b.get("kind")
+        text = b.get("text", ACTIONS_ADMIN_TEXT)
+        if kind == "url":
+            url = b.get("url", "")
+            if url:
+                rows.append([InlineKeyboardButton(text=text, url=url)])
+        else:
+            rows.append([InlineKeyboardButton(text=text, callback_data="child_change_admin")])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _send_to_topic(source_msg: Message, bot: Bot,
@@ -219,12 +232,15 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
         kb = _build_welcome_kb(fresh)
-        await message.answer(welcome, reply_markup=kb)
+        actions = _build_actions_kb(bot_id)
+        rows: list[list[InlineKeyboardButton]] = []
+        if kb:
+            rows.extend(kb.inline_keyboard)
+        if actions:
+            rows.extend(actions.inline_keyboard)
+        markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
         try:
-            await message.answer(
-                "📌 Клавиатура действий:",
-                reply_markup=_user_actions_kb(),
-            )
+            await message.answer(welcome, reply_markup=markup)
         except Exception:
             pass
         add_stat(bot_id, "message_out")
@@ -426,13 +442,34 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     # ═══════════════ Callback: "я беру" ═══════════════
 
+    @child_dp.callback_query(F.data == "child_change_admin")
+    async def cb_child_change_admin(callback: CallbackQuery) -> None:
+        topic = get_topic_by_user(bot_id, callback.from_user.id)
+        if topic and topic["admin_user_id"]:
+            await callback.message.edit_text(
+                "❓ Вы уверены, что хотите сменить админа?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Да",
+                            callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
+                        InlineKeyboardButton(
+                            text="❌ Нет",
+                            callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
+                    ]
+                ])
+            )
+        else:
+            await callback.message.edit_text("У вас сейчас нет назначенного админа.")
+        await callback.answer()
+
     @child_dp.callback_query(F.data.startswith("take_user_"))
     async def cb_take_user(callback: CallbackQuery) -> None:
         parts = callback.data.split("_")
         topic_id = int(parts[2])
         group_chat_id = int(parts[3])
 
-        admin = get_admin_by_user_id(callback.from_user.id)
+        admin = get_admin_by_user_id(get_bot_owner(bot_id) or 0, callback.from_user.id)
         if admin:
             tag = admin["tag"]
         else:
@@ -716,7 +753,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         add_stat(bot_id, "message_out")
 
-        admin = get_admin_by_user_id(message.from_user.id)
+        admin = get_admin_by_user_id(get_bot_owner(bot_id) or 0, message.from_user.id)
         if admin:
             add_admin_message(bot_id, message.from_user.id, "out")
 
