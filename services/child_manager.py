@@ -12,11 +12,9 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
     CallbackQuery,
     MessageEntity,
-    ReplyKeyboardMarkup,
 )
 
 from services.storage import (
@@ -68,21 +66,15 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
 ACTIONS_ADMIN_TEXT = "сменить админа"
 
 
-def _build_reply_kb(bot_id: int) -> ReplyKeyboardMarkup | None:
-    """Нижняя reply-клавиатура действий (настраивается владельцем бота)."""
-    buttons = get_bot_keyboard_by_bot(bot_id)
-    rows: list[list[KeyboardButton]] = []
-    for b in buttons:
-        if b.get("kind") != "admin":
-            continue
-        rows.append([KeyboardButton(text=b.get("text") or ACTIONS_ADMIN_TEXT)])
-    if not rows:
-        return None
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        input_field_placeholder="Выберите действие…",
-    )
+def _build_admin_button(bot_id: int) -> InlineKeyboardButton | None:
+    """Кнопка «сменить админа» (если включена владельцем)."""
+    for b in get_bot_keyboard_by_bot(bot_id):
+        if b.get("kind") == "admin":
+            return InlineKeyboardButton(
+                text=b.get("text") or ACTIONS_ADMIN_TEXT,
+                callback_data="child_change_admin",
+            )
+    return None
 
 
 async def _send_to_topic(source_msg: Message, bot: Bot,
@@ -231,16 +223,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
         kb = _build_welcome_kb(fresh)
-        reply = _build_reply_kb(bot_id)
+        admin_btn = _build_admin_button(bot_id)
+        rows: list[list[InlineKeyboardButton]] = []
+        if kb:
+            rows.extend(kb.inline_keyboard)
+        if admin_btn:
+            rows.append([admin_btn])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
         try:
-            await message.answer(welcome, reply_markup=kb)
+            await message.answer(welcome, reply_markup=markup)
         except Exception:
             pass
-        if reply:
-            try:
-                await message.answer("📌 Клавиатура действий:", reply_markup=reply)
-            except Exception:
-                pass
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -437,6 +430,29 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         )
         await message.answer("✅ Запрос на смену админа отправлен.")
 
+
+    # ═══════════════ Callback: «сменить админа» ═══════════════
+
+    @child_dp.callback_query(F.data == "child_change_admin")
+    async def cb_child_change_admin(callback: CallbackQuery) -> None:
+        topic = get_topic_by_user(bot_id, callback.from_user.id)
+        if topic and topic["admin_user_id"]:
+            await callback.message.edit_text(
+                "❓ Вы уверены, что хотите сменить админа?",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Да",
+                            callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
+                        InlineKeyboardButton(
+                            text="❌ Нет",
+                            callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
+                    ]
+                ])
+            )
+        else:
+            await callback.message.edit_text("У вас сейчас нет назначенного админа.")
+        await callback.answer()
 
     # ═══════════════ Callback: "я беру" ═══════════════
 
