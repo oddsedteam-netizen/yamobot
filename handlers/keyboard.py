@@ -7,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from html import escape
 
 from services.storage import (
     get_user_bots,
@@ -58,19 +59,25 @@ def describe(buttons: list[dict]) -> str:
     lines = []
     for b in buttons:
         if b.get("kind") == "url":
-            lines.append(f"  🔗 {b.get('text', 'кнопка')} → {b.get('url', '')}")
+            lines.append(f"  🔗 {escape(b.get('text', 'кнопка'))} → {escape(b.get('url', ''))}")
         else:
-            lines.append(f"  🖱 «{b.get('text', ADMIN_TEXT)}»")
+            lines.append(f"  🖱 «{escape(b.get('text', ADMIN_TEXT))}»")
     return "\n".join(lines) or "— кнопок нет —"
 
 
 async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
     if callback.message:
         try:
-            await callback.message.edit_text(text, reply_markup=kb)
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+            try:
+                await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+    try:
+        await callback.answer()
+    except Exception:
+        pass
 
 
 # ═══════════════ Список ботов ═══════════════
@@ -144,7 +151,7 @@ async def fsm_link_name(message: Message, state: FSMContext) -> None:
     await state.set_state(KeyboardFSM.waiting_link_url)
 
     await message.answer(
-        f"✅ Название: <b>{name}</b>\n\nТеперь отправь <b>ссылку</b>, на которую будет вести кнопка.\n"
+        f"✅ Название: <b>{escape(name)}</b>\n\nТеперь отправь <b>ссылку</b>, на которую будет вести кнопка.\n"
         f"Пример: <code>https://t.me/мой_канал</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="keyboard_menu")],
@@ -170,7 +177,7 @@ async def fsm_link_url(message: Message, state: FSMContext) -> None:
     set_bot_keyboard(user_id, bot_id, buttons)
 
     await message.answer(
-        f"✅ <b>Кнопка добавлена!</b>\n\n🔗 {name} → {url}",
+        f"✅ <b>Кнопка добавлена!</b>\n\n🔗 {escape(name)} → {escape(url)}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⌨️ Клавиатура", callback_data=f"kbbot_{bot_id}")],
             [InlineKeyboardButton(text="⬅️ Меню", callback_data="back_main")],
@@ -216,7 +223,7 @@ async def cb_edit_bot_keyboard(callback: CallbackQuery) -> None:
             name = bot_display_name(b)
 
     text = (
-        f"⌨️ <b>Клавиатура — {name}</b>\n\n"
+        f"⌨️ <b>Клавиатура — {escape(name)}</b>\n\n"
         f"Текущие кнопки:\n{describe(buttons)}\n\n"
         f"Что-то из этого будет показываться пользователям бота после /start."
     )
