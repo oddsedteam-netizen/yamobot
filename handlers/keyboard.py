@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+
+from html import escape
+
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -7,7 +11,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from html import escape
 
 from services.storage import (
     get_user_bots,
@@ -24,13 +27,6 @@ ADMIN_TEXT = "сменить админа"
 class KeyboardFSM(StatesGroup):
     waiting_link_name = State()
     waiting_link_url = State()
-
-
-def _back_to_bots_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К списку ботов", callback_data="keyboard_menu")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
-    ])
 
 
 def bot_keyboard_kb(bot_id: int, buttons: list[dict]) -> InlineKeyboardMarkup:
@@ -62,8 +58,7 @@ def describe(buttons: list[dict]) -> str:
             lines.append(f"  🔗 {escape(b.get('text', 'кнопка'))} → {escape(b.get('url', ''))}")
         else:
             lines.append(f"  🖱 «{escape(b.get('text', ADMIN_TEXT))}»")
-    return "\n".join(lines) or "— кнопок нет —"
-
+    return "\n".join(lines)
 
 async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
     if callback.message:
@@ -80,7 +75,7 @@ async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) 
         pass
 
 
-# ═══════════════ Список ботов ═══════════════
+# ═══════════════ Меню выбора бота ═══════════════
 
 @router.callback_query(F.data == "keyboard_menu")
 async def cb_keyboard_menu(callback: CallbackQuery, state: FSMContext) -> None:
@@ -100,6 +95,34 @@ async def cb_keyboard_menu(callback: CallbackQuery, state: FSMContext) -> None:
         InlineKeyboardButton(text=f"🤖 {bot_display_name(b)}", callback_data=f"kbbot_{b['id']}")
     ] for b in bots]
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+
+    text = (
+        "⌨️ <b>Клавиатура</b>\n\n"
+        "Выбери бота, для которого настроить кнопки. "
+        "В каждом боте будет показываться свой набор кнопок."
+    )
+    await _render(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("kbbot_"))
+async def cb_edit_bot_keyboard(callback: CallbackQuery) -> None:
+    bot_id = int(callback.data.split("_", 1)[1])
+    user_id = callback.from_user.id
+
+    buttons = get_bot_keyboard(user_id, bot_id)
+    name = "бот"
+    for b in get_user_bots(user_id):
+        if b["id"] == bot_id:
+            name = bot_display_name(b)
+
+    text = (
+        f"⌨️ <b>Клавиатура — {escape(name)}</b>\n\n"
+        f"Текущие кнопки:\n{describe(buttons)}\n\n"
+        f"Что-то из этого будет показываться пользователям бота после /start."
+    )
+    await _render(callback, text, bot_keyboard_kb(bot_id, buttons))
+
+
 # ═══════════════ Тумблер «сменить админа» ═══════════════
 
 @router.callback_query(F.data.startswith("kb_admin_"))
@@ -157,8 +180,6 @@ async def fsm_link_name(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="keyboard_menu")],
         ])
     )
-
-
 @router.message(KeyboardFSM.waiting_link_url)
 async def fsm_link_url(message: Message, state: FSMContext) -> None:
     url = (message.text or "").strip()
@@ -201,30 +222,4 @@ async def cb_delete_link(callback: CallbackQuery) -> None:
 
     set_bot_keyboard(user_id, bot_id, buttons)
     text = f"⌨️ <b>Клавиатура</b>\n\nТекущие кнопки:\n{describe(buttons)}"
-    await _render(callback, text, bot_keyboard_kb(bot_id, buttons))
-
-    text = (
-        "⌨️ <b>Клавиатура</b>\n\n"
-        "Выбери бота, для которого настроить кнопки. "
-        "В каждом боте будет показываться свой набор кнопок."
-    )
-    await _render(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("kbbot_"))
-async def cb_edit_bot_keyboard(callback: CallbackQuery) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
-
-    buttons = get_bot_keyboard(user_id, bot_id)
-    name = "бот"
-    for b in get_user_bots(user_id):
-        if b["id"] == bot_id:
-            name = bot_display_name(b)
-
-    text = (
-        f"⌨️ <b>Клавиатура — {escape(name)}</b>\n\n"
-        f"Текущие кнопки:\n{describe(buttons)}\n\n"
-        f"Что-то из этого будет показываться пользователям бота после /start."
-    )
     await _render(callback, text, bot_keyboard_kb(bot_id, buttons))
