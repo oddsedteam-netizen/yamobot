@@ -1,36 +1,30 @@
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from handlers._common import render_callback
 from handlers.profile import admin_kb
 from services.config import OWNER_ID, is_super_admin
-from services.storage import create_complaint, get_complaints, get_complaint, set_complaint_status
+from services.storage import (
+    create_complaint,
+    get_complaints,
+    get_complaint,
+    set_complaint_status,
+)
 
 router = Router()
 
 
 class ComplaintFSM(StatesGroup):
+    waiting_category = State()
     waiting_screenshot = State()
     waiting_comment = State()
-
-
-CATEGORIES = {"spam": "📢 Спам", "abuse": "😡 Оскорбления",
-              "rules": "⚠️ Нарушение правил", "other": "❓ Другое"}
-
-
-def _cancel_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_main")]
-    ])
-
-
-def categories_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=CATEGORIES[c], callback_data=f"comp_cat_{c}")]
-            for c in CATEGORIES]
-    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_main")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def complaints_admin_kb(complaints: list[dict]) -> InlineKeyboardMarkup:
@@ -39,29 +33,32 @@ def complaints_admin_kb(complaints: list[dict]) -> InlineKeyboardMarkup:
     for c in complaints:
         label = c.get("category") or c.get("user_username") or f"#{c['id']}"
         st = statuses.get(c["status"], c["status"])
-        rows.append([InlineKeyboardButton(text=f"#{c['id']} — {label} ({st})",
-                                          callback_data=f"comp_view_{c['id']}")])
+        rows.append([InlineKeyboardButton(
+            text=f"#{c['id']} — {label} ({st})",
+            callback_data=f"comp_view_{c['id']}",
+        )])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profile_admin")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def start_complaint(message: Message, state: FSMContext) -> None:
-    await state.set_state(ComplaintFSM.waiting_screenshot)
-    await message.answer("⚠️ <b>Жалоба</b>\n\nВыбери категорию жалобы:", reply_markup=categories_kb())
+    await state.set_state(ComplaintFSM.waiting_category)
+    await state.update_data(complaint_context="")
+    await message.answer(
+        "⚠️ <b>Жалоба</b>\n\n"
+        "Напиши <b>категорию</b> жалобы одной строкой."
+    )
 
 
-@router.callback_query(F.data.startswith("comp_cat_"))
-async def cb_choose_category(callback: CallbackQuery, state: FSMContext) -> None:
-    code = callback.data.split("_")[-1]
-    label = CATEGORIES.get(code, code)
-    await state.update_data(category=label)
+@router.message(ComplaintFSM.waiting_category)
+async def fsm_category(message: Message, state: FSMContext) -> None:
+    category = (message.text or "").strip()
+    if not category:
+        await message.answer("❌ Напиши категорию жалобы текстом.")
+        return
+    await state.update_data(category=category)
     await state.set_state(ComplaintFSM.waiting_screenshot)
-    try:
-        await callback.message.edit_text(f"⚠️ Категория: <b>{label}</b>\n\n📎 Отправь скриншот (фото).",
-                                         reply_markup=_cancel_kb())
-    except Exception:
-        await callback.message.answer(f"⚠️ Категория: <b>{label}</b>\n\n📎 Отправь скриншот (фото).")
-    await callback.answer()
+    await message.answer("✅ Категория принята.\n\n📎 Теперь отправь <b>скриншот</b> (фото).")
 
 
 @router.message(ComplaintFSM.waiting_screenshot)
@@ -71,7 +68,7 @@ async def fsm_screenshot(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(screenshot_id=message.photo[-1].file_id)
     await state.set_state(ComplaintFSM.waiting_comment)
-    await message.answer("💬 Теперь напиши комментарий к жалобе.")
+    await message.answer("💬 Теперь напиши <b>комментарий</b> к жалобе.")
 
 
 @router.message(ComplaintFSM.waiting_comment)
@@ -81,12 +78,14 @@ async def fsm_comment(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Комментарий не может быть пустым.")
         return
     data = await state.get_data()
-    complaint_id = create_complaint(message.from_user.id, message.from_user.username or "",
-                                    data.get("category", "Другое"),
-                                    data.get("screenshot_id", ""), comment)
+    complaint_id = create_complaint(
+        message.from_user.id, message.from_user.username or "",
+        data.get("category", "Без категории"),
+        data.get("screenshot_id", ""), comment,
+    )
     await state.clear()
     await message.answer(f"✅ <b>Жалоба #{complaint_id} отправлена.</b>\n\nМы рассмотрим её в ближайшее время.")
-    await _notify_admin(message.bot, complaint_id, data.get("category", ""), comment)
+    await _notify_admin(message.bot, complaint_id, data.get("category", "Без категории"), comment)
 async def _notify_admin(bot, complaint_id: int, category: str, comment: str) -> None:
     if not OWNER_ID:
         return

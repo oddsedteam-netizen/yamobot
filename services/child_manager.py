@@ -237,25 +237,21 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
 
-        # Инлайн-кнопки (ссылки) прикрепляем прямо к приветствию.
-        welcome_kb = _build_welcome_kb(fresh)
+        # Reply-клавиатуру дочернего бота прикрепляем прямо к приветствию.
+        reply_kb = _build_reply_kb(fresh)
         try:
-            if welcome_kb:
-                await message.answer(welcome, reply_markup=welcome_kb)
-            else:
-                await message.answer(welcome)
+            await message.answer(welcome, reply_markup=reply_kb)
         except Exception:
             try:
                 await message.answer(welcome)
             except Exception:
                 pass
 
-        # Reply-клавиатуру дочернего бота активируем отдельным сообщением,
-        # чтобы её можно было показывать вместе с инлайн-ссылками.
-        reply_kb = _build_reply_kb(fresh)
-        if reply_kb:
+        # Инлайн-кнопки (ссылки) показываем отдельным сообщением.
+        welcome_kb = _build_welcome_kb(fresh)
+        if welcome_kb:
             try:
-                await message.answer("Выберите действие:", reply_markup=reply_kb)
+                await message.answer("🔗 Ссылки:", reply_markup=welcome_kb)
             except Exception:
                 pass
         add_stat(bot_id, "message_out")

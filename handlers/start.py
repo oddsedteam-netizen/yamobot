@@ -47,6 +47,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="👥 Админы")],
             [KeyboardButton(text="📋 ПЗ")],
             [KeyboardButton(text="⚠️ Жалоба")],
+            [KeyboardButton(text="❓ FAQ")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие",
@@ -91,6 +92,18 @@ async def fsm_waiting_admin_tag(message: Message, state: FSMContext) -> None:
     username = message.from_user.username or ""
     consume_admin_invite(token)
     already = get_admin_by_user_id(owner_id, user_id)
+    if already:
+        await state.clear()
+        await message.answer(f"⚠️ Ты уже админ с тегом #{already['tag']}.")
+        return
+    ok = add_admin(owner_id, user_id, username, tag)
+    await state.clear()
+    if ok:
+        await message.answer(f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>")
+    else:
+        await message.answer("⚠️ Не удалось добавить тебя как админа.")
+
+
 # ═══════════════ Reply-кнопки главного меню ═══════════════
 
 @router.message(F.text == "🤖 Боты")
@@ -128,6 +141,11 @@ async def on_complaint_button(message: Message, state: FSMContext) -> None:
     await start_complaint(message, state)
 
 
+@router.message(F.text == "❓ FAQ")
+async def on_faq_button(message: Message) -> None:
+    await message.answer(FAQ_TEXT)
+
+
 @router.callback_query(F.data == "back_main")
 async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -140,15 +158,39 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _show_main(message)
+
+
+@router.message(Command("adm"))
+async def cmd_adm(message: Message) -> None:
+    """Открывает админ-панель только для супер-админа (переменная ADMIN)."""
+    user_id = message.from_user.id
+    if not is_super_admin(user_id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    from handlers.profile import admin_kb
+    await message.answer("🛡 <b>Админ-панель</b>\n\nВыбери раздел:", reply_markup=admin_kb())
+
+
 FAQ_TEXT = (
     "❓ <b>Как пользоваться YamoBot</b>\n\n"
-    "1️⃣ <b>🤖 Боты</b> — зайди в «Боты», чтобы увидеть все подключённые боты.\n"
-    "2️⃣ <b>➕ Добавить бота</b> — пришли токен от @BotFather.\n"
-    "3️⃣ <b>👤 Профиль</b> — твои данные и статистика.\n"
-    "4️⃣ <b>👥 Админы</b> — управление админами и ПЗ.\n"
-    "5️⃣ <b>📋 ПЗ</b> — обращения пользователей.\n"
-    "6️⃣ <b>⚠️ Жалоба</b> — оставь жалобу администрации.\n\n"
-    "Все данные привязаны к твоему аккаунту."
+    "YamoBot — это менеджер для подключения и управления твоими Telegram-ботами. "
+    "Всё управление идёт через кнопки главного меню.\n\n"
+    "🤖 <b>Боты</b> — список всех твоих подключённых ботов. "
+    "Можно открыть любого бота, выбрать все боты разом или добавить нового. "
+    "Если у тебя несколько типов ботов, сначала бот спросит, какую категорию открыть.\n"
+    "➕ <b>Добавить бота</b> — отправь токен бота от @BotFather. "
+    "Бот спросит тип (стандарт или анкетница) и настроит клавиатуру.\n"
+    "👤 <b>Профиль</b> — твои данные: имя, ID, количество ботов, админов и обращений. "
+    "Рядом с каждым ботом показано количество его обращений.\n"
+    "👥 <b>Админы</b> — управление админами твоих ботов: список, добавление, удаление.\n"
+    "📋 <b>ПЗ</b> — просмотр обращений пользователей твоих ботов.\n"
+    "⚠️ <b>Жалоба</b> — отправь жалобу администрации. "
+    "Понадобится указать категорию, приложить скриншот и оставить комментарий.\n\n"
+    "Все данные привязаны к твоему аккаунту. Просто нажимай нужную кнопку и следуй подсказкам."
 )
 
 
@@ -157,19 +199,3 @@ async def cb_faq(callback: CallbackQuery) -> None:
     await render_callback(callback, FAQ_TEXT, InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]]
     ))
-    if already:
-        await state.clear()
-        await message.answer(f"⚠️ Ты уже админ с тегом #{already['tag']}.")
-        return
-    ok = add_admin(owner_id, user_id, username, tag)
-    await state.clear()
-    if ok:
-        await message.answer(f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>")
-    else:
-        await message.answer("⚠️ Не удалось добавить тебя как админа.")
-
-
-@router.message(Command("menu"))
-async def cmd_menu(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await _show_main(message)

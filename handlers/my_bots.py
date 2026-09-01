@@ -23,8 +23,13 @@ TYPE_LABELS = {
 }
 
 
+def _norm(bot_type: str | None) -> str:
+    """Нормализует тип бота: пустое/None -> 'standard'."""
+    return bot_type if bot_type in TYPE_LABELS else "standard"
+
+
 def _bot_list_kb(bots: list[dict], child_manager: ChildManager,
-                 bot_type: str | None = None) -> InlineKeyboardMarkup:
+                 bot_type: str | None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for b in bots:
         running = child_manager.is_running(b["id"])
@@ -53,20 +58,33 @@ def _types_kb(bot_types: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _filter_bots(bots: list[dict], bot_type: str) -> list[dict]:
+    return [b for b in bots if _norm(b.get("bot_type")) == bot_type]
+
+
 def my_bots_kb(user_id: int, child_manager: ChildManager) -> InlineKeyboardMarkup:
     all_types = get_user_bot_types(user_id)
-    bot_type = all_types[0] if all_types else None
     all_bots = get_user_bots(user_id)
-    type_bots = [b for b in all_bots if b.get("bot_type") == bot_type] if bot_type else all_bots
-    return _bot_list_kb(type_bots if type_bots else all_bots, child_manager,
-                        bot_type if bot_type else None)
+    if not all_bots:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")]
+        ])
+    bot_type = _norm(all_types[0]) if all_types else "standard"
+    type_bots = _filter_bots(all_bots, bot_type)
+    return _bot_list_kb(type_bots, child_manager, bot_type)
 
 
+def _bot_list_text(bots: list[dict], bot_type: str | None) -> str:
+    seg = f" — {TYPE_LABELS.get(_norm(bot_type), _norm(bot_type))}" if bot_type else ""
+    return (
+        f"🤖 <b>Боты{seg}</b> ({len(bots)} шт.)\n\n"
+        f"🟢 — работает  🔴 — остановлен\n\nВыбери бота:"
+    )
 async def show_my_bots(message: Message, child_manager: ChildManager) -> None:
     user_id = message.from_user.id
-    bots = get_user_bots(user_id)
+    all_bots = get_user_bots(user_id)
 
-    if not bots:
+    if not all_bots:
         await message.answer(
             "🤖 <b>Боты</b>\n\nУ тебя пока нет подключённых ботов.\nНажми «➕ Добавить бота».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -84,27 +102,20 @@ async def show_my_bots(message: Message, child_manager: ChildManager) -> None:
         )
         return
 
-    bot_type = bot_types[0] if bot_types else None
-    type_bots = [b for b in bots if b.get("bot_type") == bot_type] if bot_type else bots
-    await message.answer(_bot_list_text(user_id, bot_type),
-                         reply_markup=_bot_list_kb(type_bots, child_manager, bot_type))
+    bot_type = _norm(bot_types[0]) if bot_types else "standard"
+    bots = _filter_bots(all_bots, bot_type)
+    await message.answer(_bot_list_text(bots, bot_type),
+                         reply_markup=_bot_list_kb(bots, child_manager, bot_type))
 
 
-def _bot_list_text(user_id: int, bot_type: str | None) -> str:
-    bots = get_user_bots(user_id)
-    seg = f" — {TYPE_LABELS.get(bot_type, bot_type)}" if bot_type else ""
-    return (
-        f"🤖 <b>Боты{seg}</b> ({len(bots)} шт.)\n\n"
-        f"🟢 — работает  🔴 — остановлен\n\nВыбери бота:"
-    )
 @router.callback_query(F.data == "my_bots")
 async def cb_my_bots(callback: CallbackQuery, state: FSMContext,
                      child_manager: ChildManager) -> None:
     await state.clear()
     user_id = callback.from_user.id
-    bots = get_user_bots(user_id)
+    all_bots = get_user_bots(user_id)
 
-    if not bots:
+    if not all_bots:
         await render_callback(callback, "🤖 <b>Боты</b>\n\nУ тебя пока нет подключённых ботов.",
                               InlineKeyboardMarkup(inline_keyboard=[
                                   [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")]
@@ -121,21 +132,21 @@ async def cb_my_bots(callback: CallbackQuery, state: FSMContext,
         )
         return
 
-    bot_type = bot_types[0] if bot_types else None
-    type_bots = [b for b in bots if b.get("bot_type") == bot_type] if bot_type else bots
-    await render_callback(callback, _bot_list_text(user_id, bot_type),
-                          _bot_list_kb(type_bots, child_manager, bot_type))
+    bot_type = _norm(bot_types[0]) if bot_types else "standard"
+    bots = _filter_bots(all_bots, bot_type)
+    await render_callback(callback, _bot_list_text(bots, bot_type),
+                          _bot_list_kb(bots, child_manager, bot_type))
 
 
 @router.callback_query(F.data.startswith("my_bots_type_"))
 async def cb_my_bots_type(callback: CallbackQuery, state: FSMContext,
                           child_manager: ChildManager) -> None:
     await state.clear()
-    bot_type = callback.data.split("_")[-1]
+    bot_type = _norm(callback.data.split("_")[-1])
     user_id = callback.from_user.id
-    bots = [b for b in get_user_bots(user_id) if b.get("bot_type") == bot_type]
+    bots = _filter_bots(get_user_bots(user_id), bot_type)
     if not bots:
         await callback.answer("В этой категории пока нет ботов")
         return
-    await render_callback(callback, _bot_list_text(user_id, bot_type),
+    await render_callback(callback, _bot_list_text(bots, bot_type),
                           _bot_list_kb(bots, child_manager, bot_type))

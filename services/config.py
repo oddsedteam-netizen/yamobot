@@ -19,14 +19,20 @@ def _clean_token(raw: str) -> str:
 BOT_TOKEN = _clean_token(os.getenv("BOT_TOKEN", ""))
 
 # Супер-админ платформы (принимает жалобы, видит профили пользователей).
-# Если не задан — супер-админские разделы недоступны.
-_owner_raw = os.getenv("OWNER_ID", "0").strip()
-try:
-    OWNER_ID = int(_owner_raw)
-except ValueError:
-    OWNER_ID = 0
+# Задаётся через переменную ADMIN (мой Telegram ID). Для обратной совместимости
+# также читается OWNER_ID, но приоритет у ADMIN.
+def _parse_id(raw: str) -> int:
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return 0
+
+
+ADMIN_ID = _parse_id(os.getenv("ADMIN", os.getenv("OWNER_ID", "") or "0"))
+# Алиас для совместимости со старым кодом (complaints.py использует OWNER_ID).
+OWNER_ID = ADMIN_ID
 
 
 def is_super_admin(user_id: int) -> bool:
     """Является ли пользователь супер-админом платформы."""
-    return bool(OWNER_ID) and user_id == OWNER_ID
+    return bool(ADMIN_ID) and user_id == ADMIN_ID
