@@ -223,9 +223,12 @@ async def fsm_link_url(message: Message, state: FSMContext, child_manager: Child
     bot_info = get_bot_by_id(user_id, bot_id)
     if bot_info and child_manager.is_running(bot_id):
         await child_manager.restart_child(bot_info)
+        status = "🟢 Бот перезапущен — линк уже в приветствии."
+    else:
+        status = "⚠️ Бот не запущен — линк применится при запуске бота."
 
     await message.answer(
-        f"✅ Линк добавлен!\n\n🔗 {link_name} → {link_url}",
+        f"✅ Линк добавлен!\n\n🔗 {link_name} → {link_url}\n\n{status}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Линки", callback_data=f"edit_links_{bot_id}")],
             [InlineKeyboardButton(text="⬅️ К боту", callback_data=f"bot_{bot_id}")],

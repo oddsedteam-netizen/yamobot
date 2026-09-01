@@ -54,16 +54,56 @@ logger = logging.getLogger(__name__)
 
 
 def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
-    try:
-        links = json.loads(bot_data.get("links", "[]"))
-    except (json.JSONDecodeError, TypeError):
+    """Строит инлайн-клавиатуру из сохранённых ссылок.
+
+    Устойчива к битым/невалидным записям: невалидные ссылки пропускаются,
+    а не роняют всю клавиатуру.
+    """
+    raw = bot_data.get("links", "[]")
+    if isinstance(raw, str):
+        try:
+            links = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            links = []
+    elif isinstance(raw, list):
+        links = raw
+    else:
         links = []
+
     if not links:
         return None
-    rows = []
+
+    rows: list[list[InlineKeyboardButton]] = []
     for link in links:
-        rows.append([InlineKeyboardButton(text=link["text"], url=link["url"])])
+        if not isinstance(link, dict):
+            continue
+        text = str(link.get("text", "")).strip()
+        url = str(link.get("url", "")).strip()
+        if not text or not url.startswith(("http://", "https://", "tg://")):
+            continue
+        rows.append([InlineKeyboardButton(text=text[:64], url=url)])
+        if len(rows) >= 50:  # предохранитель от неадекватно большого списка
+            break
+
+    if not rows:
+        return None
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _safe_answer(message: Message, text: str, reply_markup=None) -> bool:
+    """Отправляет сообщение, переживая ошибки HTML-разметки (fallback на parse_mode=None)."""
+    try:
+        await message.answer(text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest:
+        # Возможно, текст сломал HTML — пробуем без форматирования.
+        try:
+            await message.answer(text, reply_markup=reply_markup, parse_mode=None)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def _build_reply_kb(bot_data: dict) -> ReplyKeyboardMarkup | None:
@@ -237,23 +277,21 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
 
-        # Reply-клавиатуру дочернего бота прикрепляем прямо к приветствию.
-        reply_kb = _build_reply_kb(fresh)
-        try:
-            await message.answer(welcome, reply_markup=reply_kb)
-        except Exception:
-            try:
-                await message.answer(welcome)
-            except Exception:
-                pass
-
-        # Инлайн-кнопки (ссылки) показываем отдельным сообщением.
+        # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
+        # В одном сообщении reply- и inline-клавиатуру показать нельзя,
+        # поэтому если есть и то и другое — reply показываем отдельным сообщением.
         welcome_kb = _build_welcome_kb(fresh)
-        if welcome_kb:
-            try:
-                await message.answer("🔗 Ссылки:", reply_markup=welcome_kb)
-            except Exception:
-                pass
+        reply_kb = _build_reply_kb(fresh)
+
+        if welcome_kb and reply_kb:
+            await _safe_answer(message, welcome, welcome_kb)
+            await _safe_answer(message, "Используй кнопки ниже 👇", reply_kb)
+        elif welcome_kb:
+            await _safe_answer(message, welcome, welcome_kb)
+        elif reply_kb:
+            await _safe_answer(message, welcome, reply_kb)
+        else:
+            await _safe_answer(message, welcome)
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -776,10 +814,13 @@ class ChildManager:
         self._tasks: dict[int, asyncio.Task] = {}
         self._bots: dict[int, Bot] = {}
         self._dispatchers: dict[int, Dispatcher] = {}
+        # Боты, которые останавливаем вручную (их не нужно перезапускать).
+        self._stopping: set[int] = set()
+        # Счётчик попыток автоперезапуска после аварийного падения.
+        self._restart_attempts: dict[int, int] = {}
 
     async def start_child(self, bot_data: dict) -> bool:
         bot_id = bot_data["id"]
-        token = bot_data.get("token", "")
 
         # Если задача уже жива — ничего не делаем.
         existing = self._tasks.get(bot_id)
@@ -791,12 +832,19 @@ class ChildManager:
             self._bots.pop(bot_id, None)
             self._dispatchers.pop(bot_id, None)
 
+        # Всегда берём СВЕЖИЕ данные из БД — там актуальные bot_type,
+        # links и welcome_text (важно после добавления линков/редактирования).
+        fresh = get_bot_by_id_any_owner(bot_id)
+        if fresh is None:
+            fresh = bot_data
+        token = fresh.get("token") or bot_data.get("token", "")
+
         try:
             child_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
             me = await child_bot.get_me()
             logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
-            child_dp = _make_child_dp(bot_data, child_bot)
+            child_dp = _make_child_dp(fresh, child_bot)
             await child_bot.delete_webhook(drop_pending_updates=True)
 
             task = asyncio.create_task(child_dp.start_polling(child_bot), name=f"child_{bot_id}")
@@ -805,6 +853,10 @@ class ChildManager:
             self._tasks[bot_id] = task
             self._bots[bot_id] = child_bot
             self._dispatchers[bot_id] = child_dp
+
+            # Успешный запуск: сбрасываем счётчик перезапусков и флаг остановки.
+            self._restart_attempts[bot_id] = 0
+            self._stopping.discard(bot_id)
 
             logger.info("Бот @%s запущен", me.username)
             return True
@@ -822,12 +874,38 @@ class ChildManager:
                 return
             exc = task.exception()
             if exc is not None:
-                logger.error("Дочерний бот %s аварийно завершился: %s", bot_id, exc)
+                logger.error(
+                    "Дочерний бот %s аварийно завершился: %s\n%s",
+                    bot_id, exc, exc.__traceback__,
+                )
+                # Планируем автоперезапуск (не из колбэка — это sync).
+                try:
+                    asyncio.create_task(self._restart_bot_later(bot_id))
+                except RuntimeError:
+                    logger.error("Не удалось запланировать перезапуск бота %s", bot_id)
         return _on_done
+
+    async def _restart_bot_later(self, bot_id: int) -> None:
+        """Через паузу перезапускает бота, если он не был остановлен вручную."""
+        await asyncio.sleep(5)
+        if bot_id in self._stopping:
+            return
+        fresh = get_bot_by_id_any_owner(bot_id)
+        if not fresh or fresh.get("stopped"):
+            return
+        attempts = self._restart_attempts.get(bot_id, 0)
+        if attempts >= 3:
+            logger.error("Бот %s падает повторно — отключаю автоперезапуск", bot_id)
+            return
+        self._restart_attempts[bot_id] = attempts + 1
+        logger.info("Перезапускаю упавший бот %s (попытка %d/3)", bot_id, attempts + 1)
+        await self.start_child(fresh)
 
     async def stop_child(self, bot_id: int) -> bool:
         if bot_id not in self._tasks:
             return False
+
+        self._stopping.add(bot_id)
 
         task = self._tasks.pop(bot_id)
         dp = self._dispatchers.pop(bot_id, None)
@@ -844,6 +922,7 @@ class ChildManager:
         if bot:
             await bot.session.close()
 
+        self._stopping.discard(bot_id)
         return True
 
     async def restart_child(self, bot_data: dict) -> bool:
@@ -852,10 +931,31 @@ class ChildManager:
 
     async def start_all_children(self) -> None:
         all_bots = get_all_bots_flat()
-        for bot_data in all_bots:
-            if bot_data.get("stopped"):
-                continue
-            await self.start_child(bot_data)
+        pending = [b for b in all_bots if not b.get("stopped")]
+        if not pending:
+            logger.info("Нет ботов для запуска")
+            return
+
+        results = await asyncio.gather(
+            *(self.start_child(b) for b in pending),
+            return_exceptions=True,
+        )
+        started = 0
+        for bot_data, res in zip(pending, results):
+            if isinstance(res, Exception):
+                logger.error("Дочерний бот %s упал при запуске: %s", bot_data["id"], res)
+            elif res:
+                started += 1
+            else:
+                logger.warning("Не удалось запустить дочерний бот %s", bot_data["id"])
+        logger.info("Запущено дочерних ботов: %s/%s", started, len(pending))
+
+        for bot_data in pending:
+            if get_feedback_chat(bot_data["id"]) is None:
+                logger.info(
+                    "Бот %s (%s): не подключён чат топиков — нужен /connect в группе",
+                    bot_data["id"], bot_data.get("username") or bot_data.get("first_name") or "?",
+                )
 
     async def stop_all_children(self) -> None:
         bot_ids = list(self._tasks.keys())

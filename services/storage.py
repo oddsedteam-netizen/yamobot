@@ -495,13 +495,27 @@ def get_admins_all(owner_id: int) -> list[dict]:
 def get_admin_by_tag(owner_id: int, tag: str) -> dict | None:
     conn = _get_conn()
     row = conn.execute("SELECT * FROM admins WHERE owner_id = ? AND tag = ?", (owner_id, tag)).fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    # Легаси-админы, добавленные до появления owner_id, хранятся с owner_id = 0.
+    if owner_id != 0:
+        row = conn.execute("SELECT * FROM admins WHERE owner_id = 0 AND tag = ?", (tag,)).fetchone()
+        if row:
+            return dict(row)
+    return None
 
 
 def get_admin_by_user_id(owner_id: int, user_id: int) -> dict | None:
     conn = _get_conn()
     row = conn.execute("SELECT * FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id)).fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    # Легаси-админы, добавленные до появления owner_id, хранятся с owner_id = 0.
+    if owner_id != 0:
+        row = conn.execute("SELECT * FROM admins WHERE owner_id = 0 AND user_id = ?", (user_id,)).fetchone()
+        if row:
+            return dict(row)
+    return None
 
 
 def update_admin_tag(owner_id: int, user_id: int, new_tag: str) -> bool:

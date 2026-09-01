@@ -175,6 +175,44 @@ async def cmd_adm(message: Message) -> None:
     await message.answer("🛡 <b>Админ-панель</b>\n\nВыбери раздел:", reply_markup=admin_kb())
 
 
+@router.message(Command("status"))
+async def cmd_status(message: Message, child_manager: ChildManager) -> None:
+    """Диагностика: состояние всех дочерних ботов (только для супер-админа)."""
+    user_id = message.from_user.id
+    if not is_super_admin(user_id):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+
+    from services.storage import (
+        get_all_bots_flat,
+        get_feedback_chat,
+        get_admins_all,
+        get_child_users,
+    )
+
+    all_bots = get_all_bots_flat()
+    if not all_bots:
+        await message.answer("📭 Боты не подключены.")
+        return
+
+    lines = ["📊 <b>Состояние ботов</b>\n"]
+    for b in all_bots:
+        bot_id = b["id"]
+        running = child_manager.is_running(bot_id)
+        status = "🟢 работает" if running else "🔴 не работает"
+        fchat = get_feedback_chat(bot_id)
+        admins = len(get_admins_all(b["owner_id"]))
+        users = len(get_child_users(bot_id, only_active=False))
+        chat_info = "есть" if fchat else "нет"
+        lines.append(
+            f"🤖 @{b.get('username') or b['id']} — {status}\n"
+            f"   Тип: {b.get('bot_type') or 'standard'} | /connect: {chat_info} | "
+            f"админов: {admins} | юзеров: {users}"
+        )
+
+    await message.answer("\n".join(lines))
+
+
 FAQ_TEXT = (
     "❓ <b>Как пользоваться YamoBot</b>\n\n"
     "YamoBot — это менеджер для подключения и управления твоими Telegram-ботами. "

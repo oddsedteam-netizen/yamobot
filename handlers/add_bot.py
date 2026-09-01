@@ -4,6 +4,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
+import asyncio
+
 from handlers._common import render_callback
 from services.child_manager import ChildManager
 from services.storage import (
@@ -109,6 +111,11 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
     set_bot_keyboard(user_id, info['id'], REPLY_PRESETS[preset_key]['buttons'])
     await state.clear()
     ok = await child_manager.start_child(info)
+    if ok:
+        # Даём таску первую секунду — если бот упал сразу, считаем неудачным запуском.
+        await asyncio.sleep(1.0)
+        if not child_manager.is_running(info['id']):
+            ok = False
     status = 'Бот запущен' if ok else 'Бот сохранён, но не удалось запустить'
     text = ('✅ <b>Бот подключён!</b>\n\n'
             f'🤖 {bot_display_name(info)}\n'
