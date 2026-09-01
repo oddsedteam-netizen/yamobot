@@ -11,6 +11,7 @@ from aiogram.types import (
     Message,
 )
 
+from handlers._common import render_callback, safe_edit
 from services.storage import (
     get_bot_by_id,
     get_user_bots,
@@ -74,16 +75,13 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
     name = bot_display_name(bot_info)
 
     if not users:
-        if callback.message:
-            try:
-                await callback.message.edit_text(
-                    f"📨 <b>Рассылка — {name}</b>\n\n"
-                    f"❌ У бота нет активных пользователей.\n"
-                    f"Пользователи появятся, когда нажмут /start у дочернего бота.",
-                    reply_markup=back_to_bot_kb(bot_id)
-                )
-            except Exception:
-                pass
+        await safe_edit(
+            callback.message,
+            f"📨 <b>Рассылка — {name}</b>\n\n"
+            f"❌ У бота нет активных пользователей.\n"
+            f"Пользователи появятся, когда нажмут /start у дочернего бота.",
+            back_to_bot_kb(bot_id),
+        )
         await callback.answer()
         return
 
@@ -107,12 +105,7 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
         f"• премиум-эмодзи"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=back_to_bot_kb(bot_id))
-        except Exception:
-            await callback.message.answer(text, reply_markup=back_to_bot_kb(bot_id))
-    await callback.answer()
+    await render_callback(callback, text, back_to_bot_kb(bot_id))
 
 
 # ═══════════════ Рассылка для всех ботов ═══════════════
@@ -123,20 +116,15 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
     bots = [b for b in get_user_bots(user_id) if not b.get("stopped")]
 
     if not bots:
-        if callback.message:
-            try:
-                await callback.message.edit_text(
-                    "📨 <b>Рассылка для всех ботов</b>\n\n"
-                    "⚠️ Нет запущенных ботов.\n"
-                    "Остановленные боты не участвуют в рассылке.",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
-                        ]
-                    )
-                )
-            except Exception:
-                pass
+        await safe_edit(
+            callback.message,
+            "📨 <b>Рассылка для всех ботов</b>\n\n"
+            "⚠️ Нет запущенных ботов.\n"
+            "Остановленные боты не участвуют в рассылке.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+            ]),
+        )
         await callback.answer()
         return
 
@@ -148,19 +136,14 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
         total_users += len(users)
 
     if total_users == 0:
-        if callback.message:
-            try:
-                await callback.message.edit_text(
-                    "📨 <b>Рассылка для всех ботов</b>\n\n"
-                    "❌ Ни у одного бота нет активных пользователей.",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
-                        ]
-                    )
-                )
-            except Exception:
-                pass
+        await safe_edit(
+            callback.message,
+            "📨 <b>Рассылка для всех ботов</b>\n\n"
+            "❌ Ни у одного бота нет активных пользователей.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+            ]),
+        )
         await callback.answer()
         return
 

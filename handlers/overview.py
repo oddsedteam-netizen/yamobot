@@ -3,8 +3,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 
+from handlers._common import render_callback
 from services.storage import (
     get_user_bots,
     bot_display_name,
@@ -23,14 +25,42 @@ def _main_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
-    """Показывает (правит) текст с клавиатурой в текущем сообщении."""
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+async def show_global_pz(message: Message) -> None:
+    user_id = message.from_user.id
+    bots = get_user_bots(user_id)
+
+    if not bots:
+        await message.answer("📋 <b>ПЗ</b>\n\nУ тебя пока нет подключённых ботов.")
+        return
+
+    total = 0
+    assigned = 0
+    bot_rows = []
+    for b in bots:
+        topics = get_all_topics_for_bot(b["id"])
+        a = sum(1 for t in topics if t.get("admin_user_id"))
+        total += len(topics)
+        assigned += a
+        bot_rows.append(
+            f"  • {bot_display_name(b)} — 📋 {len(topics)} (🟢 {a} / ⏳ {len(topics) - a})"
+        )
+
+    text = (
+        f"📋 <b>ПЗ — все боты</b> ({len(bots)})\n\n"
+        f"Всего ПЗ: <b>{total}</b>\n"
+        f"🟢 С админом: <b>{assigned}</b>\n"
+        f"⏳ Без админа: <b>{total - assigned}</b>\n\n"
+        + "\n".join(bot_rows)
+    )
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=f"📋 {bot_display_name(b)}", callback_data=f"pzlist_{b['id']}_0")]
+        for b in bots
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
 # ═══════════════ Глобальная статистика ═══════════════
 
 @router.callback_query(F.data == "gstats")
@@ -40,7 +70,7 @@ async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) 
 
     if not bots:
         text = "📊 <b>Статистика</b>\n\nУ тебя пока нет подключённых ботов."
-        await _render(callback, text, _main_kb())
+        await render_callback(callback, text, _main_kb())
         return
 
     s = get_all_stats([b["id"] for b in bots])
@@ -71,7 +101,8 @@ async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) 
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
     ])
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
+
 
 # ═══════════════ ПЗ (по всем ботам) ═══════════════
 
@@ -82,7 +113,7 @@ async def cb_global_pz(callback: CallbackQuery) -> None:
 
     if not bots:
         text = "📋 <b>ПЗ</b>\n\nУ тебя пока нет подключённых ботов."
-        await _render(callback, text, _main_kb())
+        await render_callback(callback, text, _main_kb())
         return
 
     total = 0
@@ -114,4 +145,4 @@ async def cb_global_pz(callback: CallbackQuery) -> None:
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)

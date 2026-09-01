@@ -5,6 +5,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
+from handlers._common import render_callback, safe_edit
 from services.storage import (
     get_user_bots,
     get_bot_by_id,
@@ -17,9 +18,15 @@ from services.storage import (
 )
 from services.child_manager import ChildManager
 from handlers.my_bots import my_bots_kb
-from handlers.start import main_menu_kb
 
 router = Router()
+
+
+# Клавиатура, когда нужно вернуть юзера в главное меню (inline).
+def main_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")]
+    ])
 
 
 def single_bot_kb(bot_id: int, is_running: bool) -> InlineKeyboardMarkup:
@@ -49,7 +56,7 @@ async def cb_single_bot(callback: CallbackQuery,
     bot_info = get_bot_by_id(user_id, bot_id)
     if bot_info is None:
         if callback.message:
-            await callback.message.edit_text("⚠️ Бот не найден.", reply_markup=main_menu_kb())
+            await callback.message.edit_text("⚠️ Бот не найден.", reply_markup=main_inline_kb())
         await callback.answer()
         return
 
@@ -66,12 +73,7 @@ async def cb_single_bot(callback: CallbackQuery,
         f"Выбери действие:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=single_bot_kb(bot_id, running))
-        except Exception:
-            await callback.message.answer(text, reply_markup=single_bot_kb(bot_id, running))
-    await callback.answer()
+    await render_callback(callback, text, single_bot_kb(bot_id, running))
 
 
 @router.callback_query(F.data.startswith("action_stop_"))
@@ -85,13 +87,10 @@ async def cb_stop_bot(callback: CallbackQuery,
     await callback.answer("⛔ Бот остановлен")
 
     bot_info = get_bot_by_id(user_id, bot_id)
-    if bot_info and callback.message:
+    if bot_info:
         name = bot_display_name(bot_info)
         text = f"🤖 <b>{name}</b>\n🆔 <code>{bot_id}</code>\nСтатус: 🔴 Остановлен\n\nВыбери действие:"
-        try:
-            await callback.message.edit_text(text, reply_markup=single_bot_kb(bot_id, False))
-        except Exception:
-            pass
+        await safe_edit(callback.message, text, single_bot_kb(bot_id, False))
 
 
 @router.callback_query(F.data.startswith("action_start_"))
@@ -118,10 +117,7 @@ async def cb_start_bot(callback: CallbackQuery,
         running = child_manager.is_running(bot_id)
         status = "🟢 Работает" if running else "🔴 Остановлен"
         text = f"🤖 <b>{name}</b>\n🆔 <code>{bot_id}</code>\nСтатус: {status}\n\nВыбери действие:"
-        try:
-            await callback.message.edit_text(text, reply_markup=single_bot_kb(bot_id, running))
-        except Exception:
-            pass
+        await safe_edit(callback.message, text, single_bot_kb(bot_id, running))
 
 
 # ═══════════════ Антиспам ═══════════════
@@ -166,12 +162,7 @@ async def cb_antispam(callback: CallbackQuery) -> None:
         "Выбери режим:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=antispam_kb(bot_id, current))
-        except Exception:
-            await callback.message.answer(text, reply_markup=antispam_kb(bot_id, current))
-    await callback.answer()
+    await render_callback(callback, text, antispam_kb(bot_id, current))
 
 
 @router.callback_query(F.data.startswith("setantispam_"))
@@ -198,11 +189,7 @@ async def cb_set_antispam(callback: CallbackQuery,
         "Выбери режим:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=antispam_kb(bot_id, mode))
-        except Exception:
-            pass
+    await safe_edit(callback.message, text, antispam_kb(bot_id, mode))
 
 
 # ═══════════════ Статистика ═══════════════
@@ -237,12 +224,7 @@ async def cb_stats(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")],
     ])
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+    await render_callback(callback, text, kb)
 
 
 # ═══════════════ Удаление ═══════════════
@@ -267,11 +249,6 @@ async def cb_delete_bot(callback: CallbackQuery,
         kb = my_bots_kb(user_id, child_manager)
     else:
         text += "\n\nУ тебя больше нет подключённых ботов."
-        kb = main_menu_kb()
+        kb = main_inline_kb()
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+    await render_callback(callback, text, kb)

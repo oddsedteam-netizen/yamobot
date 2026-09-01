@@ -8,8 +8,8 @@ from aiogram.types import (
     Message,
 )
 
+from handlers._common import render_callback
 from services.storage import get_coowners, add_coowner, remove_coowner
-from handlers.start import main_menu_kb
 
 router = Router()
 
@@ -56,12 +56,7 @@ async def cb_coowners(callback: CallbackQuery, state: FSMContext) -> None:
             "и их статистику."
         )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=coowners_kb())
-        except Exception:
-            await callback.message.answer(text, reply_markup=coowners_kb())
-    await callback.answer()
+    await render_callback(callback, text, coowners_kb())
 
 
 # ═══════════════ Добавить совладельца ═══════════════

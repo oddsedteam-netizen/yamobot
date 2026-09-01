@@ -5,6 +5,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
+from handlers._common import render_callback, safe_edit
 from services.storage import get_user_bots, bot_display_name, get_all_stats
 from services.child_manager import ChildManager
 
@@ -30,12 +31,7 @@ async def cb_select_all(callback: CallbackQuery) -> None:
     names = "\n".join(f"  • {bot_display_name(b)}" for b in bots)
     text = f"📌 <b>Все боты</b> ({len(bots)})\n\n{names}\n\nВыбери действие:"
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=select_all_kb())
-        except Exception:
-            await callback.message.answer(text, reply_markup=select_all_kb())
-    await callback.answer()
+    await render_callback(callback, text, select_all_kb())
 
 
 @router.callback_query(F.data == "all_stats")
@@ -67,12 +63,7 @@ async def cb_all_stats(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")],
     ])
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+    await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "all_stop")
@@ -88,14 +79,11 @@ async def cb_all_stop(callback: CallbackQuery, child_manager: ChildManager) -> N
 
     await callback.answer(f"⛔ Остановлено: {stopped}")
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(
-                f"⛔ <b>Все боты остановлены</b>\n\nОстановлено: {stopped}",
-                reply_markup=select_all_kb()
-            )
-        except Exception:
-            pass
+    await safe_edit(
+        callback.message,
+        f"⛔ <b>Все боты остановлены</b>\n\nОстановлено: {stopped}",
+        select_all_kb(),
+    )
 
 
 @router.callback_query(F.data == "all_start_all")
@@ -112,11 +100,8 @@ async def cb_all_start(callback: CallbackQuery, child_manager: ChildManager) -> 
 
     await callback.answer(f"▶️ Запущено: {started}")
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(
-                f"▶️ <b>Все боты запущены</b>\n\nЗапущено: {started}",
-                reply_markup=select_all_kb()
-            )
-        except Exception:
-            pass
+    await safe_edit(
+        callback.message,
+        f"▶️ <b>Все боты запущены</b>\n\nЗапущено: {started}",
+        select_all_kb(),
+    )

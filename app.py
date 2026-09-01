@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from handlers import register_all_handlers
 from services.child_manager import ChildManager
+from services.config import BOT_TOKEN, OWNER_ID
 from services.storage import ensure_db
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,12 +22,16 @@ logging.basicConfig(
 )
 
 
+def _clean_token(raw: str) -> str:
+    """Убирает кавычки и пробелы вокруг токена."""
+    return raw.strip().strip('"').strip("'")
+
+
 def load_token() -> str:
     if ENV_PATH.exists():
         load_dotenv(dotenv_path=ENV_PATH, override=True, encoding="utf-8-sig")
 
-    token = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
-    owner_id = os.getenv("OWNER_ID", "").strip()
+    token = _clean_token(os.getenv("BOT_TOKEN", "") or BOT_TOKEN)
 
     if not token:
         raise RuntimeError(
@@ -49,6 +54,7 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
+    dp["owner_id"] = OWNER_ID
     child_manager = ChildManager()
     dp["child_manager"] = child_manager
 
@@ -57,8 +63,8 @@ async def main() -> None:
     try:
         me = await bot.get_me()
         logging.info("YamoBot запущен: @%s (%s)", me.username, me.id)
-        await child_manager.start_all_children()
         await bot.delete_webhook(drop_pending_updates=True)
+        await child_manager.start_all_children()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await child_manager.stop_all_children()

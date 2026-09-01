@@ -10,6 +10,7 @@ from aiogram.types import (
     Message,
 )
 
+from handlers._common import render_callback, safe_edit
 from services.storage import (
     get_bot_by_id,
     update_bot_field,
@@ -83,12 +84,7 @@ async def cb_editor(callback: CallbackQuery, state: FSMContext) -> None:
         f"Выбери что изменить:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=editor_kb(bot_id))
-        except Exception:
-            await callback.message.answer(text, reply_markup=editor_kb(bot_id))
-    await callback.answer()
+    await render_callback(callback, text, editor_kb(bot_id))
 
 
 @router.callback_query(F.data.startswith("edit_welcome_"))
@@ -162,12 +158,7 @@ async def cb_edit_links(callback: CallbackQuery, state: FSMContext) -> None:
     else:
         text = "🔗 <b>Линки</b>\n\nПока нет ни одного линка."
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=links_kb(bot_id, links))
-        except Exception:
-            await callback.message.answer(text, reply_markup=links_kb(bot_id, links))
-    await callback.answer()
+    await render_callback(callback, text, links_kb(bot_id, links))
 
 
 @router.callback_query(F.data.startswith("addlink_"))
@@ -269,11 +260,7 @@ async def cb_delete_link(callback: CallbackQuery, child_manager: ChildManager) -
     else:
         text = "🔗 <b>Линки</b>\n\nВсе линки удалены."
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=links_kb(bot_id, links))
-        except Exception:
-            pass
+    await safe_edit(callback.message, text, reply_markup=links_kb(bot_id, links))
 
 
 @router.callback_query(F.data.startswith("viewlink_"))

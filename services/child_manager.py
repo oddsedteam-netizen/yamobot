@@ -46,6 +46,8 @@ from services.storage import (
     get_feedback_msg_by_group_msg,
     get_feedback_msg_by_user_msg,
     get_bot_owner,
+    get_bot_keyboard_by_bot,
+    get_bot_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,14 +66,29 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _user_actions_kb() -> ReplyKeyboardMarkup:
-    """Постоянная reply-клавиатура действий для пользователя."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="сменить админа")],
-        ],
-        resize_keyboard=True,
-    )
+def _build_reply_kb(bot_data: dict) -> ReplyKeyboardMarkup | None:
+    """Строит reply-клавиатуру дочернего бота из его настроек.
+
+    Для анкетницы (anketa) reply-кнопки не используются — возвращает None.
+    Для обычного бота используются сохранённые кнопки (или дефолт «сменить админа»).
+    """
+    if bot_data.get("bot_type") == "anketa":
+        return None
+
+    buttons = get_bot_keyboard_by_bot(bot_data["id"])
+    rows: list[list[KeyboardButton]] = []
+    for item in buttons:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text", "").strip()
+        if not text:
+            continue
+        rows.append([KeyboardButton(text=text)])
+
+    if not rows:
+        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="сменить админа")]], resize_keyboard=True)
+
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 async def _send_to_topic(source_msg: Message, bot: Bot,
@@ -219,10 +236,28 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
+
+        # Инлайн-кнопки (ссылки) прикрепляем прямо к приветствию.
+        welcome_kb = _build_welcome_kb(fresh)
         try:
-            await message.answer(welcome, reply_markup=_user_actions_kb())
+            if welcome_kb:
+                await message.answer(welcome, reply_markup=welcome_kb)
+            else:
+                await message.answer(welcome)
         except Exception:
-            pass
+            try:
+                await message.answer(welcome)
+            except Exception:
+                pass
+
+        # Reply-клавиатуру дочернего бота активируем отдельным сообщением,
+        # чтобы её можно было показывать вместе с инлайн-ссылками.
+        reply_kb = _build_reply_kb(fresh)
+        if reply_kb:
+            try:
+                await message.answer("Выберите действие:", reply_markup=reply_kb)
+            except Exception:
+                pass
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -750,8 +785,15 @@ class ChildManager:
         bot_id = bot_data["id"]
         token = bot_data.get("token", "")
 
-        if bot_id in self._tasks and not self._tasks[bot_id].done():
+        # Если задача уже жива — ничего не делаем.
+        existing = self._tasks.get(bot_id)
+        if existing and not existing.done():
             return True
+        # Убираем зависшие записи от ранее упавшего процесса.
+        if existing:
+            self._tasks.pop(bot_id, None)
+            self._bots.pop(bot_id, None)
+            self._dispatchers.pop(bot_id, None)
 
         try:
             child_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -762,6 +804,7 @@ class ChildManager:
             await child_bot.delete_webhook(drop_pending_updates=True)
 
             task = asyncio.create_task(child_dp.start_polling(child_bot), name=f"child_{bot_id}")
+            task.add_done_callback(self._make_task_done_callback(bot_id))
 
             self._tasks[bot_id] = task
             self._bots[bot_id] = child_bot
@@ -772,6 +815,19 @@ class ChildManager:
         except Exception as e:
             logger.error("Не удалось запустить бот %s: %s", bot_id, e)
             return False
+
+    def _make_task_done_callback(self, bot_id: int):
+        """Возвращает колбэк, который чистит состояние при завершении задачи бота."""
+        def _on_done(task: asyncio.Task) -> None:
+            self._tasks.pop(bot_id, None)
+            self._bots.pop(bot_id, None)
+            self._dispatchers.pop(bot_id, None)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error("Дочерний бот %s аварийно завершился: %s", bot_id, exc)
+        return _on_done
 
     async def stop_child(self, bot_id: int) -> bool:
         if bot_id not in self._tasks:

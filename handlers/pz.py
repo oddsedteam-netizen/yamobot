@@ -8,6 +8,7 @@ from aiogram.types import (
     Message,
 )
 
+from handlers._common import render_callback, safe_edit
 from services.storage import (
     get_bot_by_id,
     bot_display_name,
@@ -64,12 +65,7 @@ async def cb_pz_menu(callback: CallbackQuery, state: FSMContext) -> None:
         f"Выбери действие:"
     )
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=pz_menu_kb(bot_id))
-        except Exception:
-            await callback.message.answer(text, reply_markup=pz_menu_kb(bot_id))
-    await callback.answer()
+    await render_callback(callback, text, pz_menu_kb(bot_id))
 
 
 # ═══════════════ Список ПЗ с пагинацией ═══════════════
@@ -91,11 +87,7 @@ async def cb_pz_list(callback: CallbackQuery, state: FSMContext) -> None:
 
     if not topics:
         text = "📋 <b>Список ПЗ</b>\n\nПока нет ни одного ПЗ."
-        if callback.message:
-            try:
-                await callback.message.edit_text(text, reply_markup=pz_menu_kb(bot_id))
-            except Exception:
-                pass
+        await safe_edit(callback.message, text, pz_menu_kb(bot_id))
         await callback.answer()
         return
 
@@ -138,12 +130,7 @@ async def cb_pz_list(callback: CallbackQuery, state: FSMContext) -> None:
     kb_rows.append([InlineKeyboardButton(text="🔍 Найти по ID", callback_data=f"pzsearch_{bot_id}")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pz_{bot_id}")])
 
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-        except Exception:
-            await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    await callback.answer()
+    await render_callback(callback, text, InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 @router.callback_query(F.data == "noop")

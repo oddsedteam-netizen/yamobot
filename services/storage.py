@@ -2,7 +2,7 @@ import json
 import logging
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -21,7 +21,16 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA busy_timeout=5000")
     return _conn
+
+
+def _migrate_bot_type(conn: sqlite3.Connection) -> None:
+    """Добавляет колонку bot_type в существующую таблицу bots."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+    if "bot_type" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN bot_type TEXT DEFAULT 'standard'")
+    conn.commit()
 
 
 def _migrate_admin_scope(conn: sqlite3.Connection) -> None:
@@ -61,6 +70,7 @@ def ensure_db() -> None:
             links        TEXT DEFAULT '[]',
             stopped      INTEGER DEFAULT 0,
             antispam_mode TEXT DEFAULT 'off',
+            bot_type     TEXT DEFAULT 'standard',
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -173,7 +183,28 @@ def ensure_db() -> None:
             owner_id    INTEGER NOT NULL,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS users_registry (
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            blocked    INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS complaints (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER NOT NULL,
+            user_username TEXT DEFAULT '',
+            category      TEXT NOT NULL,
+            screenshot_id TEXT DEFAULT '',
+            comment       TEXT DEFAULT '',
+            status        TEXT DEFAULT 'new',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            resolved_at   TIMESTAMP
+        );
     """)
+    _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
     conn.commit()
 
@@ -260,10 +291,21 @@ def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+_BOT_FIELDS_WHITELIST = {
+    "token", "username", "first_name", "welcome_text",
+    "links", "stopped", "antispam_mode", "bot_type",
+}
+
+
 def update_bot_field(user_id: int, bot_id: int, field: str, value) -> bool:
+    if field not in _BOT_FIELDS_WHITELIST:
+        raise ValueError(f"Недопустимое поле бота: {field!r}")
     conn = _get_conn()
     with _lock:
-        cur = conn.execute(f"UPDATE bots SET {field} = ? WHERE id = ?", (value, bot_id))
+        cur = conn.execute(
+            f"UPDATE bots SET {field} = ? WHERE id = ?",
+            (value, bot_id),
+        )
         conn.commit()
         return cur.rowcount > 0
 
@@ -521,7 +563,7 @@ def _owner_bot_ids(owner_id: int) -> list[int]:
 
 def get_admin_message_stats(owner_id: int, admin_user_id: int) -> dict:
     conn = _get_conn()
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # наивный UTC (как CURRENT_TIMESTAMP)
     day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
@@ -987,3 +1029,127 @@ def get_user_info_from_pz(bot_id: int, user_chat_id: int) -> dict | None:
         (bot_id, user_chat_id)
     ).fetchone()
     return dict(row) if row else None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Тип бота (standard / anketa)
+# ═══════════════════════════════════════════════════════════
+
+def set_bot_type(user_id: int, bot_id: int, bot_type: str) -> bool:
+    """Устанавливает тип бота: 'standard' или 'anketa'."""
+    if bot_type not in ("standard", "anketa"):
+        return False
+    return update_bot_field(user_id, bot_id, "bot_type", bot_type)
+
+
+def get_bot_type(bot_id: int) -> str:
+    conn = _get_conn()
+    row = conn.execute("SELECT bot_type FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    return row[0] if row else "standard"
+
+
+def get_user_bot_types(user_id: int) -> list[str]:
+    """Список типов ботов, которые есть у юзера (например, ['standard', 'anketa'])."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT DISTINCT bot_type FROM bots WHERE owner_id = ?", (user_id,)).fetchall()
+    return [r[0] for r in rows if r[0]]
+
+
+# ═══════════════════════════════════════════════════════════
+#  Реестр пользователей YamoBot
+# ═══════════════════════════════════════════════════════════
+
+def register_user(user_id: int, username: str = "", first_name: str = "") -> None:
+    """Регистрирует/обновляет пользователя мастер-бота."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO users_registry (user_id, username, first_name) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, "
+            "first_name=excluded.first_name",
+            (user_id, username, first_name)
+        )
+        conn.commit()
+
+
+def get_user_registry(user_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_all_users_registry() -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM users_registry ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def is_registry_user_banned(user_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute("SELECT blocked FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row[0])
+
+
+def set_registry_user_blocked(user_id: int, blocked: bool) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO users_registry (user_id, blocked) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET blocked=excluded.blocked",
+            (user_id, 1 if blocked else 0)
+        )
+        conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Жалобы
+# ═══════════════════════════════════════════════════════════
+
+def create_complaint(user_id: int, username: str, category: str,
+                     screenshot_id: str, comment: str) -> int:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT INTO complaints (user_id, user_username, category, screenshot_id, comment) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, category, screenshot_id, comment)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_complaints(status: str | None = None) -> list[dict]:
+    conn = _get_conn()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM complaints WHERE status = ? ORDER BY created_at DESC", (status,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM complaints ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_complaint(complaint_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM complaints WHERE id = ?", (complaint_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_complaint_status(complaint_id: int, status: str) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE complaints SET status = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, complaint_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def complaints_count(status: str | None = None) -> int:
+    conn = _get_conn()
+    if status:
+        row = conn.execute("SELECT COUNT(*) FROM complaints WHERE status = ?", (status,)).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM complaints").fetchone()
+    return row[0]

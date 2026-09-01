@@ -8,6 +8,7 @@ from aiogram.types import (
     Message,
 )
 
+from handlers._common import render_callback
 from services.storage import (
     get_admins_all,
     add_admin,
@@ -69,13 +70,17 @@ def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-async def _render(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
-    if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
+async def show_admins(message: Message) -> None:
+    """Показывает меню админов из reply-кнопки (не редактируя сообщение)."""
+    owner_id = message.from_user.id
+    admins = get_admins_all(owner_id)
+    text = (
+        f"👤 <b>Управление админами</b>\n\n"
+        f"Всего админов: <b>{len(admins)}</b>\n\n"
+        f"Админы привязаны ко всем ботам.\n\n"
+        f"Выбери действие:"
+    )
+    await message.answer(text, reply_markup=admins_menu_kb())
 
 
 # ═══════════════ Главное меню админов ═══════════════
@@ -93,7 +98,7 @@ async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
         f"Выбери действие:"
     )
 
-    await _render(callback, text, admins_menu_kb())
+    await render_callback(callback, text, admins_menu_kb())
 
 
 # ═══════════════ Список ═══════════════
@@ -133,7 +138,7 @@ async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
         text = "📋 <b>Список админов</b>\n\nПока нет ни одного админа."
         kb = admins_list_kb()
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
 # ═══════════════ Карточка админа ═══════════════
 
 @router.callback_query(F.data.regexp(r"^gadmins_view_\d+$"))
@@ -176,7 +181,7 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
         f"{history_text}"
     )
 
-    await _render(callback, text, admin_detail_kb(admin_user_id))
+    await render_callback(callback, text, admin_detail_kb(admin_user_id))
 
 
 # ═══════════════ Действия с конкретным админом ═══════════════
@@ -233,7 +238,7 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")],
     ])
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data.regexp(r"^gadmins_delconfirm_\d+$"))
@@ -253,7 +258,7 @@ async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
     ])
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
 
 
 # ═══════════════ Статистика ═══════════════
@@ -290,7 +295,7 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
         ]
     )
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
 # ═══════════════ Добавить ═══════════════
 
 @router.callback_query(F.data == "gadmins_addlink")
@@ -331,7 +336,7 @@ async def cb_add_admin_by_link(callback: CallbackQuery) -> None:
             [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ])
 
-    await _render(callback, text, kb)
+    await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "gadmins_add")
