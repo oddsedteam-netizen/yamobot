@@ -764,6 +764,17 @@ def create_topic_record(bot_id: int, user_chat_id: int, group_chat_id: int, topi
         conn.commit()
 
 
+def delete_topic_record(bot_id: int, user_chat_id: int) -> None:
+    """Удаляет запись топика (используется, когда топик устарел/удалили)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "DELETE FROM feedback_topics WHERE bot_id = ? AND user_chat_id = ?",
+            (bot_id, user_chat_id)
+        )
+        conn.commit()
+
+
 def assign_admin_to_topic(bot_id: int, topic_id: int, group_chat_id: int,
                           admin_user_id: int, admin_tag: str) -> dict:
     """

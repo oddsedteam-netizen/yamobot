@@ -40,6 +40,7 @@ from services.storage import (
     get_topic_by_user,
     get_topic_by_topic_id,
     create_topic_record,
+    delete_topic_record,
     assign_admin_to_topic,
     reset_topic_admin,
     save_feedback_message,
@@ -838,48 +839,48 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         anon_mode = is_bot_anonymous(bot_id)
         topic = get_topic_by_user(bot_id, user_chat_id)
 
-        if not topic:
+        async def _open_new_topic() -> None:
+            """Создаёт свежий топик, присылает заголовок и пересылает сообщение."""
             try:
                 forum_topic = await bot_obj.create_forum_topic(
                     chat_id=group_chat_id, name="⏳ без админа"
                 )
-                topic_id = forum_topic.message_thread_id
+                new_topic_id = forum_topic.message_thread_id
             except Exception as e:
                 logger.error("Не удалось создать топик: %s", e)
                 return
 
-            create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
+            create_topic_record(bot_id, user_chat_id, group_chat_id, new_topic_id)
 
             if anon_mode:
-                # Анонимный режим: личность пользователя НЕ раскрываем
-                # (никакого имени/ник/ID), но само сообщение пересылаем.
                 header_text = "📩 <b>Новое сообщение</b> 🕶"
             else:
                 user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
                 header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
 
             await bot_obj.send_message(
-                chat_id=group_chat_id, message_thread_id=topic_id,
+                chat_id=group_chat_id, message_thread_id=new_topic_id,
                 text=header_text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="✋ Я беру",
-                                           callback_data=f"take_user_{topic_id}_{group_chat_id}")]
+                                           callback_data=f"take_user_{new_topic_id}_{group_chat_id}")]
                 ])
             )
 
-            # Само сообщение пересылаем ВСЕГДА (в т.ч. в анонимном режиме).
-            sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
+            sent = await _send_to_topic(message, bot_obj, group_chat_id, new_topic_id)
             if sent:
-                save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                save_feedback_message(bot_id, new_topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
 
             add_stat(bot_id, "message_out")
 
-            # Уведомление владельцу в привязанный «чат админов».
             try:
-                await _notify_new_pz(bot_id, group_chat_id, topic_id)
+                await _notify_new_pz(bot_id, group_chat_id, new_topic_id)
             except Exception as e:
                 logger.warning("Не удалось отправить уведомление о новом ПЗ: %s", e)
+
+        if not topic:
+            await _open_new_topic()
             return
 
         topic_id = topic["topic_id"]
@@ -895,6 +896,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if sent:
             save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
                                    "in", sent.message_id, message.message_id)
+        else:
+            # Отправка не удалась (вероятно, топик устарел или удалён —
+            # "message thread not found"). Удаляем запись и создаём свежий топик.
+            if group_chat_id == topic.get("group_chat_id"):
+                logger.warning(
+                    "Топик %s для юзера %s недоступен — пересоздаю.", topic_id, user_chat_id
+                )
+                delete_topic_record(bot_id, user_chat_id)
+            await _open_new_topic()
+            return
 
     # ═══════════════ Сообщения из топика → юзеру ═══════════════
 

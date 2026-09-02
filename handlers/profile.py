@@ -114,6 +114,7 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
 
 async def show_profile(message: Message) -> None:
     text, kb = _profile_payload(message.from_user.id, message.from_user.first_name or "—")
+    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "profile_show")
