@@ -27,6 +27,13 @@ class ComplaintFSM(StatesGroup):
     waiting_comment = State()
 
 
+def _cancel_kb() -> InlineKeyboardMarkup:
+    """Кнопка «Отмена» для потока жалобы."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="comp_cancel")]
+    ])
+
+
 def complaints_admin_kb(complaints: list[dict]) -> InlineKeyboardMarkup:
     statuses = {"new": "🆕 Новая", "accepted": "✅ Принята", "rejected": "❌ Отклонена"}
     rows = []
@@ -46,8 +53,22 @@ async def start_complaint(message: Message, state: FSMContext) -> None:
     await state.update_data(complaint_context="")
     await message.answer(
         "⚠️ <b>Жалоба</b>\n\n"
-        "Напиши <b>категорию</b> жалобы одной строкой."
+        "Напиши <b>категорию</b> жалобы одной строкой.",
+        reply_markup=_cancel_kb(),
     )
+
+
+@router.callback_query(F.data == "comp_cancel")
+async def cb_comp_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer("❌ Жалоба отменена")
+    if callback.message:
+        try:
+            await callback.message.edit_text("❌ Подача жалобы отменена.", reply_markup=None)
+        except Exception:
+            pass
+    from handlers.start import _show_main
+    await _show_main(callback.message) if callback.message else None
 
 
 @router.message(ComplaintFSM.waiting_category)
@@ -58,7 +79,8 @@ async def fsm_category(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(category=category)
     await state.set_state(ComplaintFSM.waiting_screenshot)
-    await message.answer("✅ Категория принята.\n\n📎 Теперь отправь <b>скриншот</b> (фото).")
+    await message.answer("✅ Категория принята.\n\n📎 Теперь отправь <b>скриншот</b> (фото).",
+                         reply_markup=_cancel_kb())
 
 
 @router.message(ComplaintFSM.waiting_screenshot)
@@ -68,7 +90,8 @@ async def fsm_screenshot(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(screenshot_id=message.photo[-1].file_id)
     await state.set_state(ComplaintFSM.waiting_comment)
-    await message.answer("💬 Теперь напиши <b>комментарий</b> к жалобе.")
+    await message.answer("💬 Теперь напиши <b>комментарий</b> к жалобе.",
+                         reply_markup=_cancel_kb())
 
 
 @router.message(ComplaintFSM.waiting_comment)

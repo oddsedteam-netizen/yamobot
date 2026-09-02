@@ -362,8 +362,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     for btn in row:
                         one_kb = InlineKeyboardMarkup(inline_keyboard=[[btn]])
                         await _safe_answer(message, f"🔗 {btn.text}", one_kb)
-            if reply_kb:
-                await _safe_answer(message, "Используй кнопки ниже 👇", reply_kb)
         else:
             if reply_kb:
                 await _safe_answer(message, welcome, reply_kb)

@@ -202,8 +202,7 @@ async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
     text = (
         f"✏️ <b>Новый тег для #{admin['tag']}</b>\n\n"
-        f"Введи новый тег (без решётки):\n"
-        f"Пример: <code>маркетинг</code>"
+        f"Введи новый тег (без решётки):"
     )
 
     if callback.message:
@@ -564,8 +563,7 @@ async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
 
     text = (
         "✏️ <b>Редактор тегов</b>\n\n"
-        "Формат:\n<code>старый_тег новый_тег</code>\n\n"
-        "Пример:\n<code>продажи маркетинг</code>"
+        "Формат:\n<code>старый_тег новый_тег</code>"
     )
 
     if callback.message:

@@ -156,15 +156,15 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message is None:
         return
 
-    # Возвращаемся в главное меню: старый inline-экран сворачиваем,
-    # а меню выводим КОМПАКТНО (без повторного большого приветствия).
+    # Возвращаемся в главное меню: убираем старый inline-экран и выводим
+    # меню ОДНИМ сообщением (без дублирующего текста «Главное меню»).
     try:
-        await callback.message.edit_text(
-            "🏠 <b>Главное меню</b>\n\nДля навигации используйте кнопки ниже 👇",
-            reply_markup=None,
-        )
+        await callback.message.delete()
     except Exception:
-        pass
+        try:
+            await callback.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=None)
+        except Exception:
+            pass
 
     try:
         await callback.message.answer(
@@ -245,13 +245,15 @@ FAQ_TEXT = (
     "📋 <b>ПЗ</b> — это список пользователей твоих ботов.\n"
     "⚠️ <b>Жалоба</b> — отправь жалобу администрации. "
     "Понадобится указать категорию, приложить скриншот и оставить комментарий.\n\n"
-    "🧭 <b>Команды бота</b>\n"
-    "• <code>/start</code> — запуск и главное меню.\n"
-    "• <code>/menu</code> — открыть главное меню.\n"
-    "• <code>.стата</code> — краткая сводка по ПЗ всех ботов "
-    "(сколько всего ПЗ, с админом и без админа).\n"
-    "• <code>/status</code> — диагностика состояния дочерних ботов (для супер-админа).\n"
-    "• <code>/adm</code> — админ-панель (для супер-админа).\n\n"
+    "🧭 <b>Команды для админов в дочерних ботах</b>\n"
+    "Эти команды работают в топиках группового чата дочернего бота "
+    "(их по команде /connect используют как рабочий чат):\n"
+    "• <code>/smena</code> — сменить админа без подтверждения (сменить админа у ПЗ).\n"
+    "• <code>/otkaz</code> — отказаться от ПЗ / сбросить админа.\n"
+    "• <code>/ban</code> — забанить пользователя.\n"
+    "• <code>/unban</code> — разбанить пользователя.\n"
+    "• <code>/.стата</code> — краткая сводка по ПЗ всех ботов "
+    "(сколько всего ПЗ, с админом и без админа).\n\n"
     "Все данные привязаны к твоему аккаунту. Просто нажимай нужную кнопку и следуй подсказкам."
 )
 
@@ -306,7 +308,7 @@ def _resolve_stats_owner(chat, fallback_user_id: int) -> int:
     return fallback_user_id
 
 
-@router.message(F.text.regexp(r"(?i)^\.\s*стата"))
+@router.message(F.text.regexp(r"(?i)^\s*[\./]+\.?\s*(стата|stata)\s*$"))
 async def cmd_simple_stats(message: Message) -> None:
     # Виден всем: в ЛС — сводка по своему аккаунту, в чате админов — по владельцу чата.
     owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
