@@ -156,9 +156,8 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message is None:
         return
 
-    # Старый inline-экран «схлопываем» в короткую подсказку, а главное меню
-    # отправляем ровно ОДИН раз (раньше здесь выходило 2 приветствия подряд:
-    # одно — правкой текущего сообщения, второе — новым сообщением).
+    # Возвращаемся в главное меню: старый inline-экран сворачиваем,
+    # а меню выводим КОМПАКТНО (без повторного большого приветствия).
     try:
         await callback.message.edit_text(
             "🏠 <b>Главное меню</b>\n\nДля навигации используйте кнопки ниже 👇",
@@ -168,7 +167,10 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
         pass
 
     try:
-        await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+        await callback.message.answer(
+            "🏠 <b>Главное меню</b>\n\nВыбери действие кнопками ниже 👇",
+            reply_markup=main_menu_kb(),
+        )
     except Exception:
         pass
 
@@ -243,6 +245,13 @@ FAQ_TEXT = (
     "📋 <b>ПЗ</b> — это список пользователей твоих ботов.\n"
     "⚠️ <b>Жалоба</b> — отправь жалобу администрации. "
     "Понадобится указать категорию, приложить скриншот и оставить комментарий.\n\n"
+    "🧭 <b>Команды бота</b>\n"
+    "• <code>/start</code> — запуск и главное меню.\n"
+    "• <code>/menu</code> — открыть главное меню.\n"
+    "• <code>.стата</code> — краткая сводка по ПЗ всех ботов "
+    "(сколько всего ПЗ, с админом и без админа).\n"
+    "• <code>/status</code> — диагностика состояния дочерних ботов (для супер-админа).\n"
+    "• <code>/adm</code> — админ-панель (для супер-админа).\n\n"
     "Все данные привязаны к твоему аккаунту. Просто нажимай нужную кнопку и следуй подсказкам."
 )
 
@@ -299,10 +308,8 @@ def _resolve_stats_owner(chat, fallback_user_id: int) -> int:
 
 @router.message(F.text.regexp(r"(?i)^\.\s*стата"))
 async def cmd_simple_stats(message: Message) -> None:
+    # Виден всем: в ЛС — сводка по своему аккаунту, в чате админов — по владельцу чата.
     owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
-    if not get_user_bots(owner_id):
-        await message.answer("📭 Нет подключённых ботов.")
-        return
     text, kb = _stats_payload(owner_id)
     await message.answer(text, reply_markup=kb)
 

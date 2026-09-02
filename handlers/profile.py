@@ -27,6 +27,8 @@ router = Router()
 
 # Ожидание привязки чатов: user_id -> kind ("work"|"admin").
 _PENDING_BINDS: dict[int, str] = {}
+# Последний добавленный чат для юзера: user_id -> chat_id (для кнопки «я добавил бота»).
+_LAST_ADDED: dict[int, int] = {}
 
 
 
@@ -98,12 +100,20 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work")],
-        [InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin")],
         [InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="gadmins")],
         [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
+        [InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work")],
+        [InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin")],
     ])
+    if work_chat:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="❌ Отвязать чат работы", callback_data="unbind_work")
+        ])
+    if admin_chat:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin")
+        ])
     if is_super_admin(user_id):
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
@@ -125,7 +135,6 @@ async def cb_profile_show(callback: CallbackQuery) -> None:
         return
     text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
     await render_callback(callback, text, kb)
-    await message.answer(text, reply_markup=kb)
 
 
 # ═══════════════ Админ-панель пользователей ═══════════════
@@ -280,16 +289,34 @@ async def cb_bind_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "bind_done")
 async def cb_bind_done(callback: CallbackQuery) -> None:
-    kind = _PENDING_BINDS.get(callback.from_user.id)
+    """Пользователь сообщил, что добавил бота. Привязываем сами, если событие не пришло."""
+    user_id = callback.from_user.id
+    kind = _PENDING_BINDS.get(user_id)
+
+    # Если бот ещё ждёт привязку — попробуем привязать последний добавленный чат.
     if kind:
-        await callback.answer("⏳ Ожидаю событие добавления в чат…")
-        text = await _bind_instructions(callback, kind)
-        await render_callback(callback, text, _bind_wait_kb())
-    else:
-        await callback.answer("❌ Привязка не найдена. Начни заново.")
-        if callback.message:
-            text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+        chat_id = _LAST_ADDED.get(user_id)
+        if chat_id:
+            _PENDING_BINDS.pop(user_id, None)
+            set_bound_chat(user_id, kind, chat_id)
+            if kind == "work":
+                # Чат работы — бот запоминает и покидает его.
+                try:
+                    await callback.bot.leave_chat(chat_id)
+                except Exception:
+                    pass
+            await callback.answer("✅ Привязано!")
+            text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
             await render_callback(callback, text, kb)
+        else:
+            # Бот пока не видит добавление — короткое уведомление, без повтора инструкции.
+            await callback.answer("⏳ Добавь бота в чат, затем нажми ещё раз")
+            return
+    else:
+        # Уже привязано через событие — просто открываем профиль.
+        await callback.answer()
+        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "bind_cancel")
@@ -301,9 +328,42 @@ async def cb_bind_cancel(callback: CallbackQuery) -> None:
         await render_callback(callback, text, kb)
 
 
+@router.callback_query(F.data == "unbind_work")
+async def cb_unbind_work(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    set_bound_chat(user_id, "work", None)
+    await callback.answer("💼 Чат работы отвязан")
+    if callback.message:
+        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "unbind_admin")
+async def cb_unbind_admin(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    chat_id = get_bound_chat(user_id, "admin")
+    set_bound_chat(user_id, "admin", None)
+    if chat_id:
+        try:
+            await callback.bot.leave_chat(chat_id)
+        except Exception:
+            pass
+    await callback.answer("🛡 Чат админов отвязан")
+    if callback.message:
+        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        await render_callback(callback, text, kb)
+
+
 # Событие: YamoBot добавили в группу/супергруппу.
 @router.my_chat_member()
 async def on_bot_added_to_chat(event) -> None:
+    adder = getattr(event, "from_user", None)
+    if adder is not None and not getattr(adder, "is_bot", False):
+        # Запоминаем последний чат, куда добавили бота (для кнопки «я добавил бота»).
+        chat = event.chat
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            _LAST_ADDED[adder.id] = chat.id
+
     adder = getattr(event, "from_user", None)
     if adder is None or getattr(adder, "is_bot", False):
         return
