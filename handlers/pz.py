@@ -18,6 +18,7 @@ from services.storage import (
     get_user_info_from_pz,
     get_admin_by_user_id,
     is_user_banned,
+    is_bot_anonymous,
 )
 
 router = Router()
@@ -30,12 +31,40 @@ class PZFSM(StatesGroup):
 PZ_PER_PAGE = 10
 
 
-def pz_menu_kb(bot_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0")],
-        [InlineKeyboardButton(text="🔍 Найти по ID юзера", callback_data=f"pzsearch_{bot_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")],
-    ])
+def pz_menu_kb(bot_id: int, anon_mode: bool = False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if not anon_mode:
+        rows.append([InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0")])
+        rows.append([InlineKeyboardButton(text="🔍 Найти по ID юзера", callback_data=f"pzsearch_{bot_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _pz_menu_text(bot_info: dict, topics: list[dict]) -> str:
+    """Текст меню ПЗ (с учётом анонимного режима)."""
+    name = bot_display_name(bot_info)
+    bot_id = bot_info["id"]
+    anon_mode = bool(bot_info.get("anonymous_mode", 0))
+
+    assigned = sum(1 for t in topics if t.get("admin_user_id"))
+    open_count = len(topics) - assigned
+
+    text = (
+        f"📋 <b>ПЗ — {name}</b>\n\n"
+        f"Всего ПЗ: <b>{len(topics)}</b>\n"
+        f"🟢 С админом: <b>{assigned}</b>\n"
+        f"⏳ Без админа: <b>{open_count}</b>\n\n"
+    )
+
+    if anon_mode:
+        text += (
+            "🕶 <b>Анонимный режим включён.</b>\n"
+            "Список и поиск ПЗ для этого бота недоступны: "
+            "идентичность пользователей скрыта.\n\n"
+        )
+
+    text += "Выбери действие:"
+    return text
 
 
 # ═══════════════ Главное меню ПЗ ═══════════════
@@ -51,21 +80,11 @@ async def cb_pz_menu(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("⚠️ Бот не найден")
         return
 
-    name = bot_display_name(bot_info)
     topics = get_all_topics_for_bot(bot_id)
+    text = _pz_menu_text(bot_info, topics)
+    anon_mode = bool(bot_info.get("anonymous_mode", 0))
 
-    assigned = sum(1 for t in topics if t.get("admin_user_id"))
-    open_count = len(topics) - assigned
-
-    text = (
-        f"📋 <b>ПЗ — {name}</b>\n\n"
-        f"Всего ПЗ: <b>{len(topics)}</b>\n"
-        f"🟢 С админом: <b>{assigned}</b>\n"
-        f"⏳ Без админа: <b>{open_count}</b>\n\n"
-        f"Выбери действие:"
-    )
-
-    await render_callback(callback, text, pz_menu_kb(bot_id))
+    await render_callback(callback, text, pz_menu_kb(bot_id, anon_mode))
 
 
 # ═══════════════ Список ПЗ с пагинацией ═══════════════
@@ -83,11 +102,21 @@ async def cb_pz_list(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("⚠️ Бот не найден")
         return
 
+    anon_mode = bool(bot_info.get("anonymous_mode", 0))
+    if anon_mode:
+        await render_callback(
+            callback,
+            "🔒 <b>Список ПЗ недоступен</b>\n\n"
+            "У этого бота включён анонимный режим.",
+            pz_menu_kb(bot_id, True),
+        )
+        return
+
     topics = get_all_topics_for_bot(bot_id)
 
     if not topics:
         text = "📋 <b>Список ПЗ</b>\n\nПока нет ни одного ПЗ."
-        await safe_edit(callback.message, text, pz_menu_kb(bot_id))
+        await safe_edit(callback.message, text, pz_menu_kb(bot_id, False))
         await callback.answer()
         return
 
@@ -143,6 +172,17 @@ async def cb_noop(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.regexp(r"^pzsearch_\d+$"))
 async def cb_pz_search(callback: CallbackQuery, state: FSMContext) -> None:
     bot_id = int(callback.data.split("_", 1)[1])
+    user_id = callback.from_user.id
+
+    bot_info = get_bot_by_id(user_id, bot_id)
+    if bot_info and bool(bot_info.get("anonymous_mode", 0)):
+        await render_callback(
+            callback,
+            "🔒 <b>Поиск ПЗ недоступен</b>\n\n"
+            "У этого бота включён анонимный режим.",
+            pz_menu_kb(bot_id, True),
+        )
+        return
 
     await state.set_state(PZFSM.waiting_search_id)
     await state.update_data(pz_bot_id=bot_id)

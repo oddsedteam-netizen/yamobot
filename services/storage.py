@@ -57,6 +57,25 @@ def _migrate_admin_scope(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_bot_anonymous(conn: sqlite3.Connection) -> None:
+    """Добавляет колонку anonymous_mode в таблицу bots."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+    if "anonymous_mode" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN anonymous_mode INTEGER DEFAULT 0")
+    conn.commit()
+
+
+def _migrate_registry_chats(conn: sqlite3.Connection) -> None:
+    """Добавляет колонки привязанных чатов в users_registry."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users_registry)").fetchall()]
+    if "work_chat_id" not in cols:
+        conn.execute("ALTER TABLE users_registry ADD COLUMN work_chat_id INTEGER DEFAULT 0")
+    if "admin_chat_id" not in cols:
+        conn.execute("ALTER TABLE users_registry ADD COLUMN admin_chat_id INTEGER DEFAULT 0")
+    conn.commit()
+
+
+
 def ensure_db() -> None:
     conn = _get_conn()
     conn.executescript("""
@@ -206,6 +225,8 @@ def ensure_db() -> None:
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
+    _migrate_bot_anonymous(conn)
+    _migrate_registry_chats(conn)
     conn.commit()
 
 
@@ -293,7 +314,7 @@ def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
 
 _BOT_FIELDS_WHITELIST = {
     "token", "username", "first_name", "welcome_text",
-    "links", "stopped", "antispam_mode", "bot_type",
+    "links", "stopped", "antispam_mode", "bot_type", "anonymous_mode",
 }
 
 
@@ -320,6 +341,23 @@ def bot_display_name(b: dict) -> str:
     name = b.get("first_name") or b.get("username") or f"bot_{b['id']}"
     username = f" (@{b['username']})" if b.get("username") else ""
     return f"{name}{username}"
+
+
+# ═══════════════════════════════════════════════════════════
+#  Анонимный режим
+# ═══════════════════════════════════════════════════════════
+
+def is_bot_anonymous(bot_id: int) -> bool:
+    """Включён ли анонимный режим для бота (по данным любого владельца)."""
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        return False
+    return bool(bot.get("anonymous_mode", 0))
+
+
+def set_bot_anonymous(user_id: int, bot_id: int, enabled: bool) -> bool:
+    """Включает/выключает анонимный режим бота."""
+    return update_bot_field(user_id, bot_id, "anonymous_mode", 1 if enabled else 0)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1090,6 +1128,41 @@ def get_user_registry(user_id: int) -> dict | None:
     conn = _get_conn()
     row = conn.execute("SELECT * FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Привязка чатов работы и админов (в реестре YamoBot)
+# ═══════════════════════════════════════════════════════════
+
+_CHAT_BIND_COLUMNS = {"work": "work_chat_id", "admin": "admin_chat_id"}
+
+
+def get_bound_chat(user_id: int, kind: str) -> int | None:
+    """Возвращает ID привязанного чата ('work' или 'admin'), либо None."""
+    col = _CHAT_BIND_COLUMNS.get(kind)
+    if not col:
+        return None
+    row = get_user_registry(user_id)
+    if not row:
+        return None
+    chat_id = row.get(col) or 0
+    return int(chat_id) if chat_id else None
+
+
+def set_bound_chat(user_id: int, kind: str, chat_id: int | None) -> bool:
+    """Привязывает/отвязывает чат ('work' или 'admin') для пользователя."""
+    col = _CHAT_BIND_COLUMNS.get(kind)
+    if not col:
+        return False
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            f"INSERT INTO users_registry (user_id, {col}) VALUES (?, ?) "
+            f"ON CONFLICT(user_id) DO UPDATE SET {col}=excluded.{col}",
+            (user_id, chat_id or 0)
+        )
+        conn.commit()
+    return True
 
 
 def get_all_users_registry() -> list[dict]:

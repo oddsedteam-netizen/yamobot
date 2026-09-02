@@ -48,9 +48,62 @@ from services.storage import (
     get_bot_owner,
     get_bot_keyboard_by_bot,
     get_bot_type,
+    bot_display_name,
+    is_bot_anonymous,
+    get_bound_chat,
 )
 
 logger = logging.getLogger(__name__)
+
+# Основной (YamoBot) бот — используется для уведомлений в привязанный «чат админов».
+_MAIN_BOT: Bot | None = None
+
+
+def set_main_bot(bot: Bot) -> None:
+    """Сохраняет ссылку на основной бот YamoBot для отправки уведомлений."""
+    global _MAIN_BOT
+    _MAIN_BOT = bot
+
+
+def _topic_web_link(group_chat_id: int, topic_id: int) -> str:
+    """Строит ссылку на топик вида https://t.me/c/<chat>/<thread>."""
+    cid = group_chat_id
+    if cid < 0 and str(cid).startswith("-100"):
+        chat_part = int(str(cid)[4:])
+    else:
+        chat_part = int(cid)
+    return f"https://t.me/c/{chat_part}/{topic_id}"
+
+
+async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None:
+    """Шлёт в привязанный «чат админов» владельца уведомление о новом ПЗ.
+
+    Ссылка на топик отправляется всегда; имя/ID пользователя — только вне
+    анонимного режима (в анонимном личность скрыта).
+    """
+    if _MAIN_BOT is None:
+        return
+    owner_id = get_bot_owner(bot_id)
+    if not owner_id:
+        return
+    admin_chat = get_bound_chat(owner_id, "admin")
+    if not admin_chat:
+        return
+
+    bot_info = get_bot_by_id_any_owner(bot_id)
+    bot_name = bot_display_name(bot_info) if bot_info else f"bot_{bot_id}"
+    link = _topic_web_link(group_chat_id, topic_id)
+
+    text = (
+        f"🆕 <b>Новый ПЗ</b>\n"
+        f"🤖 Бот: <b>{bot_name}</b>\n"
+        f"🔗 Топик: {link}"
+    )
+
+    try:
+        await _MAIN_BOT.send_message(chat_id=admin_chat, text=text)
+    except Exception as e:
+        logger.warning("Не удалось отправить уведомление о новом ПЗ в чат админов: %s", e)
 
 
 def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
@@ -280,18 +333,37 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
         # В одном сообщении reply- и inline-клавиатуру показать нельзя,
         # поэтому если есть и то и другое — reply показываем отдельным сообщением.
-        welcome_kb = _build_welcome_kb(fresh)
-        reply_kb = _build_reply_kb(fresh)
+        try:
+            welcome_kb = _build_welcome_kb(fresh)
+        except Exception as e:
+            logger.error("Ошибка сборки inline-клавиатуры приветствия: %s", e)
+            welcome_kb = None
 
-        if welcome_kb and reply_kb:
-            await _safe_answer(message, welcome, welcome_kb)
-            await _safe_answer(message, "Используй кнопки ниже 👇", reply_kb)
-        elif welcome_kb:
-            await _safe_answer(message, welcome, welcome_kb)
-        elif reply_kb:
-            await _safe_answer(message, welcome, reply_kb)
+        try:
+            reply_kb = _build_reply_kb(fresh)
+        except Exception as e:
+            logger.error("Ошибка сборки reply-клавиатуры приветствия: %s", e)
+            reply_kb = None
+
+        # Приветствие должно уходить ВСЕГДА: сначала пробуем прикрепить inline
+        # прямо к нему; если Telegram отклоняет клавиатуру целиком (например,
+        # из-за одной невалидной ссылки) — отправляем текст отдельно, а ссылки
+        # пробуем показать по одной, чтобы битая ссылка не «съедала» приветствие.
+        if welcome_kb:
+            attached = await _safe_answer(message, welcome, welcome_kb)
+            if not attached:
+                await _safe_answer(message, welcome)
+                for row in welcome_kb.inline_keyboard:
+                    for btn in row:
+                        one_kb = InlineKeyboardMarkup(inline_keyboard=[[btn]])
+                        await _safe_answer(message, f"🔗 {btn.text}", one_kb)
+            if reply_kb:
+                await _safe_answer(message, "Используй кнопки ниже 👇", reply_kb)
         else:
-            await _safe_answer(message, welcome)
+            if reply_kb:
+                await _safe_answer(message, welcome, reply_kb)
+            else:
+                await _safe_answer(message, welcome)
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -713,10 +785,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if not group_chat_id:
             return
 
+        anon_mode = is_bot_anonymous(bot_id)
         topic = get_topic_by_user(bot_id, user_chat_id)
 
         if not topic:
-            user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
             try:
                 forum_topic = await bot_obj.create_forum_topic(
                     chat_id=group_chat_id, name="⏳ без админа"
@@ -728,24 +800,55 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
             create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
 
+            if anon_mode:
+                # Анонимный режим: личность пользователя не раскрываем.
+                header_text = (
+                    "📩 <b>Новое сообщение</b>\n"
+                    "🕶 Идентичность пользователя скрыта."
+                )
+            else:
+                user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
+                header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
+
             await bot_obj.send_message(
                 chat_id=group_chat_id, message_thread_id=topic_id,
-                text=f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>",
+                text=header_text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="✋ Я беру",
                                            callback_data=f"take_user_{topic_id}_{group_chat_id}")]
                 ])
             )
 
-            sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
-            if sent:
-                save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
-                                       "in", sent.message_id, message.message_id)
+            # В анонимном режиме содержимое сообщения не пересылается —
+            # в чат попадает только факт «пришло новое сообщение».
+            if not anon_mode:
+                sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
+                if sent:
+                    save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                                           "in", sent.message_id, message.message_id)
 
             add_stat(bot_id, "message_out")
+
+            # Уведомление владельцу в привязанный «чат админов».
+            try:
+                await _notify_new_pz(bot_id, group_chat_id, topic_id)
+            except Exception as e:
+                logger.warning("Не удалось отправить уведомление о новом ПЗ: %s", e)
             return
 
         topic_id = topic["topic_id"]
+
+        if anon_mode:
+            # Анонимный режим: в топик уходит только пинг без текста юзера.
+            try:
+                await bot_obj.send_message(
+                    chat_id=group_chat_id, message_thread_id=topic_id,
+                    text="📩 <b>Новое сообщение</b>"
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить анонимный пинг в топик: %s", e)
+            add_stat(bot_id, "message_out")
+            return
 
         reply_to_group = None
         if message.reply_to_message:

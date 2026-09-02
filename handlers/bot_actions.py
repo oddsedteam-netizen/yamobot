@@ -15,6 +15,7 @@ from services.storage import (
     get_stats,
     get_antispam_mode,
     set_antispam_mode,
+    set_bot_anonymous,
 )
 from services.child_manager import ChildManager
 from handlers.my_bots import my_bots_kb
@@ -29,14 +30,33 @@ def main_inline_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def single_bot_kb(bot_id: int, is_running: bool) -> InlineKeyboardMarkup:
+def _single_bot_text(bot_info: dict, is_running: bool) -> str:
+    """Текст карточки бота в меню бота."""
+    name = bot_display_name(bot_info)
+    status = "🟢 Работает" if is_running else "🔴 Остановлен"
+    welcome = bot_info.get("welcome_text", "") or "— не задано —"
+    anon = "🟢 вкл" if bool(bot_info.get("anonymous_mode", 0)) else "⚪ выкл"
+
+    return (
+        f"🤖 <b>{name}</b>\n"
+        f"🆔 <code>{bot_info['id']}</code>\n"
+        f"Статус: {status}\n"
+        f"🕶 Анонимный режим: {anon}\n\n"
+        f"💬 Приветствие:\n{welcome}\n\n"
+        f"Выбери действие:"
+    )
+
+
+def single_bot_kb(bot_id: int, is_running: bool, anon_mode: bool = False) -> InlineKeyboardMarkup:
     stop_text = "⛔ Остановить" if is_running else "▶️ Запустить"
     stop_data = f"action_stop_{bot_id}" if is_running else f"action_start_{bot_id}"
+    anon_text = "🕶 Аноним: вкл" if anon_mode else "🕶 Аноним: выкл"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"mailing_{bot_id}")],
             [InlineKeyboardButton(text="🛡 Антиспам", callback_data=f"antispam_{bot_id}")],
+            [InlineKeyboardButton(text=anon_text, callback_data=f"action_anon_{bot_id}")],
             [InlineKeyboardButton(text=stop_text, callback_data=stop_data)],
             [InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_{bot_id}")],
             [InlineKeyboardButton(text="✏️ Редактор", callback_data=f"editor_{bot_id}")],
@@ -60,20 +80,11 @@ async def cb_single_bot(callback: CallbackQuery,
         await callback.answer()
         return
 
-    name = bot_display_name(bot_info)
     running = child_manager.is_running(bot_id)
-    status = "🟢 Работает" if running else "🔴 Остановлен"
-    welcome = bot_info.get("welcome_text", "") or "— не задано —"
+    text = _single_bot_text(bot_info, running)
 
-    text = (
-        f"🤖 <b>{name}</b>\n"
-        f"🆔 <code>{bot_id}</code>\n"
-        f"Статус: {status}\n\n"
-        f"💬 Приветствие:\n{welcome}\n\n"
-        f"Выбери действие:"
-    )
+    await render_callback(callback, text, single_bot_kb(bot_id, running, bool(bot_info.get("anonymous_mode", 0))))
 
-    await render_callback(callback, text, single_bot_kb(bot_id, running))
 
 
 @router.callback_query(F.data.startswith("action_stop_"))
@@ -88,9 +99,8 @@ async def cb_stop_bot(callback: CallbackQuery,
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if bot_info:
-        name = bot_display_name(bot_info)
-        text = f"🤖 <b>{name}</b>\n🆔 <code>{bot_id}</code>\nСтатус: 🔴 Остановлен\n\nВыбери действие:"
-        await safe_edit(callback.message, text, single_bot_kb(bot_id, False))
+        text = _single_bot_text(bot_info, False)
+        await safe_edit(callback.message, text, single_bot_kb(bot_id, False, bool(bot_info.get("anonymous_mode", 0))))
 
 
 @router.callback_query(F.data.startswith("action_start_"))
@@ -113,11 +123,38 @@ async def cb_start_bot(callback: CallbackQuery,
         await callback.answer("⚠️ Не удалось запустить")
 
     if callback.message:
-        name = bot_display_name(bot_info)
         running = child_manager.is_running(bot_id)
-        status = "🟢 Работает" if running else "🔴 Остановлен"
-        text = f"🤖 <b>{name}</b>\n🆔 <code>{bot_id}</code>\nСтатус: {status}\n\nВыбери действие:"
-        await safe_edit(callback.message, text, single_bot_kb(bot_id, running))
+        text = _single_bot_text(bot_info, running)
+        await safe_edit(callback.message, text, single_bot_kb(bot_id, running, bool(bot_info.get("anonymous_mode", 0))))
+
+
+# ═══════════════ Анонимный режим ═══════════════
+
+@router.callback_query(F.data.startswith("action_anon_"))
+async def cb_toggle_anon(callback: CallbackQuery,
+                         child_manager: ChildManager) -> None:
+    bot_id = int(callback.data.rsplit("_", 1)[-1])
+    user_id = callback.from_user.id
+
+    bot_info = get_bot_by_id(user_id, bot_id)
+    if not bot_info:
+        await callback.answer("⚠️ Бот не найден")
+        return
+
+    new_value = 0 if bool(bot_info.get("anonymous_mode", 0)) else 1
+    set_bot_anonymous(user_id, bot_id, bool(new_value))
+
+    # Перезапускаем дочернего бота, чтобы он сразу подхватил новый режим.
+    if child_manager.is_running(bot_id):
+        await child_manager.restart_child(bot_info)
+
+    bot_info = get_bot_by_id(user_id, bot_id) or bot_info
+    running = child_manager.is_running(bot_id)
+    text = _single_bot_text(bot_info, running)
+
+    await safe_edit(callback.message, text, single_bot_kb(bot_id, running, bool(new_value)))
+    await callback.answer("🕶 Анонимный режим включён" if new_value else "🕶 Анонимный режим выключен")
+
 
 
 # ═══════════════ Антиспам ═══════════════

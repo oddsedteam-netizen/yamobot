@@ -58,6 +58,10 @@ async def main() -> None:
     child_manager = ChildManager()
     dp["child_manager"] = child_manager
 
+    # Даём менеджеру ссылку на основной бот — для уведомлений в «чат админов».
+    from services.child_manager import set_main_bot
+    set_main_bot(bot)
+
     register_all_handlers(dp)
 
     try:

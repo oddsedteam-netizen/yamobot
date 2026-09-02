@@ -43,11 +43,9 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🤖 Боты")],
+            [KeyboardButton(text="📋 ПЗ"), KeyboardButton(text="👥 Админы")],
+            [KeyboardButton(text="⚠️ Жалоба"), KeyboardButton(text="❓ FAQ")],
             [KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="👥 Админы")],
-            [KeyboardButton(text="📋 ПЗ")],
-            [KeyboardButton(text="⚠️ Жалоба")],
-            [KeyboardButton(text="❓ FAQ")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие",
@@ -150,12 +148,24 @@ async def on_faq_button(message: Message) -> None:
 async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    if callback.message:
-        try:
-            await callback.message.edit_text(WELCOME_TEXT, reply_markup=None)
-        except Exception:
-            pass
+    if callback.message is None:
+        return
+
+    # Старый inline-экран «схлопываем» в короткую подсказку, а главное меню
+    # отправляем ровно ОДИН раз (раньше здесь выходило 2 приветствия подряд:
+    # одно — правкой текущего сообщения, второе — новым сообщением).
+    try:
+        await callback.message.edit_text(
+            "🏠 <b>Главное меню</b>\n\nДля навигации используйте кнопки ниже 👇",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    try:
         await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    except Exception:
+        pass
 
 
 @router.message(Command("menu"))

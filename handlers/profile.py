@@ -1,4 +1,5 @@
 from aiogram import Router, F
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -18,9 +19,15 @@ from services.storage import (
     is_registry_user_banned,
     set_registry_user_blocked,
     remove_user_bot,
+    get_bound_chat,
+    set_bound_chat,
 )
 
 router = Router()
+
+# Ожидание привязки чатов: user_id -> kind ("work"|"admin").
+_PENDING_BINDS: dict[int, str] = {}
+
 
 
 def _user_line(u: dict) -> str:
@@ -75,6 +82,11 @@ async def show_profile(message: Message) -> None:
         lines.append(f"  • {bot_display_name(b)} — 📋 ПЗ: <b>{len(topics)}</b>")
     bots_list = "\n".join(lines) if lines else "  — нет ботов —"
 
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+    work_line = f"<code>{work_chat}</code>" if work_chat else "не привязан"
+    admin_line = f"<code>{admin_chat}</code>" if admin_chat else "не привязан"
+
     text = (
         f"👤 <b>Профиль</b>\n\n"
         f"📛 Имя: <b>{fname}</b>\n"
@@ -82,10 +94,14 @@ async def show_profile(message: Message) -> None:
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"👥 Админов: <b>{len(admins)}</b>\n"
         f"📋 Всего ПЗ: <b>{total_pz}</b>\n\n"
+        f"💼 Чат работы: {work_line}\n"
+        f"🛡 Чат админов: {admin_line}\n\n"
         f"<b>По ботам:</b>\n{bots_list}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work")],
+        [InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin")],
         [InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="gadmins")],
         [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
@@ -199,3 +215,174 @@ async def cb_profile_del_bots(callback: CallbackQuery) -> None:
     for b in bots:
         remove_user_bot(uid, b["id"])
     await render_callback(callback, f"🗑 Удалены все боты пользователя <code>{uid}</code>.", profile_admin_kb(uid))
+
+
+# ═══════════════ Привязка «чата работы» и «чата админов» ═══════════════
+
+_BIND_LABELS = {
+    "work": "💼 Чат работы",
+    "admin": "🛡 Чат админов",
+}
+
+
+def _profile_mini_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Компактное меню профиля (возврат после отмены привязки)."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=_BIND_LABELS["work"], callback_data="bind_work")],
+        [InlineKeyboardButton(text=_BIND_LABELS["admin"], callback_data="bind_admin")],
+        [InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots")],
+        [InlineKeyboardButton(text="👥 Админы", callback_data="gadmins")],
+        [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
+    ])
+    if is_super_admin(user_id):
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
+        ])
+    return kb
+
+
+def _bind_wait_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я добавил бота", callback_data="bind_done")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_back_main")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="bind_cancel")],
+    ])
+
+
+async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
+    try:
+        me = await callback.bot.get_me()
+        bot_ref = f"@{me.username}" if me.username else "бота"
+    except Exception:
+        bot_ref = "бота"
+
+    label = _BIND_LABELS[kind]
+    if kind == "work":
+        tail = "После привязки бот запомнит ID чата и <b>покинет</b> его."
+    else:
+        tail = "После привязки бот запомнит ID чата и <b>останется</b> в нём — "
+        tail += "сюда будут приходить уведомления о новых ПЗ."
+
+    return (
+        f"📌 <b>{label}</b>\n\n"
+        f"1. Добавь <b>{bot_ref}</b> в групповой чат, который хочешь "
+        f"использовать как «{label}».\n"
+        f"2. Дождись подтверждения привязки.\n\n"
+        f"{tail}"
+    )
+
+
+@router.callback_query(F.data.in_({"bind_work", "bind_admin"}))
+async def cb_bind_start(callback: CallbackQuery) -> None:
+    kind = "work" if callback.data == "bind_work" else "admin"
+    _PENDING_BINDS[callback.from_user.id] = kind
+    text = await _bind_instructions(callback, kind)
+    await render_callback(callback, text, _bind_wait_kb())
+
+
+@router.callback_query(F.data == "bind_done")
+async def cb_bind_done(callback: CallbackQuery) -> None:
+    kind = _PENDING_BINDS.get(callback.from_user.id)
+    if kind:
+        await callback.answer("⏳ Ожидаю событие добавления в чат…")
+        text = await _bind_instructions(callback, kind)
+        await render_callback(callback, text, _bind_wait_kb())
+    else:
+        await callback.answer("❌ Привязка не найдена. Начни заново.")
+        await render_callback(callback, "👤 <b>Профиль</b>", _profile_mini_kb(callback.from_user.id))
+
+
+@router.callback_query(F.data == "bind_cancel")
+async def cb_bind_cancel(callback: CallbackQuery) -> None:
+    _PENDING_BINDS.pop(callback.from_user.id, None)
+    await callback.answer("❌ Привязка отменена")
+    await render_callback(callback, "👤 <b>Профиль</b>", _profile_mini_kb(callback.from_user.id))
+
+
+@router.callback_query(F.data == "profile_back_main")
+async def cb_profile_back(callback: CallbackQuery) -> None:
+    """Возврат в главное меню (без дублей приветствия)."""
+    _PENDING_BINDS.pop(callback.from_user.id, None)
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_text(
+            "🏠 <b>Главное меню</b>\n\nДля навигации используйте кнопки ниже 👇",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+    try:
+        from handlers.start import WELCOME_TEXT, main_menu_kb
+        await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    except Exception:
+        pass
+
+
+# Событие: YamoBot добавили в группу/супергруппу.
+@router.my_chat_member()
+async def on_bot_added_to_chat(event) -> None:
+    adder = getattr(event, "from_user", None)
+    if adder is None or getattr(adder, "is_bot", False):
+        return
+
+    kind = _PENDING_BINDS.pop(adder.id, None)
+    if not kind:
+        return
+
+    chat = event.chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        # Если это не группа — возвращаем «ожидание», чтобы не потерять запрос.
+        _PENDING_BINDS[adder.id] = kind
+        return
+
+    new_status = getattr(event.new_chat_member, "status", None)
+    old_status = getattr(event.old_chat_member, "status", None)
+    was_member = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    is_member = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    if was_member or not is_member:
+        return
+
+    set_bound_chat(adder.id, kind, chat.id)
+
+    bot = event.bot
+    chat_name = chat.title or f"чат {chat.id}"
+    if kind == "work":
+        try:
+            await bot.send_message(
+                chat.id,
+                "💼 Чат работы привязан. YamoBot запомнил его и покидает чат. 👋",
+            )
+        except Exception:
+            pass
+        try:
+            await bot.leave_chat(chat.id)
+        except Exception:
+            pass
+        confirm_text = (
+            f"✅ <b>Чат работы привязан!</b>\n\n"
+            f"📎 Чат: <b>{chat_name}</b>\n"
+            f"🆔 ID: <code>{chat.id}</code>\n\n"
+            f"Бот запомнил чат и вышел из него."
+        )
+    else:
+        try:
+            await bot.send_message(
+                chat.id,
+                "🛡 <b>Чат админов привязан.</b>\n"
+                "Сюда будут приходить уведомления о новых ПЗ.",
+            )
+        except Exception:
+            pass
+        confirm_text = (
+            f"✅ <b>Чат админов привязан!</b>\n\n"
+            f"📎 Чат: <b>{chat_name}</b>\n"
+            f"🆔 ID: <code>{chat.id}</code>\n\n"
+            f"Теперь сюда будут приходить уведомления о новых ПЗ."
+        )
+
+    try:
+        await bot.send_message(adder.id, confirm_text)
+    except Exception:
+        pass
+

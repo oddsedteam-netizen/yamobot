@@ -111,15 +111,24 @@ async def cb_global_pz(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
     bots = get_user_bots(user_id)
 
-    if not bots:
-        text = "📋 <b>ПЗ</b>\n\nУ тебя пока нет подключённых ботов."
+    # В анонимном режиме бот не показывается ни в списке, ни на кнопках ПЗ.
+    visible = [b for b in bots if not b.get("anonymous_mode", 0)]
+    hidden_count = len(bots) - len(visible)
+
+    if not visible:
+        text = "📋 <b>ПЗ</b>\n\nНет доступных ботов для просмотра ПЗ."
+        if hidden_count:
+            text += (
+                "\n\n🕶 <b>Скрыто:</b> "
+                f"{hidden_count} бот(а/ов) с включённым анонимным режимом."
+            )
         await render_callback(callback, text, _main_kb())
         return
 
     total = 0
     assigned = 0
     bot_rows = []
-    for b in bots:
+    for b in visible:
         topics = get_all_topics_for_bot(b["id"])
         a = sum(1 for t in topics if t.get("admin_user_id"))
         total += len(topics)
@@ -130,15 +139,17 @@ async def cb_global_pz(callback: CallbackQuery) -> None:
         )
 
     text = (
-        f"📋 <b>ПЗ — все боты</b> ({len(bots)} ботов)\n\n"
+        f"📋 <b>ПЗ — все боты</b> ({len(visible)} ботов)\n\n"
         f"Всего ПЗ: <b>{total}</b>\n"
         f"🟢 С админом: <b>{assigned}</b>\n"
-        f"⏳ Без админа: <b>{total - assigned}</b>\n\n"
-        f"По каждому боту:\n" + "\n".join(bot_rows)
+        f"⏳ Без админа: <b>{total - assigned}</b>"
     )
+    if hidden_count:
+        text += f"\n\n🕶 Скрыто анонимных: <b>{hidden_count}</b>"
+    text += "\n\nПо каждому боту:\n" + "\n".join(bot_rows)
 
     buttons: list[list[InlineKeyboardButton]] = []
-    for b in bots:
+    for b in visible:
         buttons.append([
             InlineKeyboardButton(text=f"📋 {bot_display_name(b)}", callback_data=f"pzlist_{b['id']}_0")
         ])
