@@ -9,6 +9,7 @@ from aiogram.types import (
 )
 
 from handlers._common import render_callback
+from services.child_manager import ChildManager
 from services.storage import (
     get_admins_all,
     add_admin,
@@ -19,6 +20,7 @@ from services.storage import (
     get_admin_tag_history,
     get_admin_message_stats,
     get_admin_active_topics,
+    get_admin_active_topics_list,
     get_all_admins_stats,
     create_admin_invite,
 )
@@ -245,19 +247,97 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
 async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     admin_user_id = int(callback.data.split("_")[-1])
+    owner_id = callback.from_user.id
 
-    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
+    admin = get_admin_by_user_id(owner_id, admin_user_id)
     uname = f"@{admin['username']}" if admin and admin['username'] else f"ID:{admin_user_id}"
     tag = admin["tag"] if admin else "?"
 
-    remove_admin(callback.from_user.id, admin_user_id)
+    remove_admin(owner_id, admin_user_id)
 
+    # Сколько ПЗ закреплено за этим админом (для опроса о рассылке).
+    topics = get_admin_active_topics_list(owner_id, admin_user_id)
+    n = len(topics)
+
+    if n == 0:
+        await _finish_admin_deleted(callback, uname, tag)
+        return
+
+    text = (
+        f"🗑 <b>Админ удалён</b>\n\n"
+        f"👤 {uname}\n🏷 #{tag}\n\n"
+        f"У него было ПЗ: <b>{n}</b>\n\n"
+        f"Хотите сделать рассылку по ПЗ админа с оповещением об уходе?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, разослать", callback_data=f"gadmins_delmail_yes_{admin_user_id}")],
+        [InlineKeyboardButton(text="❌ Нет", callback_data=f"gadmins_delmail_no_{admin_user_id}")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+async def _finish_admin_deleted(callback: CallbackQuery, uname: str, tag: str) -> None:
+    """Финальный экран после удаления админа (когда рассылка не нужна)."""
     text = f"✅ <b>Админ удалён!</b>\n\n👤 {uname}\n🏷 #{tag}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
         [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
     ])
+    await render_callback(callback, text, kb)
 
+
+@router.callback_query(F.data.regexp(r"^gadmins_delmail_no_\d+$"))
+async def cb_delmail_no(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await render_callback(callback, "👌 Ок", InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")]
+    ]))
+
+
+@router.callback_query(F.data.regexp(r"^gadmins_delmail_yes_\d+$"))
+async def cb_delmail_yes(callback: CallbackQuery,
+                         child_manager: ChildManager) -> None:
+    admin_user_id = int(callback.data.split("_")[-1])
+    owner_id = callback.from_user.id
+
+    topics = get_admin_active_topics_list(owner_id, admin_user_id)
+    sent = 0
+    failed = 0
+
+    for t in topics:
+        bot_id = t["bot_id"]
+        user_chat_id = t["user_chat_id"]
+        bot = child_manager.get_bot(bot_id)
+        if bot is None:
+            failed += 1
+            continue
+        try:
+            await bot.send_message(
+                chat_id=user_chat_id,
+                text="⚠️ <b>Ваш администратор покинул бота.</b>\n\n"
+                     "Мы подберём вам нового. Нажмите кнопку ниже, чтобы ускорить процесс.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="👀 Подобрать нового",
+                        callback_data=f"picknew_{t['topic_id']}_{t['group_chat_id']}",
+                    )]
+                ]),
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    text = (
+        f"📨 <b>Рассылка завершена</b>\n\n"
+        f"✅ Отправлено ПЗ: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+    ])
     await render_callback(callback, text, kb)
 
 

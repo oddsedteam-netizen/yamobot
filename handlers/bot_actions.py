@@ -141,8 +141,14 @@ async def cb_toggle_anon(callback: CallbackQuery,
         await callback.answer("⚠️ Бот не найден")
         return
 
-    new_value = 0 if bool(bot_info.get("anonymous_mode", 0)) else 1
-    set_bot_anonymous(user_id, bot_id, bool(new_value))
+    currently_on = bool(bot_info.get("anonymous_mode", 0))
+    if currently_on:
+        # Анонимный режим нельзя выключить.
+        await callback.answer("🕶 Анонимный режим нельзя выключить", show_alert=True)
+        return
+
+    # Переносим только «включить»: 0 → 1. Выключить больше нельзя.
+    set_bot_anonymous(user_id, bot_id, True)
 
     # Перезапускаем дочернего бота, чтобы он сразу подхватил новый режим.
     if child_manager.is_running(bot_id):
@@ -152,8 +158,8 @@ async def cb_toggle_anon(callback: CallbackQuery,
     running = child_manager.is_running(bot_id)
     text = _single_bot_text(bot_info, running)
 
-    await safe_edit(callback.message, text, single_bot_kb(bot_id, running, bool(new_value)))
-    await callback.answer("🕶 Анонимный режим включён" if new_value else "🕶 Анонимный режим выключен")
+    await safe_edit(callback.message, text, single_bot_kb(bot_id, running, True))
+    await callback.answer("🕶 Анонимный режим включён")
 
 
 

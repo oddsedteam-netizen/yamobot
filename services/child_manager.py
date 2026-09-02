@@ -330,6 +330,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
 
+        # В анонимном режиме в конце приветствия добавляем плашку.
+        if is_bot_anonymous(bot_id):
+            welcome = f"{welcome}\n\n🕶 <b>Анонимный режим включён.</b>"
+
         # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
         # В одном сообщении reply- и inline-клавиатуру показать нельзя,
         # поэтому если есть и то и другое — reply показываем отдельным сообщением.
@@ -518,6 +522,52 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         )
         await message.answer("✅ Пользователю отправлено уведомление.")
 
+# ═══════════════ Callback: пользователь нажал «подобрать нового» ═══════════════
+
+    @child_dp.callback_query(F.data.startswith("picknew_"))
+    async def cb_pick_new(callback: CallbackQuery) -> None:
+        parts = callback.data.split("_")
+        thread_id = int(parts[1])
+        group_chat_id = int(parts[2])
+
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
+        if not topic:
+            await callback.answer("❌ Топик не найден")
+            return
+
+        reset_topic_admin(bot_id, thread_id, group_chat_id)
+
+        try:
+            await bot_obj.edit_forum_topic(
+                chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
+            )
+        except Exception:
+            pass
+
+        await bot_obj.send_message(
+            chat_id=group_chat_id, message_thread_id=thread_id,
+            text="🔔 Пользователь запросил нового админа!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✋ Я беру",
+                                       callback_data=f"take_user_{thread_id}_{group_chat_id}")]
+            ])
+        )
+
+        try:
+            await bot_obj.send_message(
+                chat_id=topic["user_chat_id"],
+                text="👀 Запрос на нового администратора отправлен. Скоро с вами свяжутся.",
+            )
+        except Exception:
+            pass
+
+        try:
+            await callback.message.edit_text("✅ Запрос нового админа отправлен.")
+        except Exception:
+            pass
+        await callback.answer()
+
+    # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
     # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
 
     @child_dp.message(
@@ -801,11 +851,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
 
             if anon_mode:
-                # Анонимный режим: личность пользователя не раскрываем.
-                header_text = (
-                    "📩 <b>Новое сообщение</b>\n"
-                    "🕶 Идентичность пользователя скрыта."
-                )
+                # Анонимный режим: личность пользователя НЕ раскрываем
+                # (никакого имени/ник/ID), но само сообщение пересылаем.
+                header_text = "📩 <b>Новое сообщение</b> 🕶"
             else:
                 user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
                 header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
@@ -819,13 +867,11 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 ])
             )
 
-            # В анонимном режиме содержимое сообщения не пересылается —
-            # в чат попадает только факт «пришло новое сообщение».
-            if not anon_mode:
-                sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
-                if sent:
-                    save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
-                                           "in", sent.message_id, message.message_id)
+            # Само сообщение пересылаем ВСЕГДА (в т.ч. в анонимном режиме).
+            sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id)
+            if sent:
+                save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                                       "in", sent.message_id, message.message_id)
 
             add_stat(bot_id, "message_out")
 
@@ -837,18 +883,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
 
         topic_id = topic["topic_id"]
-
-        if anon_mode:
-            # Анонимный режим: в топик уходит только пинг без текста юзера.
-            try:
-                await bot_obj.send_message(
-                    chat_id=group_chat_id, message_thread_id=topic_id,
-                    text="📩 <b>Новое сообщение</b>"
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить анонимный пинг в топик: %s", e)
-            add_stat(bot_id, "message_out")
-            return
 
         reply_to_group = None
         if message.reply_to_message:

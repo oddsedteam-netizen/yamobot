@@ -1171,6 +1171,31 @@ def get_all_users_registry() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_owner_by_admin_chat(chat_id: int) -> int | None:
+    """Возвращает владельца, к которому привязан данный «чат админов» (или None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_id FROM users_registry WHERE admin_chat_id = ?",
+        (chat_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_admin_active_topics_list(owner_id: int, admin_user_id: int) -> list[dict]:
+    """Активные топики (ПЗ), закреплённые за конкретным админом."""
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return []
+    placeholders = ",".join("?" for _ in bot_ids)
+    conn = _get_conn()
+    rows = conn.execute(
+        f"SELECT * FROM feedback_topics "
+        f"WHERE admin_user_id = ? AND status = 'assigned' AND bot_id IN ({placeholders})",
+        (admin_user_id, *bot_ids)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def is_registry_user_banned(user_id: int) -> bool:
     conn = _get_conn()
     row = conn.execute("SELECT blocked FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()

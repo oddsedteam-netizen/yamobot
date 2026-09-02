@@ -1,4 +1,5 @@
 from aiogram import Router, F
+from aiogram.enums import ChatType
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -21,6 +22,10 @@ from services.storage import (
     get_admin_by_user_id,
     register_user,
     is_registry_user_banned,
+    get_user_bots,
+    get_all_topics_for_bot,
+    bot_display_name,
+    get_owner_by_admin_chat,
 )
 
 router = Router()
@@ -56,7 +61,7 @@ async def _show_main(message: Message) -> None:
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
-@router.message(CommandStart())
+@router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
@@ -77,7 +82,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await _show_main(message)
 
 
-@router.message(StartFSM.waiting_admin_tag)
+@router.message(StartFSM.waiting_admin_tag, F.chat.type == ChatType.PRIVATE)
 async def fsm_waiting_admin_tag(message: Message, state: FSMContext) -> None:
     tag = (message.text or "").strip().lstrip("#")
     if not tag:
@@ -168,13 +173,13 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
         pass
 
 
-@router.message(Command("menu"))
+@router.message(Command("menu"), F.chat.type == ChatType.PRIVATE)
 async def cmd_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
     await _show_main(message)
 
 
-@router.message(Command("adm"))
+@router.message(Command("adm"), F.chat.type == ChatType.PRIVATE)
 async def cmd_adm(message: Message) -> None:
     """Открывает админ-панель только для супер-админа (переменная ADMIN)."""
     user_id = message.from_user.id
@@ -185,7 +190,7 @@ async def cmd_adm(message: Message) -> None:
     await message.answer("🛡 <b>Админ-панель</b>\n\nВыбери раздел:", reply_markup=admin_kb())
 
 
-@router.message(Command("status"))
+@router.message(Command("status"), F.chat.type == ChatType.PRIVATE)
 async def cmd_status(message: Message, child_manager: ChildManager) -> None:
     """Диагностика: состояние всех дочерних ботов (только для супер-админа)."""
     user_id = message.from_user.id
@@ -247,3 +252,94 @@ async def cb_faq(callback: CallbackQuery) -> None:
     await render_callback(callback, FAQ_TEXT, InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]]
     ))
+
+
+# ═══════════════ .стата — сводка в чате админов ═══════════════
+
+def _stats_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏳ ПЗ без админов", callback_data="gstat_noadmin")]
+    ])
+
+
+def _stats_payload(owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Сводка по ПЗ всех ботов владельца (общая и по каждому боту)."""
+    bots = get_user_bots(owner_id)
+    if not bots:
+        return "📭 Нет подключённых ботов.", _stats_kb()
+
+    total = 0
+    noadmin = 0
+    lines = []
+    for b in bots:
+        ts = get_all_topics_for_bot(b["id"])
+        a = sum(1 for t in ts if t.get("admin_user_id"))
+        noadmin += len(ts) - a
+        total += len(ts)
+        lines.append(f"  • {bot_display_name(b)} — 📋 {len(ts)} (🟢 {a} / ⏳ {len(ts) - a})")
+
+    text = (
+        f"📊 <b>Сводка по ПЗ</b>\n\n"
+        f"Всего ПЗ: <b>{total}</b>\n"
+        f"🟢 С админом: <b>{total - noadmin}</b>\n"
+        f"⏳ Без админа: <b>{noadmin}</b>\n\n"
+        f"<b>По ботам:</b>\n" + "\n".join(lines)
+    )
+    return text, _stats_kb()
+
+
+def _resolve_stats_owner(chat, fallback_user_id: int) -> int:
+    """Владелец: в ЛС — сам юзер, в группе — владелец привязанного «чата админов»."""
+    if chat and chat.type != ChatType.PRIVATE:
+        own = get_owner_by_admin_chat(chat.id)
+        if own:
+            return own
+    return fallback_user_id
+
+
+@router.message(F.text.regexp(r"(?i)^\.\s*стата"))
+async def cmd_simple_stats(message: Message) -> None:
+    owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
+    if not get_user_bots(owner_id):
+        await message.answer("📭 Нет подключённых ботов.")
+        return
+    text, kb = _stats_payload(owner_id)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "gstat_noadmin")
+async def cb_gstat_noadmin(callback: CallbackQuery) -> None:
+    chat = callback.message.chat if callback.message else None
+    owner_id = _resolve_stats_owner(chat, callback.from_user.id)
+    bots = get_user_bots(owner_id)
+
+    links = []
+    for b in bots:
+        for t in get_all_topics_for_bot(b["id"]):
+            if not t.get("admin_user_id"):
+                cid, tid = t["group_chat_id"], t["topic_id"]
+                if cid < 0 and str(cid).startswith("-100"):
+                    chat_part = int(str(cid)[4:])
+                else:
+                    chat_part = int(cid)
+                link = f"https://t.me/c/{chat_part}/{tid}"
+                links.append(f"  • {bot_display_name(b)}: {link}")
+
+    if not links:
+        text = "🎉 Все ПЗ закрыты админами! Топиков без админа нет."
+    else:
+        text = f"⏳ <b>ПЗ без админа ({len(links)})</b>\n\n" + "\n".join(links)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstat_noadmin")],
+        [InlineKeyboardButton(text="⬅️ К сводке", callback_data="gstat_back")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "gstat_back")
+async def cb_gstat_back(callback: CallbackQuery) -> None:
+    chat = callback.message.chat if callback.message else None
+    owner_id = _resolve_stats_owner(chat, callback.from_user.id)
+    text, kb = _stats_payload(owner_id)
+    await render_callback(callback, text, kb)

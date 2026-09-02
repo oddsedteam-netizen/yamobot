@@ -67,10 +67,8 @@ def profile_admin_kb(user_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-async def show_profile(message: Message) -> None:
-    user_id = message.from_user.id
-    fname = message.from_user.first_name or "—"
-
+def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Собирает текст и клавиатуру профиля (используется и для message, и для callback)."""
     bots = get_user_bots(user_id)
     admins = get_admins_all(user_id)
 
@@ -89,7 +87,7 @@ async def show_profile(message: Message) -> None:
 
     text = (
         f"👤 <b>Профиль</b>\n\n"
-        f"📛 Имя: <b>{fname}</b>\n"
+        f"📛 Имя: <b>{first_name}</b>\n"
         f"🆔 ID: <code>{user_id}</code>\n\n"
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"👥 Админов: <b>{len(admins)}</b>\n"
@@ -111,6 +109,21 @@ async def show_profile(message: Message) -> None:
             InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
         ])
 
+    return text, kb
+
+
+async def show_profile(message: Message) -> None:
+    text, kb = _profile_payload(message.from_user.id, message.from_user.first_name or "—")
+
+
+@router.callback_query(F.data == "profile_show")
+async def cb_profile_show(callback: CallbackQuery) -> None:
+    """Открывает профиль из инлайн-колбэка (без нового приветствия)."""
+    _PENDING_BINDS.pop(callback.from_user.id, None)
+    if callback.message is None:
+        return
+    text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+    await render_callback(callback, text, kb)
     await message.answer(text, reply_markup=kb)
 
 
@@ -225,26 +238,10 @@ _BIND_LABELS = {
 }
 
 
-def _profile_mini_kb(user_id: int) -> InlineKeyboardMarkup:
-    """Компактное меню профиля (возврат после отмены привязки)."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=_BIND_LABELS["work"], callback_data="bind_work")],
-        [InlineKeyboardButton(text=_BIND_LABELS["admin"], callback_data="bind_admin")],
-        [InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots")],
-        [InlineKeyboardButton(text="👥 Админы", callback_data="gadmins")],
-        [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
-    ])
-    if is_super_admin(user_id):
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
-        ])
-    return kb
-
-
 def _bind_wait_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Я добавил бота", callback_data="bind_done")],
-        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_back_main")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="bind_cancel")],
     ])
 
@@ -289,34 +286,18 @@ async def cb_bind_done(callback: CallbackQuery) -> None:
         await render_callback(callback, text, _bind_wait_kb())
     else:
         await callback.answer("❌ Привязка не найдена. Начни заново.")
-        await render_callback(callback, "👤 <b>Профиль</b>", _profile_mini_kb(callback.from_user.id))
+        if callback.message:
+            text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+            await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "bind_cancel")
 async def cb_bind_cancel(callback: CallbackQuery) -> None:
     _PENDING_BINDS.pop(callback.from_user.id, None)
     await callback.answer("❌ Привязка отменена")
-    await render_callback(callback, "👤 <b>Профиль</b>", _profile_mini_kb(callback.from_user.id))
-
-
-@router.callback_query(F.data == "profile_back_main")
-async def cb_profile_back(callback: CallbackQuery) -> None:
-    """Возврат в главное меню (без дублей приветствия)."""
-    _PENDING_BINDS.pop(callback.from_user.id, None)
-    if callback.message is None:
-        return
-    try:
-        await callback.message.edit_text(
-            "🏠 <b>Главное меню</b>\n\nДля навигации используйте кнопки ниже 👇",
-            reply_markup=None,
-        )
-    except Exception:
-        pass
-    try:
-        from handlers.start import WELCOME_TEXT, main_menu_kb
-        await callback.message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
-    except Exception:
-        pass
+    if callback.message:
+        text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+        await render_callback(callback, text, kb)
 
 
 # Событие: YamoBot добавили в группу/супергруппу.
