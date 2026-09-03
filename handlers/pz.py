@@ -1,4 +1,5 @@
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -8,7 +9,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, safe_edit
+from handlers._common import _is_not_modified, render_callback, safe_edit
 from services.storage import (
     get_bot_by_id,
     bot_display_name,
@@ -292,6 +293,12 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
         if msg_or_cb.message:
             try:
                 await msg_or_cb.message.edit_text(text, reply_markup=kb)
+            except TelegramBadRequest as e:
+                if _is_not_modified(e):
+                    # Контент не изменился — исходное сообщение уже актуально,
+                    # отправлять новое не нужно (иначе дубликат при «Обновить»).
+                    return
+                await msg_or_cb.message.answer(text, reply_markup=kb)
             except Exception:
                 await msg_or_cb.message.answer(text, reply_markup=kb)
 

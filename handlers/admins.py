@@ -35,6 +35,12 @@ class AdminFSM(StatesGroup):
     waiting_search_tag = State()
 
 
+# Кэш последней сгенерированной ссылки-приглашения (owner_id -> link).
+# Нужен, чтобы кнопка «Скопировать ссылку» показывала именно ту ссылку,
+# что отображается в сообщении, не открывая её и не запуская приглашение.
+_invite_link_cache: dict[int, str] = {}
+
+
 # ═══════════════ Клавиатуры ═══════════════
 
 def admins_menu_kb() -> InlineKeyboardMarkup:
@@ -398,15 +404,17 @@ async def cb_add_admin_by_link(callback: CallbackQuery) -> None:
         )
 
     if link:
+        # Запоминаем ссылку, чтобы кнопка «Скопировать ссылку» показывала именно её.
+        _invite_link_cache[owner_id] = link
         text = (
             "🔗 <b>Добавить админа ссылкой</b>\n\n"
             "Отправь эту ссылку человеку, которого хочешь сделать админом. "
             "Когда он перейдёт по ней, бот попросит его ввести тег и привяжет его к твоим ботам.\n\n"
             f"<code>{link}</code>\n\n"
-            "⬇️ Или нажми, чтобы скопировать:"
+            "⬇️ Нажми, чтобы увидеть ссылку для копирования:"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Скопировать ссылку", url=link)],
+            [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data="gadmins_addlink_copy")],
             [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink")],
             [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
         ])
@@ -416,6 +424,22 @@ async def cb_add_admin_by_link(callback: CallbackQuery) -> None:
         ])
 
     await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "gadmins_addlink_copy")
+async def cb_add_admin_copy_link(callback: CallbackQuery) -> None:
+    """Показывает ссылку-приглашение во всплывающем окне, не открывая её.
+
+    Telegram не даёт боту скопировать текст в буфер напрямую. Раньше кнопка была
+    url-кнопкой и по нажатию открывала саму ссылку, из-за чего владелец запускал
+    приглашение на себя и получал запрос на ввод тега. Теперь ссылку просто показываем.
+    """
+    link = _invite_link_cache.get(callback.from_user.id)
+    if not link:
+        await callback.answer("❌ Ссылка не найдена. Нажми «🔄 Новая ссылка».",
+                              show_alert=True)
+        return
+    await callback.answer(link, show_alert=True)
 
 
 @router.callback_query(F.data == "gadmins_add")
