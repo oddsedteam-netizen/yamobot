@@ -222,6 +222,32 @@ def ensure_db() -> None:
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             resolved_at   TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS user_restrictions (
+            bot_id         INTEGER NOT NULL,
+            user_chat_id   INTEGER NOT NULL,
+            ban_until      TEXT,
+            mute_until     TEXT,
+            warns          INTEGER DEFAULT 0,
+            updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (bot_id, user_chat_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS warn_settings (
+            owner_id         INTEGER PRIMARY KEY,
+            max_warns        INTEGER DEFAULT 5,
+            punish_type      TEXT DEFAULT 'mute',
+            punish_duration  INTEGER DEFAULT 60
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_chat_moderators (
+            owner_id    INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            first_name  TEXT DEFAULT '',
+            added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (owner_id, user_id)
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
@@ -983,7 +1009,16 @@ def is_user_banned(bot_id: int, chat_id: int) -> bool:
         "SELECT blocked FROM users WHERE bot_id = ? AND chat_id = ?",
         (bot_id, chat_id)
     ).fetchone()
-    return bool(row and row[0])
+    if row and row[0]:
+        return True
+    # Временный бан из «чата админов».
+    r = conn.execute(
+        "SELECT ban_until FROM user_restrictions WHERE bot_id = ? AND user_chat_id = ?",
+        (bot_id, chat_id)
+    ).fetchone()
+    if r and r[0]:
+        return r[0] > _now_utc_str()
+    return False
 
 
 def unban_user(bot_id: int, chat_id: int) -> bool:
@@ -996,6 +1031,243 @@ def unban_user(bot_id: int, chat_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+# ═══════════════════════════════════════════════════════════
+#  Наказания из «чата админов»: бан/мут/преды
+# ═══════════════════════════════════════════════════════════
+
+def _now_utc_str() -> str:
+    """Текущее время в формате CURRENT_TIMESTAMP (наивный UTC)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _expire_time(minutes: int | None) -> str | None:
+    """Время истечения в ISO-строках БД; None означает вечный бан."""
+    if not minutes:
+        return None
+    return (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _restriction_upsert(conn: sqlite3.Connection, bot_id: int, chat_id: int, col: str, value) -> None:
+    conn.execute(
+        f"INSERT INTO user_restrictions (bot_id, user_chat_id, {col}) VALUES (?, ?, ?) "
+        f"ON CONFLICT(bot_id, user_chat_id) DO UPDATE SET {col}=excluded.{col}",
+        (bot_id, chat_id, value)
+    )
+
+
+def get_user_restriction(bot_id: int, chat_id: int) -> dict:
+    """Текущее состояние ограничений юзера (бан/мут/преды)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT ban_until, mute_until, warns FROM user_restrictions "
+        "WHERE bot_id = ? AND user_chat_id = ?",
+        (bot_id, chat_id)
+    ).fetchone()
+    if not row:
+        return {"ban_until": None, "mute_until": None, "warns": 0}
+    return {"ban_until": row[0], "mute_until": row[1], "warns": row[2]}
+
+
+def set_user_ban(bot_id: int, chat_id: int, until_iso: str | None = None) -> None:
+    """Устанавливает бан. None — навсегда (постоянный флаг), строка — до даты."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (bot_id, chat_id, username, first_name) "
+            "VALUES (?, ?, '', '')",
+            (bot_id, chat_id)
+        )
+        if until_iso is None:
+            # Вечный бан — постоянный флаг, чтобы is_user_banned ловил его всегда.
+            conn.execute(
+                "UPDATE users SET blocked = 1 WHERE bot_id = ? AND chat_id = ?",
+                (bot_id, chat_id)
+            )
+            _restriction_upsert(conn, bot_id, chat_id, "ban_until", None)
+        else:
+            conn.execute(
+                "UPDATE users SET blocked = 0 WHERE bot_id = ? AND chat_id = ?",
+                (bot_id, chat_id)
+            )
+            _restriction_upsert(conn, bot_id, chat_id, "ban_until", until_iso)
+        conn.commit()
+
+
+def set_user_mute(bot_id: int, chat_id: int, until_iso: str | None) -> None:
+    """Устанавливает мут до until_iso."""
+    conn = _get_conn()
+    with _lock:
+        _restriction_upsert(conn, bot_id, chat_id, "mute_until", until_iso)
+        conn.execute(
+            "INSERT OR IGNORE INTO users (bot_id, chat_id, username, first_name) "
+            "VALUES (?, ?, '', '')",
+            (bot_id, chat_id)
+        )
+        conn.commit()
+
+
+def clear_user_restriction(bot_id: int, chat_id: int) -> None:
+    """Снимает бан, мут и преды."""
+    conn = _get_conn()
+    with _lock:
+        _restriction_upsert(conn, bot_id, chat_id, "ban_until", None)
+        _restriction_upsert(conn, bot_id, chat_id, "mute_until", None)
+        _restriction_upsert(conn, bot_id, chat_id, "warns", 0)
+        conn.execute(
+            "UPDATE users SET blocked = 0 WHERE bot_id = ? AND chat_id = ?",
+            (bot_id, chat_id)
+        )
+        conn.commit()
+
+
+def add_user_warn(bot_id: int, chat_id: int) -> int:
+    """Записывает один пред. Возвращает новое количество предов юзера."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO user_restrictions (bot_id, user_chat_id, warns) VALUES (?, ?, 1) "
+            "ON CONFLICT(bot_id, user_chat_id) DO UPDATE SET warns=warns+1",
+            (bot_id, chat_id)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT warns FROM user_restrictions WHERE bot_id = ? AND user_chat_id = ?",
+            (bot_id, chat_id)
+        ).fetchone()
+        return row[0] if row else 1
+
+
+def reset_user_warns(bot_id: int, chat_id: int) -> None:
+    conn = _get_conn()
+    with _lock:
+        _restriction_upsert(conn, bot_id, chat_id, "warns", 0)
+        conn.commit()
+
+
+def get_warn_settings(owner_id: int) -> dict:
+    """Порог предов до наказания и само наказание для владельца."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT max_warns, punish_type, punish_duration FROM warn_settings WHERE owner_id = ?",
+        (owner_id,)
+    ).fetchone()
+    if not row:
+        return {"max_warns": 5, "punish_type": "mute", "punish_duration": 60}
+    return {"max_warns": row[0], "punish_type": row[1], "punish_duration": row[2]}
+
+
+def set_warn_settings(owner_id: int, max_warns: int, punish_type: str, punish_duration: int) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO warn_settings (owner_id, max_warns, punish_type, punish_duration) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET "
+            "max_warns=excluded.max_warns, punish_type=excluded.punish_type, "
+            "punish_duration=excluded.punish_duration",
+            (owner_id, max_warns, punish_type, punish_duration)
+        )
+        conn.commit()
+
+
+def is_user_muted(bot_id: int, chat_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT mute_until FROM user_restrictions WHERE bot_id = ? AND user_chat_id = ?",
+        (bot_id, chat_id)
+    ).fetchone()
+    if row and row[0]:
+        return row[0] > _now_utc_str()
+    return False
+
+
+def get_owner_users(owner_id: int) -> list[dict]:
+    """Все пользователи дочерних ботов владельца (bot_id, chat_id, username, first_name)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT u.bot_id AS bot_id, u.chat_id AS chat_id, "
+        "u.username AS username, u.first_name AS first_name "
+        "FROM users u JOIN bots b ON b.id = u.bot_id "
+        "WHERE b.owner_id = ?",
+        (owner_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+def clear_user_restriction_for_owner(owner_id: int, chat_id: int) -> None:
+    """Снимает бан, мут и преды у юзера по всем ботам владельца."""
+    for bot_id in _owner_bot_ids(owner_id):
+        clear_user_restriction(bot_id, chat_id)
+
+
+def clear_user_mute_for_owner(owner_id: int, chat_id: int) -> None:
+    """Снимает только мут у юзера по всем ботам владельца."""
+    conn = _get_conn()
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return
+    with _lock:
+        for bot_id in bot_ids:
+            _restriction_upsert(conn, bot_id, chat_id, "mute_until", None)
+        conn.commit()
+
+
+def reset_user_warns_for_owner(owner_id: int, chat_id: int) -> None:
+    """Сбрасывает преды у юзера по всем ботам владельца."""
+    conn = _get_conn()
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return
+    with _lock:
+        for bot_id in bot_ids:
+            _restriction_upsert(conn, bot_id, chat_id, "warns", 0)
+        conn.commit()
+
+
+def add_admin_chat_moderator(owner_id: int, user_id: int, username: str = "", first_name: str = "") -> bool:
+    conn = _get_conn()
+    with _lock:
+        try:
+            conn.execute(
+                "INSERT INTO admin_chat_moderators (owner_id, user_id, username, first_name) "
+                "VALUES (?, ?, ?, ?)",
+                (owner_id, user_id, username, first_name)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_admin_chat_moderator(owner_id: int, user_id: int) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "DELETE FROM admin_chat_moderators WHERE owner_id = ? AND user_id = ?",
+            (owner_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_admin_chat_moderators(owner_id: int) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM admin_chat_moderators WHERE owner_id = ? ORDER BY added_at ASC",
+        (owner_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def is_admin_chat_moderator(owner_id: int, user_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_id FROM admin_chat_moderators WHERE owner_id = ? AND user_id = ?",
+        (owner_id, user_id)
+    ).fetchone()
+    return row is not None
 
 # ═══════════════════════════════════════════════════════════
 #  Глобальные приветствие и линки для всех ботов юзера

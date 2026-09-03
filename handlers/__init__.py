@@ -13,6 +13,7 @@ from handlers.pz import router as pz_router
 from handlers.overview import router as overview_router
 from handlers.profile import router as profile_router
 from handlers.complaints import router as complaints_router
+from handlers.admin_moderation import router as admin_moderation_router
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
@@ -29,3 +30,4 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(overview_router)
     dp.include_router(profile_router)
     dp.include_router(complaints_router)
+    dp.include_router(admin_moderation_router)

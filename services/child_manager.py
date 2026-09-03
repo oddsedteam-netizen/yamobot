@@ -26,6 +26,7 @@ from services.storage import (
     ban_user,
     unban_user,
     is_user_banned,
+    is_user_muted,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
@@ -738,6 +739,12 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     @child_dp.message(F.chat.type == ChatType.PRIVATE)
     async def private_message(message: Message) -> None:
         if is_user_banned(bot_id, message.from_user.id):
+            return
+        if is_user_muted(bot_id, message.from_user.id):
+            try:
+                await message.answer("🔇 Вы временно ограничены в отправке сообщений. Попробуйте позже.")
+            except Exception:
+                pass
             return
 
         add_stat(bot_id, "message_in")
