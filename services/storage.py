@@ -75,6 +75,19 @@ def _migrate_registry_chats(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_admin_invites(conn: sqlite3.Connection) -> None:
+    """Добавляет колонки лимита использования в таблицу admin_invites.
+
+    Старые ссылки (до этого обновления) считаются одноразовыми: max_uses = 1.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(admin_invites)").fetchall()]
+    if "max_uses" not in cols:
+        conn.execute("ALTER TABLE admin_invites ADD COLUMN max_uses INTEGER DEFAULT 1")
+    if "used" not in cols:
+        conn.execute("ALTER TABLE admin_invites ADD COLUMN used INTEGER DEFAULT 0")
+    conn.commit()
+
+
 
 def ensure_db() -> None:
     conn = _get_conn()
@@ -211,6 +224,14 @@ def ensure_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS transfers (
+            token          TEXT PRIMARY KEY,
+            from_user_id   INTEGER NOT NULL,
+            kind           TEXT NOT NULL,
+            bot_id         INTEGER,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS complaints (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id       INTEGER NOT NULL,
@@ -233,6 +254,15 @@ def ensure_db() -> None:
             PRIMARY KEY (bot_id, user_chat_id)
         );
 
+        CREATE TABLE IF NOT EXISTS banned_topics (
+            bot_id         INTEGER NOT NULL,
+            user_chat_id   INTEGER NOT NULL,
+            group_chat_id  INTEGER NOT NULL,
+            topic_id       INTEGER NOT NULL,
+            banned_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, group_chat_id, topic_id)
+        );
+
         CREATE TABLE IF NOT EXISTS warn_settings (
             owner_id         INTEGER PRIMARY KEY,
             max_warns        INTEGER DEFAULT 5,
@@ -253,6 +283,7 @@ def ensure_db() -> None:
     _migrate_admin_scope(conn)
     _migrate_bot_anonymous(conn)
     _migrate_registry_chats(conn)
+    _migrate_admin_invites(conn)
     conn.commit()
 
 
@@ -791,7 +822,10 @@ def create_topic_record(bot_id: int, user_chat_id: int, group_chat_id: int, topi
 
 
 def delete_topic_record(bot_id: int, user_chat_id: int) -> None:
-    """Удаляет запись топика (используется, когда топик устарел/удалили)."""
+    """Удаляет запись топика (используется, когда топик устарел/удалили/закрыли).
+
+    Удалённый топик больше не отображается ни в «ПЗ», ни в сводке «ПЗ без админов».
+    """
     conn = _get_conn()
     with _lock:
         conn.execute(
@@ -799,6 +833,24 @@ def delete_topic_record(bot_id: int, user_chat_id: int) -> None:
             (bot_id, user_chat_id)
         )
         conn.commit()
+
+
+def delete_topics_for_owner_user(owner_id: int, user_chat_id: int) -> int:
+    """Удаляет ПЗ пользователя по всем ботам владельца (например, после бана).
+
+    Возвращает количество удалённых записей.
+    """
+    removed = 0
+    for bot_id in _owner_bot_ids(owner_id):
+        conn = _get_conn()
+        with _lock:
+            cur = conn.execute(
+                "DELETE FROM feedback_topics WHERE bot_id = ? AND user_chat_id = ?",
+                (bot_id, user_chat_id)
+            )
+            conn.commit()
+            removed += cur.rowcount
+    return removed
 
 
 def assign_admin_to_topic(bot_id: int, topic_id: int, group_chat_id: int,
@@ -922,32 +974,57 @@ def get_bot_keyboard_by_bot(bot_id: int) -> list[dict]:
 #  Приглашения админов по ссылке
 # ═══════════════════════════════════════════════════════════
 
-def create_admin_invite(owner_id: int) -> str:
-    """Создаёт одноразовый токен-приглашение админа."""
+def create_admin_invite(owner_id: int, max_uses: int = 1) -> str:
+    """Создаёт токен-приглашение админа на `max_uses` человек (по умолчанию — 1)."""
     token = secrets.token_urlsafe(16)
     conn = _get_conn()
     with _lock:
         conn.execute(
-            "INSERT INTO admin_invites (token, owner_id) VALUES (?, ?)",
-            (token, owner_id)
+            "INSERT INTO admin_invites (token, owner_id, max_uses, used) VALUES (?, ?, ?, 0)",
+            (token, owner_id, max_uses)
         )
         conn.commit()
     return token
 
 
-def get_admin_invite_owner(token: str) -> int | None:
+def get_admin_invite(token: str) -> dict | None:
+    """Возвращает инфо о приглашении: {'owner_id', 'max_uses', 'used'} или None."""
     conn = _get_conn()
     row = conn.execute(
-        "SELECT owner_id FROM admin_invites WHERE token = ?", (token,)
+        "SELECT owner_id, max_uses, used FROM admin_invites WHERE token = ?", (token,)
     ).fetchone()
-    return row[0] if row else None
+    return dict(row) if row else None
 
 
-def consume_admin_invite(token: str) -> None:
+def get_admin_invite_owner(token: str) -> int | None:
+    """Возвращает владельца приглашения (или None). Совместимость со старым кодом."""
+    invite = get_admin_invite(token)
+    return invite["owner_id"] if invite else None
+
+
+def consume_admin_invite(token: str) -> int | None:
+    """Использует один «слот» приглашения.
+
+    Возвращает количество оставшихся мест (0 — ссылка исчерпана и удалена),
+    либо None, если приглашения не существует.
+    """
     conn = _get_conn()
     with _lock:
-        conn.execute("DELETE FROM admin_invites WHERE token = ?", (token,))
+        row = conn.execute(
+            "SELECT max_uses, used FROM admin_invites WHERE token = ?", (token,)
+        ).fetchone()
+        if not row:
+            return None
+        new_used = row["used"] + 1
+        if new_used >= row["max_uses"]:
+            conn.execute("DELETE FROM admin_invites WHERE token = ?", (token,))
+            conn.commit()
+            return 0
+        conn.execute(
+            "UPDATE admin_invites SET used = ? WHERE token = ?", (new_used, token)
+        )
         conn.commit()
+        return row["max_uses"] - new_used
 
 
 def set_bot_keyboard(owner_id: int, bot_id: int, buttons: list[dict]) -> bool:
@@ -1031,6 +1108,49 @@ def unban_user(bot_id: int, chat_id: int) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+# ═══════════════════════════════════════════════════════════
+#  Забаненные топики (для рабочего /unban в топике)
+# ═══════════════════════════════════════════════════════════
+
+def save_banned_topic(bot_id: int, user_chat_id: int, group_chat_id: int, topic_id: int) -> None:
+    """Сохраняет маппинг «топик → юзер» при бане.
+
+    Запись ПЗ при бане удаляется, чтобы он не светился в списках, но
+    сохраняем маппинг, чтобы потом можно было разбанить прямо из топика.
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO banned_topics "
+            "(bot_id, user_chat_id, group_chat_id, topic_id) VALUES (?, ?, ?, ?)",
+            (bot_id, user_chat_id, group_chat_id, topic_id),
+        )
+        conn.commit()
+
+
+def get_banned_topic_user(bot_id: int, group_chat_id: int, topic_id: int) -> int | None:
+    """Возвращает user_chat_id забаненного топика (или None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_chat_id FROM banned_topics "
+        "WHERE bot_id = ? AND group_chat_id = ? AND topic_id = ?",
+        (bot_id, group_chat_id, topic_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def delete_banned_topic(bot_id: int, group_chat_id: int, topic_id: int) -> None:
+    """Удаляет запись о забаненном топике (после разбана)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "DELETE FROM banned_topics "
+            "WHERE bot_id = ? AND group_chat_id = ? AND topic_id = ?",
+            (bot_id, group_chat_id, topic_id),
+        )
+        conn.commit()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1548,3 +1668,114 @@ def complaints_count(status: str | None = None) -> int:
     else:
         row = conn.execute("SELECT COUNT(*) FROM complaints").fetchone()
     return row[0]
+
+
+# ═══════════════════════════════════════════════════════════
+#  Передача прав владельца
+# ═══════════════════════════════════════════════════════════
+
+def create_transfer(from_user_id: int, kind: str, bot_id: int | None = None) -> str:
+    """Создаёт токен-ссылку на передачу прав.
+
+    kind = "all" — передача всех прав владельца.
+    kind = "bot" — передача одного бота (bot_id).
+    """
+    token = secrets.token_urlsafe(20)
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO transfers (token, from_user_id, kind, bot_id) VALUES (?, ?, ?, ?)",
+            (token, from_user_id, kind, bot_id),
+        )
+        conn.commit()
+    return token
+
+
+def get_transfer(token: str) -> dict | None:
+    """Возвращает инфо о передаче прав или None."""
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM transfers WHERE token = ?", (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_transfer(token: str) -> None:
+    """Удаляет ссылку-передачу (после принятия или отклонения)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute("DELETE FROM transfers WHERE token = ?", (token,))
+        conn.commit()
+
+
+def transfer_all_rights(
+    from_id: int,
+    to_id: int,
+    to_username: str = "",
+    to_first_name: str = "",
+) -> int:
+    """Полная передача всех прав владельца новому юзеру.
+
+    Мигрируют: боты, админы, совладельцы, привязанные чаты (работа/админов),
+    настройки предов (warn_settings) и модераторы «чата админов».
+    Возвращает количество переданных ботов.
+    """
+    register_user(to_id, to_username, to_first_name)
+
+    bot_ids = _owner_bot_ids(from_id)
+    conn = _get_conn()
+    with _lock:
+        # Боты
+        conn.execute("UPDATE bots SET owner_id = ? WHERE owner_id = ?", (to_id, from_id))
+        # Админы (избегаем конфликта, если новый владелец уже был админом старика)
+        conn.execute(
+            "DELETE FROM admins WHERE owner_id = ? AND user_id = ?", (from_id, to_id)
+        )
+        conn.execute("UPDATE admins SET owner_id = ? WHERE owner_id = ?", (to_id, from_id))
+        # Совладельцы
+        conn.execute(
+            "DELETE FROM coowners WHERE owner_id = ? AND coowner_id = ?", (from_id, to_id)
+        )
+        conn.execute("UPDATE coowners SET owner_id = ? WHERE owner_id = ?", (to_id, from_id))
+        # Настройки предов
+        conn.execute(
+            "UPDATE warn_settings SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+        )
+        conn.execute(
+            "DELETE FROM warn_settings WHERE owner_id = ?", (from_id,)
+        )
+        # Модераторы «чата админов»
+        conn.execute(
+            "DELETE FROM admin_chat_moderators WHERE owner_id = ? AND user_id = ?",
+            (from_id, to_id),
+        )
+        conn.execute(
+            "UPDATE admin_chat_moderators SET owner_id = ? WHERE owner_id = ?",
+            (to_id, from_id),
+        )
+        conn.commit()
+
+    # Привязанные чаты передаём новому владельцу, у старого — сбрасываем.
+    set_bound_chat(to_id, "work", get_bound_chat(from_id, "work"))
+    set_bound_chat(to_id, "admin", get_bound_chat(from_id, "admin"))
+    set_bound_chat(from_id, "work", None)
+    set_bound_chat(from_id, "admin", None)
+
+    return len(bot_ids)
+
+
+def transfer_bot(
+    from_id: int,
+    to_id: int,
+    bot_id: int,
+    to_username: str = "",
+    to_first_name: str = "",
+) -> bool:
+    """Передаёт только одного бота новому владельцу (вместе с его данными)."""
+    register_user(to_id, to_username, to_first_name)
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE bots SET owner_id = ? WHERE id = ? AND owner_id = ?",
+            (to_id, bot_id, from_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0

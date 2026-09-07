@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import time
@@ -10,6 +11,7 @@ from aiogram.enums import ParseMode, ContentType, ChatType
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -27,6 +29,9 @@ from services.storage import (
     unban_user,
     is_user_banned,
     is_user_muted,
+    save_banned_topic,
+    get_banned_topic_user,
+    delete_banned_topic,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
@@ -65,6 +70,33 @@ def set_main_bot(bot: Bot) -> None:
     """Сохраняет ссылку на основной бот YamoBot для отправки уведомлений."""
     global _MAIN_BOT
     _MAIN_BOT = bot
+
+
+# Кэш скачанных байт медиа по file_id: file_id -> bytes.
+# Нужен, чтобы при рассылке на несколько ботов не качать файл повторно.
+_mailing_bytes_cache: dict[str, bytes] = {}
+
+
+async def _cached_media_bytes(file_id: str) -> bytes | None:
+    """Скачивает файл через основной бот и кэширует байты.
+
+    file_id из YamoBot не работает в дочерних ботах (file_id привязан к боту,
+    принявшему файл), поэтому для рассылки медиа перекачиваем его байты и
+    перезаливаем дочерним ботом как новый файл.
+    """
+    if file_id in _mailing_bytes_cache:
+        return _mailing_bytes_cache[file_id]
+    if _MAIN_BOT is None:
+        return None
+    buffer = io.BytesIO()
+    try:
+        await _MAIN_BOT.download(file_id, destination=buffer)
+        data = buffer.getvalue()
+    except Exception as e:
+        logger.warning("Не удалось скачать медиа %s: %s", file_id, e)
+        return None
+    _mailing_bytes_cache[file_id] = data
+    return data
 
 
 def _topic_web_link(group_chat_id: int, topic_id: int) -> str:
@@ -284,6 +316,8 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
     g_id = topic["group_chat_id"]
     t_id = topic["topic_id"]
     reset_topic_admin(bot_id, t_id, g_id)
+    # ПЗ пользователя, заблокировавшего бота, скрываем из списков ПЗ.
+    delete_topic_record(bot_id, user_chat_id)
 
     try:
         await bot.edit_forum_topic(chat_id=g_id, message_thread_id=t_id, name="🚫 забанил бота")
@@ -337,37 +371,24 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             welcome = f"{welcome}\n\n🕶 <b>Анонимный режим включён.</b>"
 
         # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
-        # В одном сообщении reply- и inline-клавиатуру показать нельзя,
-        # поэтому если есть и то и другое — reply показываем отдельным сообщением.
-        try:
-            welcome_kb = _build_welcome_kb(fresh)
-        except Exception as e:
-            logger.error("Ошибка сборки inline-клавиатуры приветствия: %s", e)
-            welcome_kb = None
+        # В одном сообщении reply- и inline-клавиатуру показать нельзя, поэтому
+        # приветствие отправляется РОВНО ОДИН раз, а reply-клавиатура (если она
+        # есть у стандартного бота) показывается отдельным коротким сообщением.
+        welcome_kb = _build_welcome_kb(fresh)
+        reply_kb = _build_reply_kb(fresh)
 
-        try:
-            reply_kb = _build_reply_kb(fresh)
-        except Exception as e:
-            logger.error("Ошибка сборки reply-клавиатуры приветствия: %s", e)
-            reply_kb = None
-
-        # Приветствие должно уходить ВСЕГДА: сначала пробуем прикрепить inline
-        # прямо к нему; если Telegram отклоняет клавиатуру целиком (например,
-        # из-за одной невалидной ссылки) — отправляем текст отдельно, а ссылки
-        # пробуем показать по одной, чтобы битая ссылка не «съедала» приветствие.
-        if welcome_kb:
-            attached = await _safe_answer(message, welcome, welcome_kb)
-            if not attached:
+        if welcome_kb and reply_kb:
+            # Сначала приветствие с инлайн-кнопками, затем подсказка с reply.
+            if not await _safe_answer(message, welcome, welcome_kb):
                 await _safe_answer(message, welcome)
-                for row in welcome_kb.inline_keyboard:
-                    for btn in row:
-                        one_kb = InlineKeyboardMarkup(inline_keyboard=[[btn]])
-                        await _safe_answer(message, f"🔗 {btn.text}", one_kb)
+            await _safe_answer(message, "👇 Меню действий — кнопкой ниже:", reply_kb)
+        elif welcome_kb:
+            if not await _safe_answer(message, welcome, welcome_kb):
+                await _safe_answer(message, welcome)
+        elif reply_kb:
+            await _safe_answer(message, welcome, reply_kb)
         else:
-            if reply_kb:
-                await _safe_answer(message, welcome, reply_kb)
-            else:
-                await _safe_answer(message, welcome)
+            await _safe_answer(message, welcome)
         add_stat(bot_id, "message_out")
 
     # ═══════════════ /connect в группе ═══════════════
@@ -420,6 +441,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             pass
 
         reset_topic_admin(bot_id, thread_id, group_chat_id)
+        # Забаненный/закрытый ПЗ не должен показываться в списках ПЗ.
+        delete_topic_record(bot_id, user_chat_id)
+        # Но запоминаем маппинг «топик → юзер», чтобы /unban из топика работал.
+        save_banned_topic(bot_id, user_chat_id, group_chat_id, thread_id)
         await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> заблокирован.")
 
     # ═══════════════ /unban в топике ═══════════════
@@ -432,16 +457,25 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     async def cmd_unban(message: Message, thread_id: int) -> None:
         group_chat_id = message.chat.id
         topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-        if not topic:
-            return
+        # При бане запись ПЗ удаляется, поэтому ищем юзера по маппингу забаненных топиков.
+        if topic:
+            user_chat_id = topic["user_chat_id"]
+        else:
+            user_chat_id = get_banned_topic_user(bot_id, group_chat_id, thread_id)
 
-        user_chat_id = topic["user_chat_id"]
+        if user_chat_id is None:
+            await message.answer("⚠️ Не удалось найти ПЗ для этого топика.")
+            return
 
         # Снимаем бан
         success = unban_user(bot_id, user_chat_id)
         if not success:
             await message.answer("⚠️ Пользователь не найден в базе.")
             return
+
+        # Убираем флаг «забаненный топик» и восстанавливаем запись ПЗ.
+        delete_banned_topic(bot_id, group_chat_id, thread_id)
+        create_topic_record(bot_id, user_chat_id, group_chat_id, thread_id)
 
         # Отправляем юзеру сообщение
         try:
@@ -823,6 +857,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                             g_id = topic["group_chat_id"]
                             t_id = topic["topic_id"]
                             reset_topic_admin(bot_id, t_id, g_id)
+                            delete_topic_record(bot_id, user_chat_id)
                             try:
                                 await bot_obj.edit_forum_topic(
                                     chat_id=g_id, message_thread_id=t_id, name="🚫 бан спам"
@@ -1137,27 +1172,43 @@ class ChildManager:
         sent = 0
         failed = 0
 
+        # Медиа: байты скачиваем через основной бот один раз и перезаливаем
+        # дочерним ботом (file_id чужого бота не работает).
+        media_bytes = None
+        if media_type and media_id:
+            media_bytes = await _cached_media_bytes(media_id)
+
         for i, user in enumerate(users):
             chat_id = user["chat_id"]
             try:
                 if media_type == "photo" and media_id:
-                    await bot.send_photo(chat_id=chat_id, photo=media_id,
+                    photo = BufferedInputFile(media_bytes, filename="photo.jpg") \
+                        if media_bytes is not None else media_id
+                    await bot.send_photo(chat_id=chat_id, photo=photo,
                                          caption=text, caption_entities=msg_entities,
                                          parse_mode=None)
                 elif media_type == "video" and media_id:
-                    await bot.send_video(chat_id=chat_id, video=media_id,
+                    video = BufferedInputFile(media_bytes, filename="video.mp4") \
+                        if media_bytes is not None else media_id
+                    await bot.send_video(chat_id=chat_id, video=video,
                                          caption=text, caption_entities=msg_entities,
                                          parse_mode=None)
                 elif media_type == "document" and media_id:
-                    await bot.send_document(chat_id=chat_id, document=media_id,
+                    document = BufferedInputFile(media_bytes, filename="file.bin") \
+                        if media_bytes is not None else media_id
+                    await bot.send_document(chat_id=chat_id, document=document,
                                             caption=text, caption_entities=msg_entities,
                                             parse_mode=None)
                 elif media_type == "animation" and media_id:
-                    await bot.send_animation(chat_id=chat_id, animation=media_id,
+                    animation = BufferedInputFile(media_bytes, filename="anim.gif") \
+                        if media_bytes is not None else media_id
+                    await bot.send_animation(chat_id=chat_id, animation=animation,
                                              caption=text, caption_entities=msg_entities,
                                              parse_mode=None)
                 elif media_type == "sticker" and media_id:
-                    await bot.send_sticker(chat_id=chat_id, sticker=media_id)
+                    sticker = BufferedInputFile(media_bytes, filename="sticker.webp") \
+                        if media_bytes is not None else media_id
+                    await bot.send_sticker(chat_id=chat_id, sticker=sticker)
                 else:
                     await bot.send_message(chat_id=chat_id, text=text,
                                            entities=msg_entities, parse_mode=None)

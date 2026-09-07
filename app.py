@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from handlers import register_all_handlers
 from services.child_manager import ChildManager
 from services.config import BOT_TOKEN, OWNER_ID
+from services.constants import BOT_VERSION
 from services.storage import ensure_db
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -66,7 +67,7 @@ async def main() -> None:
 
     try:
         me = await bot.get_me()
-        logging.info("YamoBot запущен: @%s (%s)", me.username, me.id)
+        logging.info("YamoBot запущен: @%s (%s) | версия %s", me.username, me.id, BOT_VERSION)
         await bot.delete_webhook(drop_pending_updates=True)
         await child_manager.start_all_children()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

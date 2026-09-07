@@ -42,6 +42,7 @@ from services.storage import (
     get_admins_all,
     get_admin_message_stats,
     get_admin_active_topics,
+    delete_topics_for_owner_user,
     _expire_time,
 )
 
@@ -347,6 +348,7 @@ async def cmd_warn(message: Message) -> None:
             reset_user_warns(t.bot_id, t.chat_id)
             if settings["punish_type"] == "ban":
                 set_user_ban(t.bot_id, t.chat_id, None)
+                delete_topics_for_owner_user(owner_id, t.chat_id)
                 act = "🚫 заблокирован навсегда"
             else:
                 until = _expire_time(settings["punish_duration"])
@@ -388,6 +390,8 @@ async def cmd_ban(message: Message) -> None:
     until = _expire_time(duration)
     for t in targets:
         set_user_ban(t.bot_id, t.chat_id, until)
+        # Скрываем ПЗ забаненного пользователя из списков ПЗ.
+        delete_topics_for_owner_user(owner_id, t.chat_id)
 
     label = "навсегда" if duration is None or duration == 0 else format_duration(duration)
     lines = [f"🚫 <b>{_actor_name(message.from_user)}</b> забанил пользователя на {label}:"]

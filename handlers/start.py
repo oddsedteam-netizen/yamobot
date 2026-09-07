@@ -15,8 +15,9 @@ from aiogram.types import (
 from handlers._common import render_callback
 from services.child_manager import ChildManager
 from services.config import is_super_admin
+from services.constants import BOT_VERSION
 from services.storage import (
-    get_admin_invite_owner,
+    get_admin_invite,
     consume_admin_invite,
     add_admin,
     get_admin_by_user_id,
@@ -26,6 +27,7 @@ from services.storage import (
     get_all_topics_for_bot,
     bot_display_name,
     get_owner_by_admin_chat,
+    delete_topic_record,
 )
 
 router = Router()
@@ -35,12 +37,21 @@ class StartFSM(StatesGroup):
     waiting_admin_tag = State()
 
 
+class StatsFSM(StatesGroup):
+    # Ожидание номера топика при удалении из списка ПЗ.
+    waiting_pz_delete = State()
+
+
 WELCOME_TEXT = (
     "👋 <b>Добро пожаловать в YamoBot!</b>\n\n"
     "Это бот-менеджер. Через него ты сможешь подключать "
     "и управлять другими Telegram-ботами.\n\n"
     "Выбери действие кнопками ниже:"
 )
+
+
+def _welcome_text_with_version() -> str:
+    return f"{WELCOME_TEXT}\n\n⚙️ Версия бота: <b>{BOT_VERSION}</b>"
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -58,7 +69,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 async def _show_main(message: Message) -> None:
-    await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    await message.answer(_welcome_text_with_version(), reply_markup=main_menu_kb())
 
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -71,13 +82,41 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     if message.text and "addadmin_" in message.text:
         token = message.text.split("addadmin_", 1)[1].strip().split()[0]
-        owner_id = get_admin_invite_owner(token)
-        if owner_id is None:
+        invite = get_admin_invite(token)
+        if invite is None:
             await message.answer("❌ Ссылка-приглашение недействительна.")
             return
+        owner_id = invite["owner_id"]
+        remaining = invite["max_uses"] - invite["used"]
+
+        # Админ уже зарегистрирован в этом боте — повторная регистрация не нужна.
+        existing = get_admin_by_user_id(owner_id, user_id)
+        if existing:
+            await message.answer(
+                "⚠️ <b>Ты уже зарегистрирован в этом боте.</b>\n\n"
+                f"🏷 Твой тег: <b>#{existing['tag']}</b>\n"
+                "Повторно регистрироваться не нужно."
+            )
+            return
+
         await state.set_state(StartFSM.waiting_admin_tag)
         await state.update_data(admin_owner_id=owner_id, admin_token=token)
-        await message.answer("🎉 <b>Вас пригласили стать админом!</b>\n\nОтправь свой <b>тег</b>.")
+        if remaining > 1:
+            await message.answer(
+                "🎉 <b>Вас пригласили стать админом!</b>\n\n"
+                f"Осталось мест по этой ссылке: <b>{remaining}</b>\n\n"
+                "Отправь свой <b>тег</b>."
+            )
+        else:
+            await message.answer(
+                "🎉 <b>Вас пригласили стать админом!</b>\n\n"
+                "Отправь свой <b>тег</b>."
+            )
+        return
+    if message.text and "transfer_" in message.text:
+        from handlers.profile import handle_transfer_link
+        token = message.text.split("transfer_", 1)[1].strip().split()[0]
+        await handle_transfer_link(message, token)
         return
     await _show_main(message)
 
@@ -93,18 +132,32 @@ async def fsm_waiting_admin_tag(message: Message, state: FSMContext) -> None:
     token = data.get("admin_token")
     user_id = message.from_user.id
     username = message.from_user.username or ""
-    consume_admin_invite(token)
+    await state.clear()
+
     already = get_admin_by_user_id(owner_id, user_id)
     if already:
-        await state.clear()
         await message.answer(f"⚠️ Ты уже админ с тегом #{already['tag']}.")
         return
+
     ok = add_admin(owner_id, user_id, username, tag)
-    await state.clear()
-    if ok:
-        await message.answer(f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>")
-    else:
+    if not ok:
         await message.answer("⚠️ Не удалось добавить тебя как админа.")
+        return
+
+    # «Слот» приглашения считается использованным только при успешном вступлении.
+    remaining = consume_admin_invite(token)
+    if remaining is None:
+        await message.answer(f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>")
+    elif remaining == 0:
+        await message.answer(
+            f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>\n\n"
+            "Это был последний слот — ссылка-приглашение больше не действует."
+        )
+    else:
+        await message.answer(
+            f"✅ <b>Ты стал админом!</b>\n\n🏷 Тег: <b>#{tag}</b>\n\n"
+            f"👥 Осталось мест по ссылке: <b>{remaining}</b>"
+        )
 
 
 # ═══════════════ Reply-кнопки главного меню ═══════════════
@@ -334,12 +387,15 @@ async def cmd_simple_stats(message: Message) -> None:
 
 
 @router.callback_query(F.data == "gstat_noadmin")
-async def cb_gstat_noadmin(callback: CallbackQuery) -> None:
+async def cb_gstat_noadmin(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     chat = callback.message.chat if callback.message else None
     owner_id = _resolve_stats_owner(chat, callback.from_user.id)
     bots = get_user_bots(owner_id)
 
-    links = []
+    # Нумерованный список ПЗ без админа. Сохраняем маппинг «номер → топик»,
+    # чтобы кнопка «удалить из списка» могла найти нужную запись.
+    entries: list[dict] = []
     for b in bots:
         for t in get_all_topics_for_bot(b["id"]):
             if not t.get("admin_user_id"):
@@ -349,22 +405,104 @@ async def cb_gstat_noadmin(callback: CallbackQuery) -> None:
                 else:
                     chat_part = int(cid)
                 link = f"https://t.me/c/{chat_part}/{tid}"
-                links.append(f"  • {bot_display_name(b)}: {link}")
+                entries.append({
+                    "bot_id": b["id"],
+                    "user_chat_id": t["user_chat_id"],
+                    "label": f"{bot_display_name(b)}: {link}",
+                })
 
-    if not links:
-        text = "🎉 Все ПЗ закрыты админами! Топиков без админа нет."
-    else:
-        text = f"⏳ <b>ПЗ без админа ({len(links)})</b>\n\n" + "\n".join(links)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstat_noadmin")],
-        [InlineKeyboardButton(text="⬅️ К сводке", callback_data="gstat_back")],
-    ])
+    await state.update_data(stats_no_admin=entries)
+    text, kb = _noadmin_payload(entries)
     await render_callback(callback, text, kb)
 
 
+def _noadmin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить из списка", callback_data="gstat_del")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstat_noadmin")],
+        [InlineKeyboardButton(text="⬅️ К сводке", callback_data="gstat_back")],
+    ])
+
+
+def _noadmin_payload(entries: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
+    if not entries:
+        text = "🎉 Все ПЗ закрыты админами или удалены из списка. Топиков без админа нет."
+    else:
+        lines = [f"{i}. {e['label']}" for i, e in enumerate(entries, start=1)]
+        text = (
+            f"⏳ <b>ПЗ без админа ({len(entries)})</b>\n\n"
+            "Если топик удалил вручную, но он остался в списке — "
+            "нажми «🗑 Удалить из списка» и напиши его номер.\n\n"
+            + "\n".join(lines)
+        )
+    return text, _noadmin_kb()
+
+
+@router.callback_query(F.data == "gstat_del")
+async def cb_gstat_del(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    entries = data.get("stats_no_admin") or []
+    if not entries:
+        await callback.answer("Сначала открой список ПЗ без админов.", show_alert=True)
+        return
+
+    await state.set_state(StatsFSM.waiting_pz_delete)
+    await state.update_data(stats_no_admin=entries)
+
+    text = (
+        "🗑 <b>Удаление из списка ПЗ</b>\n\n"
+        f"В списке <b>{len(entries)}</b> позиций.\n"
+        "Напиши <b>номер</b> топика из списка, который хочешь удалить "
+        "(например, если удалил его вручную)."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gstat_cancel_del")]
+    ])
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "gstat_cancel_del")
+async def cb_gstat_cancel_del(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(None)
+    data = await state.get_data()
+    entries = data.get("stats_no_admin") or []
+    text, kb = _noadmin_payload(entries)
+    await render_callback(callback, text, kb)
+
+
+@router.message(StatsFSM.waiting_pz_delete)
+async def fsm_pz_delete(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    entries = data.get("stats_no_admin") or []
+
+    raw = (message.text or "").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        await message.answer("❌ Номер должен быть числом. Напиши номер из списка.")
+        return
+
+    if n < 1 or n > len(entries):
+        await message.answer(f"❌ Номер вне диапазона (1–{len(entries)}). Попробуй ещё раз.")
+        return
+
+    target = entries.pop(n - 1)
+    delete_topic_record(target["bot_id"], target["user_chat_id"])
+
+    # Перерисовываем обновлённый список.
+    await state.update_data(stats_no_admin=entries)
+    text, kb = _noadmin_payload(entries)
+    await message.answer(text, reply_markup=kb)
+
+
 @router.callback_query(F.data == "gstat_back")
-async def cb_gstat_back(callback: CallbackQuery) -> None:
+async def cb_gstat_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     chat = callback.message.chat if callback.message else None
     owner_id = _resolve_stats_owner(chat, callback.from_user.id)
     text, kb = _stats_payload(owner_id)

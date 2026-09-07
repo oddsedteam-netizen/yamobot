@@ -9,6 +9,7 @@ from aiogram.types import (
 
 from handlers._common import render_callback
 from services.config import is_super_admin
+from services.constants import BOT_VERSION
 from services.storage import (
     get_all_users_registry,
     get_user_bots,
@@ -21,6 +22,13 @@ from services.storage import (
     remove_user_bot,
     get_bound_chat,
     set_bound_chat,
+    get_user_registry,
+    get_bot_by_id_any_owner,
+    create_transfer,
+    get_transfer,
+    delete_transfer,
+    transfer_all_rights,
+    transfer_bot,
 )
 
 router = Router()
@@ -96,7 +104,8 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
         f"📋 Всего ПЗ: <b>{total_pz}</b>\n\n"
         f"💼 Чат работы: {work_line}\n"
         f"🛡 Чат админов: {admin_line}\n\n"
-        f"<b>По ботам:</b>\n{bots_list}"
+        f"<b>По ботам:</b>\n{bots_list}\n\n"
+        f"⚙️ Версия бота: <b>{BOT_VERSION}</b>"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -114,6 +123,9 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin")
         ])
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="👑 Передать права", callback_data="transfer")
+    ])
     if is_super_admin(user_id):
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
@@ -135,6 +147,243 @@ async def cb_profile_show(callback: CallbackQuery) -> None:
         return
     text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
     await render_callback(callback, text, kb)
+
+
+# ═══════════════ Передача прав владельца ═══════════════
+
+async def _master_bot_username(bot) -> str:
+    """Возвращает username мастер-бота (YamoBot) для ссылки-приглашения."""
+    try:
+        me = await bot.get_me()
+        return me.username or ""
+    except Exception:
+        return ""
+
+
+def _user_display(user_id: int) -> str:
+    """Имя пользователя YamoBot (для подписи «<ник> передаёт вам права»)."""
+    u = get_user_registry(user_id)
+    if u:
+        return u.get("username") or u.get("first_name") or f"ID:{user_id}"
+    return f"ID:{user_id}"
+
+
+def _rights_lines_from(transfer: dict) -> list[str]:
+    """Читаемый список того, что передаётся, по данным ссылки-передачи."""
+    kind = transfer.get("kind")
+    if kind == "bot" and transfer.get("bot_id"):
+        bot = get_bot_by_id_any_owner(int(transfer["bot_id"]))
+        if bot:
+            return [f"• {bot_display_name(bot)}"]
+        return ["• бот (удалён)"]
+    bots = get_user_bots(transfer.get("from_user_id") or 0)
+    if not bots:
+        return ["• все права"]
+    return [f"• {bot_display_name(b)}" for b in bots]
+
+
+@router.callback_query(F.data == "transfer")
+async def cb_transfer_open(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    bots = get_user_bots(user_id)
+    if not bots:
+        await render_callback(
+            callback,
+            "👑 <b>Передача прав</b>\n\nУ тебя нет ботов — передавать нечего.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")]
+            ]),
+        )
+        return
+
+    text = (
+        "👑 <b>Передача прав</b>\n\n"
+        "⚠️ <b>Внимание!</b> При передаче все привязанные данные "
+        "(боты, админы, совладельцы, привязанные чаты и настройки) "
+        "перейдут другому владельцу.\n\n"
+        "Что передаём?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👑 Все права", callback_data="transfer_all")],
+        [InlineKeyboardButton(text="🤖 Только одного бота", callback_data="transfer_one")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "transfer_one")
+async def cb_transfer_one(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    bots = get_user_bots(user_id)
+    if not bots:
+        await callback.answer("У тебя нет ботов", show_alert=True)
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=bot_display_name(b), callback_data=f"transfer_pick_{b['id']}")]
+        for b in bots
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="transfer")])
+    await render_callback(
+        callback,
+        "🤖 <b>Передать одного бота</b>\n\nВыбери бота, которого хочешь передать:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _send_confirm_link(callback: CallbackQuery, token: str) -> None:
+    """Отправляет владельцу ссылку для передачи прав."""
+    username = await _master_bot_username(callback.bot)
+    if not username:
+        await callback.answer("⚠️ Не удалось сформировать ссылку", show_alert=True)
+        return
+    link = f"https://t.me/{username}?start=transfer_{token}"
+    text = (
+        "🔗 <b>Ссылка для передачи прав готова!</b>\n\n"
+        "Отправь её новому владельцу. После перехода он должен подтвердить принятие.\n\n"
+        f"<code>{link}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")]
+    ])
+    if callback.message:
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            if callback.message:
+                await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "transfer_all")
+async def cb_transfer_all(callback: CallbackQuery) -> None:
+    token = create_transfer(callback.from_user.id, "all")
+    await _send_confirm_link(callback, token)
+
+
+@router.callback_query(F.data.startswith("transfer_pick_"))
+async def cb_transfer_pick(callback: CallbackQuery) -> None:
+    bot_id = int(callback.data.split("_")[-1])
+    token = create_transfer(callback.from_user.id, "bot", bot_id)
+    await _send_confirm_link(callback, token)
+
+
+async def handle_transfer_link(message: Message, token: str) -> None:
+    """Обрабатывает переход нового владельца по ссылке `?start=transfer_<token>`."""
+    transfer = get_transfer(token)
+    if not transfer:
+        await message.answer("❌ Ссылка на передачу прав недействительна.")
+        return
+
+    from_uid = transfer.get("from_user_id")
+    to_uid = message.from_user.id
+
+    if to_uid == from_uid:
+        await message.answer("⚠️ Ты не можешь передать права самому себе.")
+        return
+    if is_registry_user_banned(to_uid) and not is_super_admin(to_uid):
+        await message.answer("🚫 Вы заблокированы администрацией.")
+        return
+
+    lines = _rights_lines_from(transfer)
+
+    # Регистрируем нового владельца в реестре.
+    if not get_user_registry(to_uid):
+        from services.storage import register_user
+        register_user(to_uid, message.from_user.username or "", message.from_user.first_name or "")
+
+    text = (
+        f"👑 <b>Вам передают права!</b>\n\n"
+        f"Пользователь <b>{_user_display(from_uid)}</b> передаёт вам следующие права:\n"
+        + "\n".join(lines)
+        + "\n\nПодтверди принятие, чтобы данные перешли к тебе навсегда."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"transfer_accept_{token}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"transfer_reject_{token}")],
+    ])
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("transfer_accept_"))
+async def cb_transfer_accept(callback: CallbackQuery) -> None:
+    from aiogram.exceptions import TelegramBadRequest
+    token = callback.data.split("transfer_accept_", 1)[1]
+    transfer = get_transfer(token)
+    if not transfer:
+        await callback.answer("⚠️ Ссылка уже недействительна.", show_alert=True)
+        return
+
+    from_uid = transfer.get("from_user_id")
+    to_uid = callback.from_user.id
+    kind = transfer.get("kind")
+
+    if to_uid == from_uid:
+        await callback.answer("⚠️ Нельзя принять у самого себя.", show_alert=True)
+        return
+
+    username = callback.from_user.username or ""
+    first_name = callback.from_user.first_name or ""
+
+    if kind == "bot":
+        bot_id = int(transfer.get("bot_id") or 0)
+        ok = transfer_bot(from_uid, to_uid, bot_id, username, first_name)
+        if not ok:
+            await callback.answer("⚠️ Не удалось передать бота.", show_alert=True)
+            return
+        bot = get_bot_by_id_any_owner(bot_id)
+        bot_name = bot_display_name(bot) if bot else f"бот {bot_id}"
+        rights_text = f"• {bot_name}"
+        summary = f"🤖 Теперь бот <b>{bot_name}</b> принадлежит тебе."
+    else:
+        count = transfer_all_rights(from_uid, to_uid, username, first_name)
+        rights_text = "все права"
+        summary = f"👑 <b>Все права приняты!</b>\n\nПередано ботов: <b>{count}</b>."
+
+    delete_transfer(token)
+
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                summary,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile_show")]
+                ]),
+            )
+        except TelegramBadRequest:
+            pass
+
+    # Уведомляем старого владельца.
+    try:
+        await callback.bot.send_message(
+            from_uid,
+            f"🔁 <b>Права переданы.</b>\n\n"
+            f"<b>{_user_display(to_uid)}</b> принял ваши права: {rights_text}.",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("transfer_reject_"))
+async def cb_transfer_reject(callback: CallbackQuery) -> None:
+    token = callback.data.split("transfer_reject_", 1)[1]
+    transfer = get_transfer(token)
+    delete_transfer(token)
+
+    if callback.message:
+        try:
+            await callback.message.edit_text("❌ <b>Вы отклонили передачу прав.</b>")
+        except Exception:
+            pass
+
+    if transfer:
+        try:
+            await callback.bot.send_message(
+                transfer.get("from_user_id"),
+                "❌ Новый владелец отклонил передачу прав.",
+            )
+        except Exception:
+            pass
 
 
 # ═══════════════ Админ-панель пользователей ═══════════════

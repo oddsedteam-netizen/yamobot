@@ -10,6 +10,7 @@ from aiogram.types import (
 
 from handlers._common import render_callback
 from services.child_manager import ChildManager
+from services.constants import MIN_ADMIN_INVITE_USES, MAX_ADMIN_INVITE_USES
 from services.storage import (
     get_admins_all,
     add_admin,
@@ -33,12 +34,7 @@ class AdminFSM(StatesGroup):
     waiting_delete_admin = State()
     waiting_edit_tag = State()
     waiting_search_tag = State()
-
-
-# Кэш последней сгенерированной ссылки-приглашения (owner_id -> link).
-# Нужен, чтобы кнопка «Скопировать ссылку» показывала именно ту ссылку,
-# что отображается в сообщении, не открывая её и не запуская приглашение.
-_invite_link_cache: dict[int, str] = {}
+    waiting_invite_count = State()
 
 
 # ═══════════════ Клавиатуры ═══════════════
@@ -384,62 +380,79 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
 # ═══════════════ Добавить ═══════════════
 
 @router.callback_query(F.data == "gadmins_addlink")
-async def cb_add_admin_by_link(callback: CallbackQuery) -> None:
-    owner_id = callback.from_user.id
-    token = create_admin_invite(owner_id)
+async def cb_add_admin_by_link(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminFSM.waiting_invite_count)
 
+    text = (
+        f"🔗 <b>Добавить админов ссылкой</b>\n\n"
+        f"Сколько админов должно вступить по этой ссылке?\n"
+        f"Отправь число от <b>{MIN_ADMIN_INVITE_USES}</b> до <b>{MAX_ADMIN_INVITE_USES}</b>.\n\n"
+        f"Как только нужное количество админов вступит, ссылка станет неактуальной."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.message(AdminFSM.waiting_invite_count)
+async def fsm_invite_count(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
     try:
-        me = await callback.bot.get_me()
+        count = int(raw)
+    except ValueError:
+        await message.answer(
+            f"❌ Нужно отправить число от {MIN_ADMIN_INVITE_USES} до {MAX_ADMIN_INVITE_USES}."
+        )
+        return
+
+    if count < MIN_ADMIN_INVITE_USES or count > MAX_ADMIN_INVITE_USES:
+        await message.answer(
+            f"❌ Максимально допустимое количество админов по ссылке — "
+            f"<b>{MAX_ADMIN_INVITE_USES}</b>.\nОтправь число от "
+            f"{MIN_ADMIN_INVITE_USES} до {MAX_ADMIN_INVITE_USES}."
+        )
+        return
+
+    owner_id = message.from_user.id
+    token = create_admin_invite(owner_id, count)
+    await state.clear()
+
+    text, kb = await _invite_link_payload(message.bot, token, count)
+    await message.answer(text, reply_markup=kb)
+
+
+async def _invite_link_payload(bot, token: str, max_uses: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Собирает текст и клавиатуру сообщения со ссылкой-приглашением."""
+    try:
+        me = await bot.get_me()
         username = me.username or ""
     except Exception:
         username = ""
 
-    if username:
-        link = f"https://t.me/{username}?start=addadmin_{token}"
-    else:
-        link = ""
-        text = (
+    if not username:
+        return (
             "⚠️ <b>Не удалось создать ссылку.</b>\n\n"
-            "Не удалось получить username бота. Попробуй ещё раз."
+            "Не удалось получить username бота. Попробуй ещё раз.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")]
+            ]),
         )
 
-    if link:
-        # Запоминаем ссылку, чтобы кнопка «Скопировать ссылку» показывала именно её.
-        _invite_link_cache[owner_id] = link
-        text = (
-            "🔗 <b>Добавить админа ссылкой</b>\n\n"
-            "Отправь эту ссылку человеку, которого хочешь сделать админом. "
-            "Когда он перейдёт по ней, бот попросит его ввести тег и привяжет его к твоим ботам.\n\n"
-            f"<code>{link}</code>\n\n"
-            "⬇️ Нажми, чтобы увидеть ссылку для копирования:"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Скопировать ссылку", callback_data="gadmins_addlink_copy")],
-            [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
-        ])
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
-        ])
-
-    await render_callback(callback, text, kb)
-
-
-@router.callback_query(F.data == "gadmins_addlink_copy")
-async def cb_add_admin_copy_link(callback: CallbackQuery) -> None:
-    """Показывает ссылку-приглашение во всплывающем окне, не открывая её.
-
-    Telegram не даёт боту скопировать текст в буфер напрямую. Раньше кнопка была
-    url-кнопкой и по нажатию открывала саму ссылку, из-за чего владелец запускал
-    приглашение на себя и получал запрос на ввод тега. Теперь ссылку просто показываем.
-    """
-    link = _invite_link_cache.get(callback.from_user.id)
-    if not link:
-        await callback.answer("❌ Ссылка не найдена. Нажми «🔄 Новая ссылка».",
-                              show_alert=True)
-        return
-    await callback.answer(link, show_alert=True)
+    link = f"https://t.me/{username}?start=addadmin_{token}"
+    text = (
+        "🔗 <b>Добавить админов ссылкой</b>\n\n"
+        "Отправь эту ссылку людям, которых хочешь сделать админами. "
+        "Перешедшему бот предложит ввести тег и привяжет его к твоим ботам.\n\n"
+        f"<code>{link}</code>\n\n"
+        f"👥 Может вступить: <b>{max_uses}</b> админ(а/ов)\n"
+        "Как только все места займут, ссылка автоматически перестанет действовать."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+    ])
+    return text, kb
 
 
 @router.callback_query(F.data == "gadmins_add")
