@@ -75,6 +75,19 @@ def _migrate_registry_chats(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_registry_pending_bind(conn: sqlite3.Connection) -> None:
+    """Добавляет колонку активной привязки в users_registry.
+
+    Сделано для того, чтобы привязка «чата работы»/«чата админов» переживала
+    перезапуск бота и не зависела от in-memory словаря (иначе бот «не видит»
+    добавление и привязка теряется со временем).
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(users_registry)").fetchall()]
+    if "pending_bind_kind" not in cols:
+        conn.execute("ALTER TABLE users_registry ADD COLUMN pending_bind_kind TEXT DEFAULT ''")
+    conn.commit()
+
+
 def _migrate_admin_invites(conn: sqlite3.Connection) -> None:
     """Добавляет колонки лимита использования в таблицу admin_invites.
 
@@ -283,6 +296,7 @@ def ensure_db() -> None:
     _migrate_admin_scope(conn)
     _migrate_bot_anonymous(conn)
     _migrate_registry_chats(conn)
+    _migrate_registry_pending_bind(conn)
     _migrate_admin_invites(conn)
     conn.commit()
 
@@ -579,6 +593,40 @@ def remove_admin(owner_id: int, user_id: int) -> bool:
         cur = conn.execute("DELETE FROM admins WHERE owner_id = ? AND user_id = ?", (owner_id, user_id))
         conn.commit()
         return cur.rowcount > 0
+
+
+def ensure_admin(owner_id: int, user_id: int, username: str = "") -> bool:
+    """Гарантирует, что юзер записан админом владельца (тег = username).
+
+    Нужно после передачи прав: новый владелец автоматически становится админом
+    со своим тегом, чтобы при взятии ПЗ название топика было админским тегом,
+    а не личным именем/юзером. Существующую запись (в т.ч. легаси owner_id=0)
+    не перезаписывает.
+    """
+    if get_admin_by_user_id(owner_id, user_id):
+        return True
+    existing_tag = ""
+    if owner_id != 0:
+        legacy = get_admin_by_user_id(0, user_id)
+        if legacy and legacy.get("tag"):
+            existing_tag = legacy["tag"]
+    tag = existing_tag or username or f"id{user_id}"
+    conn = _get_conn()
+    with _lock:
+        try:
+            conn.execute(
+                "INSERT INTO admins (owner_id, user_id, username, tag) VALUES (?, ?, ?, ?)",
+                (owner_id, user_id, username or "", tag),
+            )
+            conn.execute(
+                "INSERT INTO admin_tag_history (admin_user_id, old_tag, new_tag) VALUES (?, ?, ?)",
+                (user_id, "", tag),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Запись уже появилась (гонка) — считаем успехом.
+            pass
+    return True
 
 
 def get_admins_all(owner_id: int) -> list[dict]:
@@ -1584,6 +1632,35 @@ def get_owner_by_admin_chat(chat_id: int) -> int | None:
     return row[0] if row else None
 
 
+def set_pending_bind(user_id: int, kind: str | None) -> bool:
+    """Отмечает, какой чат пользователь сейчас привязывает ('work'/'admin').
+
+    Хранится в БД, чтобы привязка переживала перезапуск бота и не терялась
+    (раньше это был in-memory словарь, из-за чего бот со временем «не видел»
+    добавление и привязка ломалась).
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO users_registry (user_id, pending_bind_kind) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET pending_bind_kind=excluded.pending_bind_kind",
+            (user_id, kind or ""),
+        )
+        conn.commit()
+    return True
+
+
+def get_pending_bind(user_id: int) -> str | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT pending_bind_kind FROM users_registry WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if not row:
+        return None
+    val = (row[0] or "").strip()
+    return val if val else None
+
+
 def get_admin_active_topics_list(owner_id: int, admin_user_id: int) -> list[dict]:
     """Активные топики (ПЗ), закреплённые за конкретным админом."""
     bot_ids = _owner_bot_ids(owner_id)
@@ -1753,11 +1830,19 @@ def transfer_all_rights(
         )
         conn.commit()
 
-    # Привязанные чаты передаём новому владельцу, у старого — сбрасываем.
-    set_bound_chat(to_id, "work", get_bound_chat(from_id, "work"))
-    set_bound_chat(to_id, "admin", get_bound_chat(from_id, "admin"))
+    # Привязанные чаты передаём новому владельцу (только если у старого они были).
+    # Не затираем собственные привязки нового владельца, если у старого их нет,
+    # иначе при передаче могли пропасть уведомления/стата у нового владельца.
+    for kind in ("work", "admin"):
+        src = get_bound_chat(from_id, kind)
+        if src:
+            set_bound_chat(to_id, kind, src)
     set_bound_chat(from_id, "work", None)
     set_bound_chat(from_id, "admin", None)
+
+    # Новый владелец становится админом со своим тегом — чтобы при взятии ПЗ
+    # название топика было админским тегом, а не личным именем/юзером.
+    ensure_admin(to_id, to_id, to_username)
 
     return len(bot_ids)
 
@@ -1778,4 +1863,17 @@ def transfer_bot(
             (to_id, bot_id, from_id),
         )
         conn.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
+        if not ok:
+            return False
+
+    # Переносим привязку «чата админов» новому владельцу, если у него своей ещё нет
+    # (иначе после одиночной передачи бота пропадают уведомления о новых ПЗ и /стата).
+    if get_bound_chat(to_id, "admin") is None:
+        src_admin = get_bound_chat(from_id, "admin")
+        if src_admin:
+            set_bound_chat(to_id, "admin", src_admin)
+
+    # Новый владелец бота становится его админом со своим тегом.
+    ensure_admin(to_id, to_id, to_username)
+    return True

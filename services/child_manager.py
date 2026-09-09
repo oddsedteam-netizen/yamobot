@@ -653,9 +653,26 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         topic_id = int(parts[2])
         group_chat_id = int(parts[3])
 
-        admin = get_admin_by_user_id(get_bot_owner(bot_id) or 0, callback.from_user.id)
+        # Владелец чата — тот, кому принадлежит бот. После «передачи прав»
+        # этим владельцем становится новый юзер, поэтому админа ищем именно у него.
+        owner_id = get_bot_owner(bot_id) or 0
+        admin = get_admin_by_user_id(owner_id, callback.from_user.id)
+        if not admin and owner_id != 0:
+            # Легаси-записи (до введения owner_id) лежат с owner_id = 0.
+            admin = get_admin_by_user_id(0, callback.from_user.id)
+
         if admin:
             tag = admin["tag"]
+        elif owner_id == callback.from_user.id:
+            # Владелец/новый владелец, у которого нет записи админа — используем его
+            # ник как тег, чтобы топик назывался админским тегом, а не личным именем.
+            if getattr(callback.from_user, "username", None):
+                tag = f"@{callback.from_user.username}"
+            elif getattr(callback.from_user, "first_name", None):
+                tag = callback.from_user.first_name
+            else:
+                tag = str(callback.from_user.id)
+            logger.debug("Владелец %s взял ПЗ без тега админа, используем ник как тег", owner_id)
         else:
             tag = callback.from_user.first_name or str(callback.from_user.id)
 

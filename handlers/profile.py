@@ -22,6 +22,8 @@ from services.storage import (
     remove_user_bot,
     get_bound_chat,
     set_bound_chat,
+    get_pending_bind,
+    set_pending_bind,
     get_user_registry,
     get_bot_by_id_any_owner,
     create_transfer,
@@ -143,6 +145,7 @@ async def show_profile(message: Message) -> None:
 async def cb_profile_show(callback: CallbackQuery) -> None:
     """Открывает профиль из инлайн-колбэка (без нового приветствия)."""
     _PENDING_BINDS.pop(callback.from_user.id, None)
+    set_pending_bind(callback.from_user.id, None)
     if callback.message is None:
         return
     text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
@@ -532,6 +535,7 @@ async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
 async def cb_bind_start(callback: CallbackQuery) -> None:
     kind = "work" if callback.data == "bind_work" else "admin"
     _PENDING_BINDS[callback.from_user.id] = kind
+    set_pending_bind(callback.from_user.id, kind)  # в БД — переживает рестарт бота
     text = await _bind_instructions(callback, kind)
     await render_callback(callback, text, _bind_wait_kb())
 
@@ -540,13 +544,27 @@ async def cb_bind_start(callback: CallbackQuery) -> None:
 async def cb_bind_done(callback: CallbackQuery) -> None:
     """Пользователь сообщил, что добавил бота. Привязываем сами, если событие не пришло."""
     user_id = callback.from_user.id
-    kind = _PENDING_BINDS.get(user_id)
+    kind = get_pending_bind(user_id) or _PENDING_BINDS.get(user_id)
 
     # Если бот ещё ждёт привязку — попробуем привязать последний добавленный чат.
     if kind:
         chat_id = _LAST_ADDED.get(user_id)
         if chat_id:
+            # Защита от путаницы: нельзя привязать «чат админов» как «чат работы»
+            # (и наоборот) и тем более выйти из нужного чата. Иначе при отвязке/
+            # привязке одного чата бот мог «уходить» из другого.
+            other = "admin" if kind == "work" else "work"
+            other_bound = get_bound_chat(user_id, other)
+            if other_bound and chat_id == other_bound:
+                set_pending_bind(user_id, None)
+                await callback.answer(
+                    "⚠️ Этот чат уже привязан как другой тип. Добавь бота в новый чат.",
+                    show_alert=True,
+                )
+                return
+
             _PENDING_BINDS.pop(user_id, None)
+            set_pending_bind(user_id, None)
             set_bound_chat(user_id, kind, chat_id)
             if kind == "work":
                 # Чат работы — бот запоминает и покидает его.
@@ -571,6 +589,7 @@ async def cb_bind_done(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "bind_cancel")
 async def cb_bind_cancel(callback: CallbackQuery) -> None:
     _PENDING_BINDS.pop(callback.from_user.id, None)
+    set_pending_bind(callback.from_user.id, None)
     await callback.answer("❌ Привязка отменена")
     if callback.message:
         text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
@@ -617,14 +636,13 @@ async def on_bot_added_to_chat(event) -> None:
     if adder is None or getattr(adder, "is_bot", False):
         return
 
-    kind = _PENDING_BINDS.pop(adder.id, None)
+    kind = get_pending_bind(adder.id) or _PENDING_BINDS.pop(adder.id, None)
     if not kind:
         return
 
     chat = event.chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        # Если это не группа — возвращаем «ожидание», чтобы не потерять запрос.
-        _PENDING_BINDS[adder.id] = kind
+        # Если это не группа — оставляем ожидание в БД, чтобы не потерять запрос.
         return
 
     new_status = getattr(event.new_chat_member, "status", None)
@@ -634,7 +652,9 @@ async def on_bot_added_to_chat(event) -> None:
     if was_member or not is_member:
         return
 
+    # Какой бы чат ни добавил бота — это и есть привязываемый чат, он точный.
     set_bound_chat(adder.id, kind, chat.id)
+    set_pending_bind(adder.id, None)
 
     bot = event.bot
     chat_name = chat.title or f"чат {chat.id}"
