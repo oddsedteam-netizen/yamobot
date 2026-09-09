@@ -7,7 +7,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, ADMIN_CHAT_WELCOME
 from services.config import is_super_admin
 from services.constants import BOT_VERSION
 from services.storage import (
@@ -677,18 +677,7 @@ async def on_bot_added_to_chat(event) -> None:
             f"Бот запомнил чат и вышел из него."
         )
     else:
-        welcome_admin = (
-            "🛡 <b>Чат админов привязан!</b>\n\n"
-            "👋 Приветствую тебя в чате админов YamoBot!\n\n"
-            "🧭 <b>Команды для админов (работают в топиках):</b>\n"
-            "• <code>/smena</code> — сменить админа у ПЗ без подтверждения.\n"
-            "• <code>/otkaz</code> — отказаться от ПЗ / сбросить админа.\n"
-            "• <code>/ban</code> — забанить пользователя.\n"
-            "• <code>/unban</code> — разбанить пользователя.\n"
-            "• <code>/.стата</code> — сводка по ПЗ всех ботов (в т.ч. в этом чате).\n"
-            "• <code>/стата</code> или <code>/stata</code> — то же самое через слеш.\n\n"
-            "Сюда будут приходить уведомления о новых ПЗ."
-        )
+        welcome_admin = ADMIN_CHAT_WELCOME
         try:
             await bot.send_message(chat.id, welcome_admin)
         except Exception:

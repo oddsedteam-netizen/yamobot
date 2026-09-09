@@ -12,10 +12,14 @@
   /предред N бан|мут [время]          — порог предов до наказания + само наказание
   /мут [время] [цель]                 — запрет писать на время
   /стата неделя|день|месяц            — статистика админов за период
+  /стата (без аргумента)              — сводка по ПЗ (в чате админов)
+  /perezap (или /перезапуск, /рестарт)— перезапуск бота в этом чате (без перепривязки)
 """
 
+import logging
 import re
 
+from handlers._common import _retry_send, ADMIN_CHAT_WELCOME
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.types import Message
@@ -23,6 +27,8 @@ from aiogram.types import Message
 from services.config import is_super_admin
 from services.storage import (
     get_owner_by_admin_chat,
+    get_bound_chat,
+    set_bound_chat,
     get_user_bots,
     get_owner_users,
     set_user_ban,
@@ -48,6 +54,8 @@ from services.storage import (
 
 router = Router()
 
+logger = logging.getLogger(__name__)
+
 _MARK = r"[/\.!]"
 _BAN_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*(?:бан|ban)\b\s*(.*)$")
 _WARN_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*(?:варн|warn|пред|prew|pred)\b\s*(.*)$")
@@ -60,6 +68,7 @@ _MODERS_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*модеры\b\s*(.*)$")
 _RAZBAN_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*разбан\b\s*(.*)$")
 _RAZMUT_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*размут\b\s*(.*)$")
 _SNYAT_WARN_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*(?:снять\s+варн|снять\s+пред|снятьварн)\b\s*(.*)$")
+_PEREZAP_RE = re.compile(rf"(?i)^\s*{_MARK}+\s*(?:perezap|перезап|перезапуск|рестарт|restart)\b\s*$")
 
 _UNIT_COEF = {
     "м": 1, "мин": 1, "min": 1, "m": 1,
@@ -482,10 +491,15 @@ async def cmd_stata_period(message: Message) -> None:
         )
 
     # NB: раньше ответ не отправлялся вовсе — /стата <период> молча «не реагировал».
+    # Flood-wait в группе (медленный режим) обрабатываем ретраем, чтобы бот ВСЕГДА отвечал.
     try:
-        await message.answer("\n".join(lines))
+        await _retry_send(lambda: message.answer("\n".join(lines)), attempts=6)
     except Exception as e:
-        await message.answer(f"❌ Не удалось сформировать статистику: {e}")
+        logger.warning("Не удалось отправить /стата: %s", e)
+        try:
+            await _retry_send(lambda: message.answer(f"❌ Не удалось сформировать статистику: {e}"), attempts=2)
+        except Exception:
+            pass
 
 # ═══════════════════════════════════════════════════════════
 #  /разбан, /размут, /снять варн
@@ -645,3 +659,63 @@ async def cmd_list_moders(message: Message) -> None:
     lines.append(f"👑 Владелец: <code>{owner_id}</code>")
     await message.answer("\n".join(lines))
     await message.answer("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+#  /perezap — «перезапуск» бота прямо в привязанном чате
+#  (без передобавления и перепривязки через профиль)
+# ═══════════════════════════════════════════════════════════
+
+@router.message(
+    F.text.regexp(_PEREZAP_RE) & F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP})
+)
+async def cmd_perezap(message: Message) -> None:
+    """Перезапуск/перепривязка YamoBot в текущем групповом чате.
+
+    Если чат уже привязан как «чат админов»/«чат работы» — просто повторно
+    привязывает его к владельцу и шлёт приветствие (бот отвечает ⇒ бот живой).
+    Если ещё не привязан — привязывает этот чат как «чат админов».
+    Доступно владельцу, супер-админу и модераторам чата.
+    """
+    chat = message.chat
+    user_id = message.from_user.id if message.from_user else 0
+
+    # Владелец чата, либо (для непривязанного) сам инициатор.
+    owner = get_owner_by_admin_chat(chat.id) or user_id
+    if owner is None or not _is_moderator(owner, user_id):
+        await message.answer("❌ /perezap доступен владельцу и модераторам чата.")
+        return
+
+    # Сохраняем тип уже привязанного чата; иначе (или для непривязанного) — «чат админов».
+    if get_bound_chat(owner, "work") == chat.id:
+        kind = "work"
+    else:
+        kind = "admin"
+    set_bound_chat(owner, kind, chat.id)
+
+    # Приветствие в чат (главное — бот отвечает, значит он активен и команды
+    # /стата и пр. дойдут). При flood-wait ждём и повторяем.
+    if kind == "work":
+        await _retry_send(
+            lambda: message.answer(
+                "💼 <b>Чат работы привязан к YamoBot.</b> Бот активен. ✅"
+            ),
+            attempts=6,
+        )
+    else:
+        await _retry_send(lambda: message.answer(ADMIN_CHAT_WELCOME), attempts=6)
+
+    # Подтверждение инициатору (best-effort, чтобы /perezap всегда отвечал).
+    try:
+        await _retry_send(
+            lambda: message.answer(
+                f"✅ <b>Бот перезапущен в этом чате.</b>\n"
+                f"📎 Чат: <code>{chat.id}</code> (тип: {kind})\n"
+                f"👑 Владелец: <code>{owner}</code>\n\n"
+                "Теперь команды (<code>/стата</code>, <code>/.стата</code> и др.) "
+                "должны работать."
+            ),
+            attempts=3,
+        )
+    except Exception as e:
+        logger.warning("Не удалось отправить подтверждение /perezap: %s", e)

@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import Router, F
 from aiogram.enums import ChatType
 from aiogram.filters import CommandStart, Command
@@ -12,7 +14,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, _retry_send
 from services.child_manager import ChildManager
 from services.config import is_super_admin
 from services.constants import BOT_VERSION
@@ -36,6 +38,8 @@ router = Router()
 # Нужно, чтобы каждый новый вызов команды удалял старую сводку и слал свежую —
 # так бот «всегда» показывает актуальную статату и не плодит дубликаты.
 _STATS_MESSAGES: dict[int, int] = {}
+
+_logger = logging.getLogger(__name__)
 
 
 class StartFSM(StatesGroup):
@@ -389,25 +393,33 @@ async def cmd_simple_stats(message: Message) -> None:
     owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
     text, kb = _stats_payload(owner_id)
     chat_key = message.chat.id if message.chat else 0
+    bot = message.bot
 
-    # Удаляем предыдущую сводку «/стата» в этом чате, чтобы не накапливались дубликаты
-    # и на экране всегда была одна свежая статистика.
+    # Удаляем предыдущую сводку «/стата» в этом чате (best-effort: если не
+    # удалось — например, flood-wait или уже удалено — просто идём дальше).
     old_id = _STATS_MESSAGES.pop(chat_key, None)
     if old_id:
         try:
-            await message.bot.delete_message(message.chat.id, old_id)
+            await _retry_send(lambda: bot.delete_message(message.chat.id, old_id), attempts=2)
         except Exception:
-            # Сообщение уже удалено/недоступно — не проблема.
             pass
 
-    # Всегда отправляем свежую сводку. Даже если что-то упадёт — не даём
-    # команде «молча пропасть», отвечаем текстом ошибки.
+    # Всегда отправляем свежую сводку. При flood-wait (медленный режим в группе)
+    # ждём и повторяем, чтобы бот ВСЕГДА отвечал на команду, а не «молча пропадал».
     try:
-        sent = await message.answer(text, reply_markup=kb)
+        sent = await _retry_send(
+            lambda: message.answer(text, reply_markup=kb), attempts=6
+        )
     except Exception as e:
-        await message.answer(f"❌ Не удалось сформировать сводку: {e}")
+        _logger.error("Не удалось отправить сводку /стата: %s", e)
+        # Последняя попытка — простой текст с ошибкой (без клавиатуры).
+        try:
+            await _retry_send(lambda: message.answer(f"❌ Не удалось сформировать сводку: {e}"), attempts=2)
+        except Exception:
+            pass
         return
-    _STATS_MESSAGES[chat_key] = sent.message_id
+    if sent is not None:
+        _STATS_MESSAGES[chat_key] = sent.message_id
 
 
 @router.callback_query(F.data == "gstat_noadmin")
