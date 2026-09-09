@@ -32,6 +32,11 @@ from services.storage import (
 
 router = Router()
 
+# Chat id -> message id последнего сообщения со сводкой «/стата».
+# Нужно, чтобы каждый новый вызов команды удалял старую сводку и слал свежую —
+# так бот «всегда» показывает актуальную статату и не плодит дубликаты.
+_STATS_MESSAGES: dict[int, int] = {}
+
 
 class StartFSM(StatesGroup):
     waiting_admin_tag = State()
@@ -383,7 +388,26 @@ async def cmd_simple_stats(message: Message) -> None:
     # Виден всем: в ЛС — сводка по своему аккаунту, в чате админов — по владельцу чата.
     owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
     text, kb = _stats_payload(owner_id)
-    await message.answer(text, reply_markup=kb)
+    chat_key = message.chat.id if message.chat else 0
+
+    # Удаляем предыдущую сводку «/стата» в этом чате, чтобы не накапливались дубликаты
+    # и на экране всегда была одна свежая статистика.
+    old_id = _STATS_MESSAGES.pop(chat_key, None)
+    if old_id:
+        try:
+            await message.bot.delete_message(message.chat.id, old_id)
+        except Exception:
+            # Сообщение уже удалено/недоступно — не проблема.
+            pass
+
+    # Всегда отправляем свежую сводку. Даже если что-то упадёт — не даём
+    # команде «молча пропасть», отвечаем текстом ошибки.
+    try:
+        sent = await message.answer(text, reply_markup=kb)
+    except Exception as e:
+        await message.answer(f"❌ Не удалось сформировать сводку: {e}")
+        return
+    _STATS_MESSAGES[chat_key] = sent.message_id
 
 
 @router.callback_query(F.data == "gstat_noadmin")
