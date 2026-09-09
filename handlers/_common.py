@@ -36,14 +36,20 @@ async def _retry_send(coro_factory, attempts: int = 6):
     повторы команд отдаёт TelegramRetryAfter, и aiogram сам не повторяет запрос.
     Здесь ждём указанный `retry_after` и пробуем ещё раз, чтобы бот ВСЕГДА
     отвечал на команду (например, /стата), а не «молча пропадал».
+
+    Если все попытки исчерпаны — пробрасываем последнее исключение, чтобы
+    вызывающий код гарантированно ушёл в ветку «отправить текст ошибки» (а не
+    вернул None и «промолчал»).
     """
+    last_error: Exception | None = None
     for attempt in range(attempts):
         try:
             return await coro_factory()
         except TelegramRetryAfter as e:
+            last_error = e
             delay = float(getattr(e, "retry_after", 1) or 1)
             # Не «засыпаем» надолго: каптируем до 30с за попытку, чтобы не блокировать
-            # обработку остальных сообщений. При 6 попытках это максимум ~30–60с.
+            # обработку остальных сообщений. При 6 попытках это максимум ~30–180с.
             delay = min(delay, 30.0)
             _logger.warning("Flood wait %.1fs (попытка %d/%d), жду", delay, attempt + 1, attempts)
             await asyncio.sleep(delay)
@@ -51,6 +57,8 @@ async def _retry_send(coro_factory, attempts: int = 6):
             if _is_not_modified(e):
                 return None
             raise
+    if last_error is not None:
+        raise last_error
     return None
 
 

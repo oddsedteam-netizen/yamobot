@@ -672,45 +672,49 @@ async def cmd_list_moders(message: Message) -> None:
 async def cmd_perezap(message: Message) -> None:
     """Перезапуск/перепривязка YamoBot в текущем групповом чате.
 
-    Если чат уже привязан как «чат админов»/«чат работы» — просто повторно
-    привязывает его к владельцу и шлёт приветствие (бот отвечает ⇒ бот живой).
-    Если ещё не привязан — привязывает этот чат как «чат админов».
-    Доступно владельцу, супер-админу и модераторам чата.
+    Главное назначение — «забрать» чат на правильного владельца после передачи
+    прав. Если у вызывающего есть хотя бы один бот — он и есть владелец, и этот
+    чат привязывается к нему (админский или рабочий). Это чинит ситуацию, когда
+    привязанный чат «осиротел» после передачи прав и команда /стата перестала
+    работать в нём, а в новом тестовом чате работает.
     """
     chat = message.chat
     user_id = message.from_user.id if message.from_user else 0
+    chat_id = chat.id if chat else 0
 
-    # Владелец чата, либо (для непривязанного) сам инициатор.
-    owner = get_owner_by_admin_chat(chat.id) or user_id
-    if owner is None or not _is_moderator(owner, user_id):
-        await message.answer("❌ /perezap доступен владельцу и модераторам чата.")
-        return
+    # 1) Вызывающий — владелец ботов → привязываем чат к нему.
+    if chat_id and get_user_bots(user_id):
+        owner = user_id
+    else:
+        # 2) Либо модератор уже привязанного чата (просто «перезапуск»).
+        owner = get_owner_by_admin_chat(chat_id) or user_id
+        if owner is None or not _is_moderator(owner, user_id):
+            await message.answer("❌ /perezap: нужен владелец ботов (или модератор привязанного чата админов).")
+            return
 
-    # Сохраняем тип уже привязанного чата; иначе (или для непривязанного) — «чат админов».
-    if get_bound_chat(owner, "work") == chat.id:
+    # 3) Тип чата: «работа», если уже привязан как рабочий, иначе — «админов».
+    if get_bound_chat(owner, "work") == chat_id:
         kind = "work"
     else:
         kind = "admin"
-    set_bound_chat(owner, kind, chat.id)
 
-    # Приветствие в чат (главное — бот отвечает, значит он активен и команды
-    # /стата и пр. дойдут). При flood-wait ждём и повторяем.
+    # 4) Сохраняем привязку: бот «перезапускается» в этом чате без перепривязки через профиль.
+    set_bound_chat(owner, kind, chat_id)
+
     if kind == "work":
         await _retry_send(
-            lambda: message.answer(
-                "💼 <b>Чат работы привязан к YamoBot.</b> Бот активен. ✅"
-            ),
+            lambda: message.answer("💼 <b>Чат работы привязан к YamoBot.</b> Бот активен. ✅"),
             attempts=6,
         )
     else:
         await _retry_send(lambda: message.answer(ADMIN_CHAT_WELCOME), attempts=6)
 
-    # Подтверждение инициатору (best-effort, чтобы /perezap всегда отвечал).
+    # 5) Подтверждение (best-effort, чтобы /perezap всегда отвечал).
     try:
         await _retry_send(
             lambda: message.answer(
-                f"✅ <b>Бот перезапущен в этом чате.</b>\n"
-                f"📎 Чат: <code>{chat.id}</code> (тип: {kind})\n"
+                f"✅ <b>YamoBot перезапущен в этом чате.</b>\n"
+                f"📎 Чат: <code>{chat_id}</code> (тип: {kind})\n"
                 f"👑 Владелец: <code>{owner}</code>\n\n"
                 "Теперь команды (<code>/стата</code>, <code>/.стата</code> и др.) "
                 "должны работать."
