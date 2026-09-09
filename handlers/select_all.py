@@ -5,7 +5,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from handlers._common import render_callback, safe_edit
+from handlers._common import render_callback, safe_edit, cb_uid
 from services.storage import get_user_bots, bot_display_name, get_all_stats
 from services.child_manager import ChildManager
 
@@ -25,7 +25,7 @@ def select_all_kb() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "select_all")
 async def cb_select_all(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     names = "\n".join(f"  • {bot_display_name(b)}" for b in bots)
@@ -36,7 +36,7 @@ async def cb_select_all(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "all_stats")
 async def cb_all_stats(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     if not bots:
@@ -68,7 +68,7 @@ async def cb_all_stats(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "all_stop")
 async def cb_all_stop(callback: CallbackQuery, child_manager: ChildManager) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     stopped = 0
@@ -88,7 +88,7 @@ async def cb_all_stop(callback: CallbackQuery, child_manager: ChildManager) -> N
 
 @router.callback_query(F.data == "all_start_all")
 async def cb_all_start(callback: CallbackQuery, child_manager: ChildManager) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     started = 0

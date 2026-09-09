@@ -6,7 +6,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, cb_uid, msg_uid
 from services.storage import (
     get_user_bots,
     bot_display_name,
@@ -26,7 +26,7 @@ def _main_kb() -> InlineKeyboardMarkup:
 
 
 async def show_global_pz(message: Message) -> None:
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     bots = get_user_bots(user_id)
 
     if not bots:
@@ -65,7 +65,7 @@ async def show_global_pz(message: Message) -> None:
 
 @router.callback_query(F.data == "gstats")
 async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     if not bots:
@@ -108,7 +108,7 @@ async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) 
 
 @router.callback_query(F.data == "gpz")
 async def cb_global_pz(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     # В анонимном режиме бот не показывается ни в списке, ни на кнопках ПЗ.

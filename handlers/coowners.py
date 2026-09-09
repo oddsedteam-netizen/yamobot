@@ -8,7 +8,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, cb_uid, msg_uid, try_edit_answer
 from services.storage import get_coowners, add_coowner, remove_coowner
 
 router = Router()
@@ -32,7 +32,7 @@ def coowners_kb() -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "coowners")
 async def cb_coowners(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
 
     coowners = get_coowners(user_id)
 
@@ -73,21 +73,16 @@ async def cb_co_add(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="coowners")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="coowners")]
+                              ]))
     await callback.answer()
 
 
 @router.message(CoownerFSM.waiting_add)
 async def fsm_co_add(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=1)
 
@@ -139,7 +134,7 @@ async def fsm_co_add(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "co_remove")
 async def cb_co_remove(callback: CallbackQuery, state: FSMContext) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     coowners = get_coowners(user_id)
 
     if not coowners:
@@ -162,21 +157,16 @@ async def cb_co_remove(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="coowners")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="coowners")]
+                              ]))
     await callback.answer()
 
 
 @router.message(CoownerFSM.waiting_remove)
 async def fsm_co_remove(message: Message, state: FSMContext) -> None:
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     raw = (message.text or "").strip()
 
     try:

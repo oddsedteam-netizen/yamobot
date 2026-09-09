@@ -8,7 +8,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, cb_data, cb_uid, msg_uid, msg_username, try_edit
 from handlers.profile import admin_kb
 from services.config import OWNER_ID, is_super_admin
 from services.storage import (
@@ -63,12 +63,10 @@ async def cb_comp_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer("❌ Жалоба отменена")
     if callback.message:
-        try:
-            await callback.message.edit_text("❌ Подача жалобы отменена.", reply_markup=None)
-        except Exception:
-            pass
+        await try_edit(callback.message, "❌ Подача жалобы отменена.", reply_markup=None)
     from handlers.start import _show_main
-    await _show_main(callback.message) if callback.message else None
+    if isinstance(callback.message, Message):
+        await _show_main(callback.message)
 
 
 @router.message(ComplaintFSM.waiting_category)
@@ -102,7 +100,7 @@ async def fsm_comment(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     complaint_id = create_complaint(
-        message.from_user.id, message.from_user.username or "",
+        msg_uid(message), msg_username(message),
         data.get("category", "Без категории"),
         data.get("screenshot_id", ""), comment,
     )
@@ -135,7 +133,7 @@ async def _notify_user(bot, user_id: int, complaint_id: int, text: str) -> None:
 
 @router.callback_query(F.data == "complaints_admin")
 async def cb_complaints_admin(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     complaints = get_complaints()
@@ -148,10 +146,10 @@ async def cb_complaints_admin(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("comp_view_"))
 async def cb_complaint_view(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    cid = int(callback.data.split("_")[-1])
+    cid = int(cb_data(callback).split("_")[-1])
     c = get_complaint(cid)
     if not c:
         await callback.answer("Жалоба не найдена")
@@ -166,18 +164,26 @@ async def cb_complaint_view(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="complaints_admin")],
     ])
     if c.get("screenshot_id"):
-        await callback.message.answer_photo(c["screenshot_id"], caption=txt, reply_markup=kb)
+        msg = callback.message
+        if msg is not None:
+            answer = getattr(msg, "answer_photo", None)
+            if answer is not None:
+                await answer(c["screenshot_id"], caption=txt, reply_markup=kb)
     else:
-        await callback.message.answer(txt, reply_markup=kb)
+        msg = callback.message
+        if msg is not None:
+            answer = getattr(msg, "answer", None)
+            if answer is not None:
+                await answer(txt, reply_markup=kb)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("comp_acc_"))
 async def cb_accept(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    cid = int(callback.data.split("_")[-1])
+    cid = int(cb_data(callback).split("_")[-1])
     c = get_complaint(cid)
     if c:
         set_complaint_status(cid, "accepted")
@@ -187,10 +193,10 @@ async def cb_accept(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("comp_rej_"))
 async def cb_reject(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    cid = int(callback.data.split("_")[-1])
+    cid = int(cb_data(callback).split("_")[-1])
     c = get_complaint(cid)
     if c:
         set_complaint_status(cid, "rejected")

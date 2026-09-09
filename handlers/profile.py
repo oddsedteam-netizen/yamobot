@@ -7,7 +7,9 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, ADMIN_CHAT_WELCOME
+from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
+                              cb_uid, cb_username, cb_firstname, msg_uid,
+                              msg_username, msg_firstname, try_edit_answer)
 from services.config import is_super_admin
 from services.constants import BOT_VERSION
 from services.storage import (
@@ -137,18 +139,18 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
 
 
 async def show_profile(message: Message) -> None:
-    text, kb = _profile_payload(message.from_user.id, message.from_user.first_name or "—")
+    text, kb = _profile_payload(msg_uid(message), msg_firstname(message) or "—")
     await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "profile_show")
 async def cb_profile_show(callback: CallbackQuery) -> None:
     """Открывает профиль из инлайн-колбэка (без нового приветствия)."""
-    _PENDING_BINDS.pop(callback.from_user.id, None)
-    set_pending_bind(callback.from_user.id, None)
+    _PENDING_BINDS.pop(cb_uid(callback), None)
+    set_pending_bind(cb_uid(callback), None)
     if callback.message is None:
         return
-    text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+    text, kb = _profile_payload(cb_uid(callback), cb_firstname(callback) or "—")
     await render_callback(callback, text, kb)
 
 
@@ -187,7 +189,7 @@ def _rights_lines_from(transfer: dict) -> list[str]:
 
 @router.callback_query(F.data == "transfer")
 async def cb_transfer_open(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
     if not bots:
         await render_callback(
@@ -216,7 +218,7 @@ async def cb_transfer_open(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "transfer_one")
 async def cb_transfer_one(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
     if not bots:
         await callback.answer("У тебя нет ботов", show_alert=True)
@@ -250,24 +252,20 @@ async def _send_confirm_link(callback: CallbackQuery, token: str) -> None:
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")]
     ])
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            if callback.message:
-                await callback.message.answer(text, reply_markup=kb)
+        await try_edit_answer(callback.message, text, reply_markup=kb)
     await callback.answer()
 
 
 @router.callback_query(F.data == "transfer_all")
 async def cb_transfer_all(callback: CallbackQuery) -> None:
-    token = create_transfer(callback.from_user.id, "all")
+    token = create_transfer(cb_uid(callback), "all")
     await _send_confirm_link(callback, token)
 
 
 @router.callback_query(F.data.startswith("transfer_pick_"))
 async def cb_transfer_pick(callback: CallbackQuery) -> None:
-    bot_id = int(callback.data.split("_")[-1])
-    token = create_transfer(callback.from_user.id, "bot", bot_id)
+    bot_id = int(cb_data(callback).split("_")[-1])
+    token = create_transfer(cb_uid(callback), "bot", bot_id)
     await _send_confirm_link(callback, token)
 
 
@@ -279,7 +277,7 @@ async def handle_transfer_link(message: Message, token: str) -> None:
         return
 
     from_uid = transfer.get("from_user_id")
-    to_uid = message.from_user.id
+    to_uid = msg_uid(message)
 
     if to_uid == from_uid:
         await message.answer("⚠️ Ты не можешь передать права самому себе.")
@@ -293,11 +291,11 @@ async def handle_transfer_link(message: Message, token: str) -> None:
     # Регистрируем нового владельца в реестре.
     if not get_user_registry(to_uid):
         from services.storage import register_user
-        register_user(to_uid, message.from_user.username or "", message.from_user.first_name or "")
+        register_user(to_uid, msg_username(message) or "", msg_firstname(message) or "")
 
     text = (
         f"👑 <b>Вам передают права!</b>\n\n"
-        f"Пользователь <b>{_user_display(from_uid)}</b> передаёт вам следующие права:\n"
+        f"Пользователь <b>{_user_display(int(from_uid or 0))}</b> передаёт вам следующие права:\n"
         + "\n".join(lines)
         + "\n\nПодтверди принятие, чтобы данные перешли к тебе навсегда."
     )
@@ -311,26 +309,26 @@ async def handle_transfer_link(message: Message, token: str) -> None:
 @router.callback_query(F.data.startswith("transfer_accept_"))
 async def cb_transfer_accept(callback: CallbackQuery) -> None:
     from aiogram.exceptions import TelegramBadRequest
-    token = callback.data.split("transfer_accept_", 1)[1]
+    token = cb_data(callback).split("transfer_accept_", 1)[1]
     transfer = get_transfer(token)
     if not transfer:
         await callback.answer("⚠️ Ссылка уже недействительна.", show_alert=True)
         return
 
     from_uid = transfer.get("from_user_id")
-    to_uid = callback.from_user.id
+    to_uid = cb_uid(callback)
     kind = transfer.get("kind")
 
     if to_uid == from_uid:
         await callback.answer("⚠️ Нельзя принять у самого себя.", show_alert=True)
         return
 
-    username = callback.from_user.username or ""
-    first_name = callback.from_user.first_name or ""
+    username = cb_username(callback) or ""
+    first_name = cb_firstname(callback) or ""
 
     if kind == "bot":
         bot_id = int(transfer.get("bot_id") or 0)
-        ok = transfer_bot(from_uid, to_uid, bot_id, username, first_name)
+        ok = transfer_bot(int(from_uid or 0), to_uid, bot_id, username, first_name)
         if not ok:
             await callback.answer("⚠️ Не удалось передать бота.", show_alert=True)
             return
@@ -339,52 +337,51 @@ async def cb_transfer_accept(callback: CallbackQuery) -> None:
         rights_text = f"• {bot_name}"
         summary = f"🤖 Теперь бот <b>{bot_name}</b> принадлежит тебе."
     else:
-        count = transfer_all_rights(from_uid, to_uid, username, first_name)
+        count = transfer_all_rights(int(from_uid or 0), to_uid, username, first_name)
         rights_text = "все права"
         summary = f"👑 <b>Все права приняты!</b>\n\nПередано ботов: <b>{count}</b>."
 
     delete_transfer(token)
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                summary,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile_show")]
-                ]),
-            )
-        except TelegramBadRequest:
-            pass
+        await try_edit_answer(
+            callback.message,
+            summary,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile_show")]
+            ]),
+        )
 
     # Уведомляем старого владельца.
     try:
-        await callback.bot.send_message(
-            from_uid,
-            f"🔁 <b>Права переданы.</b>\n\n"
-            f"<b>{_user_display(to_uid)}</b> принял ваши права: {rights_text}.",
-        )
+        bot = getattr(callback, "bot", None)
+        if bot is not None:
+            await bot.send_message(
+                int(from_uid or 0),
+                f"🔁 <b>Права переданы.</b>\n\n"
+                f"<b>{_user_display(to_uid)}</b> принял ваши права: {rights_text}.",
+            )
     except Exception:
         pass
 
 
 @router.callback_query(F.data.startswith("transfer_reject_"))
 async def cb_transfer_reject(callback: CallbackQuery) -> None:
-    token = callback.data.split("transfer_reject_", 1)[1]
+    token = cb_data(callback).split("transfer_reject_", 1)[1]
     transfer = get_transfer(token)
     delete_transfer(token)
 
     if callback.message:
-        try:
-            await callback.message.edit_text("❌ <b>Вы отклонили передачу прав.</b>")
-        except Exception:
-            pass
+        await try_edit_answer(callback.message, "❌ <b>Вы отклонили передачу прав.</b>")
 
     if transfer:
         try:
-            await callback.bot.send_message(
-                transfer.get("from_user_id"),
-                "❌ Новый владелец отклонил передачу прав.",
-            )
+            bot = getattr(callback, "bot", None)
+            if bot is not None:
+                await bot.send_message(
+                    int(transfer.get("from_user_id") or 0),
+                    "❌ Новый владелец отклонил передачу прав.",
+                )
         except Exception:
             pass
 
@@ -393,7 +390,7 @@ async def cb_transfer_reject(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "profile_admin")
 async def cb_profile_admin(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     await render_callback(callback, "🛡 <b>Админ-панель</b>\n\nВыбери раздел:", admin_kb())
@@ -401,7 +398,7 @@ async def cb_profile_admin(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "profiles_list")
 async def cb_profiles_list(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     users = get_all_users_registry()
@@ -414,10 +411,10 @@ async def cb_profiles_list(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("profile_view_"))
 async def cb_profile_view(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    uid = int(callback.data.split("_")[-1])
+    uid = int(cb_data(callback).split("_")[-1])
     users = [u for u in get_all_users_registry() if u["user_id"] == uid]
     if not users:
         await callback.answer("Пользователь не найден")
@@ -437,30 +434,30 @@ async def cb_profile_view(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("profile_ban_"))
 async def cb_profile_ban(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    uid = int(callback.data.split("_")[-1])
+    uid = int(cb_data(callback).split("_")[-1])
     set_registry_user_blocked(uid, True)
     await render_callback(callback, f"🚫 Пользователь <code>{uid}</code> забанен.", profile_admin_kb(uid))
 
 
 @router.callback_query(F.data.startswith("profile_unban_"))
 async def cb_profile_unban(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    uid = int(callback.data.split("_")[-1])
+    uid = int(cb_data(callback).split("_")[-1])
     set_registry_user_blocked(uid, False)
     await render_callback(callback, f"✅ Пользователь <code>{uid}</code> разбанен.", profile_admin_kb(uid))
 
 
 @router.callback_query(F.data.startswith("profile_stats_"))
 async def cb_profile_stats(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    uid = int(callback.data.split("_")[-1])
+    uid = int(cb_data(callback).split("_")[-1])
     bots = get_user_bots(uid)
     lines = []
     total = {"users_total": 0, "messages_in": 0, "messages_out": 0}
@@ -482,10 +479,10 @@ async def cb_profile_stats(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("profile_del_bots_"))
 async def cb_profile_del_bots(callback: CallbackQuery) -> None:
-    if not is_super_admin(callback.from_user.id):
+    if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    uid = int(callback.data.split("_")[-1])
+    uid = int(cb_data(callback).split("_")[-1])
     bots = get_user_bots(uid)
     for b in bots:
         remove_user_bot(uid, b["id"])
@@ -510,8 +507,9 @@ def _bind_wait_kb() -> InlineKeyboardMarkup:
 
 async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
     try:
-        me = await callback.bot.get_me()
-        bot_ref = f"@{me.username}" if me.username else "бота"
+        bot = getattr(callback, "bot", None)
+        me = await bot.get_me() if bot is not None else None
+        bot_ref = f"@{me.username}" if me and me.username else "бота"
     except Exception:
         bot_ref = "бота"
 
@@ -522,11 +520,19 @@ async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
         tail = "После привязки бот запомнит ID чата и <b>останется</b> в нём — "
         tail += "сюда будут приходить уведомления о новых ПЗ."
 
+    admin_note = ""
+    if kind == "admin":
+        admin_note = (
+            "3. Выдай боту <b>права администратора</b> в этом чате — иначе "
+            "он не сможет в полной мере работать с уведомлениями.\n"
+        )
+
     return (
         f"📌 <b>{label}</b>\n\n"
         f"1. Добавь <b>{bot_ref}</b> в групповой чат, который хочешь "
         f"использовать как «{label}».\n"
-        f"2. Дождись подтверждения привязки.\n\n"
+        f"2. Дождись подтверждения привязки.\n"
+        f"{admin_note}\n"
         f"{tail}"
     )
 
@@ -534,8 +540,8 @@ async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
 @router.callback_query(F.data.in_({"bind_work", "bind_admin"}))
 async def cb_bind_start(callback: CallbackQuery) -> None:
     kind = "work" if callback.data == "bind_work" else "admin"
-    _PENDING_BINDS[callback.from_user.id] = kind
-    set_pending_bind(callback.from_user.id, kind)  # в БД — переживает рестарт бота
+    _PENDING_BINDS[cb_uid(callback)] = kind
+    set_pending_bind(cb_uid(callback), kind)  # в БД — переживает рестарт бота
     text = await _bind_instructions(callback, kind)
     await render_callback(callback, text, _bind_wait_kb())
 
@@ -543,7 +549,7 @@ async def cb_bind_start(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "bind_done")
 async def cb_bind_done(callback: CallbackQuery) -> None:
     """Пользователь сообщил, что добавил бота. Привязываем сами, если событие не пришло."""
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     kind = get_pending_bind(user_id) or _PENDING_BINDS.get(user_id)
 
     # Если бот ещё ждёт привязку — попробуем привязать последний добавленный чат.
@@ -568,12 +574,14 @@ async def cb_bind_done(callback: CallbackQuery) -> None:
             set_bound_chat(user_id, kind, chat_id)
             if kind == "work":
                 # Чат работы — бот запоминает и покидает его.
+                bot = getattr(callback, "bot", None)
                 try:
-                    await callback.bot.leave_chat(chat_id)
+                    if bot is not None:
+                        await bot.leave_chat(chat_id)
                 except Exception:
                     pass
             await callback.answer("✅ Привязано!")
-            text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+            text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
             await render_callback(callback, text, kb)
         else:
             # Бот пока не видит добавление — короткое уведомление, без повтора инструкции.
@@ -582,43 +590,45 @@ async def cb_bind_done(callback: CallbackQuery) -> None:
     else:
         # Уже привязано через событие — просто открываем профиль.
         await callback.answer()
-        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
         await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "bind_cancel")
 async def cb_bind_cancel(callback: CallbackQuery) -> None:
-    _PENDING_BINDS.pop(callback.from_user.id, None)
-    set_pending_bind(callback.from_user.id, None)
+    _PENDING_BINDS.pop(cb_uid(callback), None)
+    set_pending_bind(cb_uid(callback), None)
     await callback.answer("❌ Привязка отменена")
     if callback.message:
-        text, kb = _profile_payload(callback.from_user.id, callback.from_user.first_name or "—")
+        text, kb = _profile_payload(cb_uid(callback), cb_firstname(callback) or "—")
         await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "unbind_work")
 async def cb_unbind_work(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     set_bound_chat(user_id, "work", None)
     await callback.answer("💼 Чат работы отвязан")
     if callback.message:
-        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
         await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "unbind_admin")
 async def cb_unbind_admin(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     chat_id = get_bound_chat(user_id, "admin")
     set_bound_chat(user_id, "admin", None)
     if chat_id:
+        bot = getattr(callback, "bot", None)
         try:
-            await callback.bot.leave_chat(chat_id)
+            if bot is not None:
+                await bot.leave_chat(chat_id)
         except Exception:
             pass
     await callback.answer("🛡 Чат админов отвязан")
     if callback.message:
-        text, kb = _profile_payload(user_id, callback.from_user.first_name or "—")
+        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
         await render_callback(callback, text, kb)
 
 
@@ -686,6 +696,10 @@ async def on_bot_added_to_chat(event) -> None:
             f"✅ <b>Чат админов привязан!</b>\n\n"
             f"📎 Чат: <b>{chat_name}</b>\n"
             f"🆔 ID: <code>{chat.id}</code>\n\n"
+            f"⚠️ <b>Выдай боту права администратора</b> в этом чате — "
+            f"иначе он не сможет в полной мере работать с уведомлениями.\n"
+            f"Сделай это через: «Управление чатом → Администраторы → YamoBot → "
+            f"Назначить администратором».\n\n"
             f"Теперь сюда будут приходить уведомления о новых ПЗ. "
             f"Я отправил в чат приветствие со списком команд."
         )

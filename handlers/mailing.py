@@ -11,7 +11,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, safe_edit
+from handlers._common import (render_callback, safe_edit, cb_data, cb_uid,
+                              try_edit_answer, try_edit)
 from services.storage import (
     get_bot_by_id,
     get_user_bots,
@@ -63,8 +64,8 @@ def back_to_bot_kb(bot_id: int) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data.regexp(r"^mailing_\d+$"))
 async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -112,7 +113,7 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "all_mailing")
 async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = [b for b in get_user_bots(user_id) if not b.get("stopped")]
 
     if not bots:
@@ -164,17 +165,10 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
-                    ]
-                )
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
+                              ]))
     await callback.answer()
 
 
@@ -275,7 +269,8 @@ async def cb_mailing_confirm(
         await callback.answer()
         return
 
-    status_msg = await callback.message.edit_text("📨 Рассылка запущена... ⏳")
+    await try_edit(callback.message, "📨 Рассылка запущена... ⏳")
+    status_msg = callback.message
     await callback.answer()
 
     grand_sent = 0
@@ -289,11 +284,12 @@ async def cb_mailing_confirm(
         async def progress_cb(sent, failed, total, current, _bot_id=bot_id):
             try:
                 pct = int(current / total * 100) if total else 0
-                await status_msg.edit_text(
+                await try_edit(
+                    status_msg,
                     f"📨 Рассылка...\n\n"
                     f"🤖 Бот: <code>{_bot_id}</code>\n"
                     f"📊 {pct}% ({current}/{total})\n"
-                    f"✅ {sent}  ❌ {failed}"
+                    f"✅ {sent}  ❌ {failed}",
                 )
             except Exception:
                 pass
@@ -313,7 +309,8 @@ async def cb_mailing_confirm(
 
     back_data = f"bot_{bot_ids[0]}" if len(bot_ids) == 1 else "select_all"
 
-    await status_msg.edit_text(
+    await try_edit(
+        status_msg,
         f"📨 <b>Рассылка завершена!</b>\n\n"
         f"🤖 Ботов: <b>{len(bot_ids)}</b>\n"
         f"👥 Всего получателей: <b>{grand_total}</b>\n\n"
@@ -324,5 +321,5 @@ async def cb_mailing_confirm(
                 [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_data)],
             ]
-        )
+        ),
     )

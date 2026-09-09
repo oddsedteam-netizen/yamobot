@@ -14,7 +14,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from handlers._common import render_callback, _retry_send
+from handlers._common import (render_callback, cb_data, cb_uid, msg_uid,
+                              msg_username, msg_firstname, try_edit,
+                              try_edit_answer)
 from services.child_manager import ChildManager
 from services.config import is_super_admin
 from services.constants import BOT_VERSION
@@ -33,11 +35,6 @@ from services.storage import (
 )
 
 router = Router()
-
-# Chat id -> message id последнего сообщения со сводкой «/стата».
-# Нужно, чтобы каждый новый вызов команды удалял старую сводку и слал свежую —
-# так бот «всегда» показывает актуальную статату и не плодит дубликаты.
-_STATS_MESSAGES: dict[int, int] = {}
 
 _logger = logging.getLogger(__name__)
 
@@ -84,8 +81,8 @@ async def _show_main(message: Message) -> None:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    user_id = message.from_user.id
-    register_user(user_id, message.from_user.username or "", message.from_user.first_name or "")
+    user_id = msg_uid(message)
+    register_user(user_id, msg_username(message) or "", msg_firstname(message) or "")
     if is_registry_user_banned(user_id) and not is_super_admin(user_id):
         await message.answer("🚫 Вы заблокированы администрацией.")
         return
@@ -137,10 +134,10 @@ async def fsm_waiting_admin_tag(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
     data = await state.get_data()
-    owner_id = data.get("admin_owner_id")
-    token = data.get("admin_token")
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
+    owner_id = int(data.get("admin_owner_id") or 0)
+    token = data.get("admin_token") or ""
+    user_id = msg_uid(message)
+    username = msg_username(message) or ""
     await state.clear()
 
     already = get_admin_by_user_id(owner_id, user_id)
@@ -220,13 +217,15 @@ async def cb_back_main(callback: CallbackQuery, state: FSMContext) -> None:
 
     # Возвращаемся в главное меню: убираем старый inline-экран и выводим
     # меню ОДНИМ сообщением (без дублирующего текста «Главное меню»).
-    try:
-        await callback.message.delete()
-    except Exception:
+    delete = getattr(callback.message, "delete", None)
+    if delete is not None:
         try:
-            await callback.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=None)
+            await delete()
         except Exception:
-            pass
+            try:
+                await try_edit(callback.message, "🏠 <b>Главное меню</b>", reply_markup=None)
+            except Exception:
+                pass
 
     try:
         await callback.message.answer(
@@ -246,7 +245,7 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
 @router.message(Command("adm"), F.chat.type == ChatType.PRIVATE)
 async def cmd_adm(message: Message) -> None:
     """Открывает админ-панель только для супер-админа (переменная ADMIN)."""
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     if not is_super_admin(user_id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -257,7 +256,7 @@ async def cmd_adm(message: Message) -> None:
 @router.message(Command("status"), F.chat.type == ChatType.PRIVATE)
 async def cmd_status(message: Message, child_manager: ChildManager) -> None:
     """Диагностика: состояние всех дочерних ботов (только для супер-админа)."""
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     if not is_super_admin(user_id):
         await message.answer("⛔ Доступ запрещён.")
         return
@@ -376,46 +375,11 @@ def _resolve_stats_owner(chat, fallback_user_id: int) -> int:
     return fallback_user_id
 
 
-@router.message(F.text.regexp(r"(?i)^\s*[\./]+\.?\s*(стата|stata)\s*$"))
-async def cmd_simple_stats(message: Message) -> None:
-    # Виден всем: в ЛС — сводка по своему аккаунту, в чате админов — по владельцу чата.
-    owner_id = _resolve_stats_owner(message.chat, message.from_user.id)
-    text, kb = _stats_payload(owner_id)
-    chat_key = message.chat.id if message.chat else 0
-    bot = message.bot
-
-    # Удаляем предыдущую сводку «/стата» в этом чате (best-effort: если не
-    # удалось — например, flood-wait или уже удалено — просто идём дальше).
-    old_id = _STATS_MESSAGES.pop(chat_key, None)
-    if old_id:
-        try:
-            await _retry_send(lambda: bot.delete_message(message.chat.id, old_id), attempts=2)
-        except Exception:
-            pass
-
-    # Всегда отправляем свежую сводку. При flood-wait (медленный режим в группе)
-    # ждём и повторяем, чтобы бот ВСЕГДА отвечал на команду, а не «молча пропадал».
-    try:
-        sent = await _retry_send(
-            lambda: message.answer(text, reply_markup=kb), attempts=6
-        )
-    except Exception as e:
-        _logger.error("Не удалось отправить сводку /стата: %s", e)
-        # Последняя попытка — простой текст с ошибкой (без клавиатуры).
-        try:
-            await _retry_send(lambda: message.answer(f"❌ Не удалось сформировать сводку: {e}"), attempts=2)
-        except Exception:
-            pass
-        return
-    if sent is not None:
-        _STATS_MESSAGES[chat_key] = sent.message_id
-
-
 @router.callback_query(F.data == "gstat_noadmin")
 async def cb_gstat_noadmin(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     chat = callback.message.chat if callback.message else None
-    owner_id = _resolve_stats_owner(chat, callback.from_user.id)
+    owner_id = _resolve_stats_owner(chat, cb_uid(callback))
     bots = get_user_bots(owner_id)
 
     # Нумерованный список ПЗ без админа. Сохраняем маппинг «номер → топик»,
@@ -484,10 +448,7 @@ async def cb_gstat_del(callback: CallbackQuery, state: FSMContext) -> None:
         [InlineKeyboardButton(text="❌ Отмена", callback_data="gstat_cancel_del")]
     ])
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=kb)
-        except Exception:
-            await callback.message.answer(text, reply_markup=kb)
+        await try_edit_answer(callback.message, text, reply_markup=kb)
     await callback.answer()
 
 
@@ -529,6 +490,6 @@ async def fsm_pz_delete(message: Message, state: FSMContext) -> None:
 async def cb_gstat_back(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     chat = callback.message.chat if callback.message else None
-    owner_id = _resolve_stats_owner(chat, callback.from_user.id)
+    owner_id = _resolve_stats_owner(chat, cb_uid(callback))
     text, kb = _stats_payload(owner_id)
     await render_callback(callback, text, kb)

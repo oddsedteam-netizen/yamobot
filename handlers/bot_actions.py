@@ -5,7 +5,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from handlers._common import render_callback, safe_edit
+from handlers._common import render_callback, safe_edit, cb_data, cb_uid, try_edit
 from services.storage import (
     get_user_bots,
     get_bot_by_id,
@@ -70,13 +70,13 @@ def single_bot_kb(bot_id: int, is_running: bool, anon_mode: bool = False) -> Inl
 @router.callback_query(F.data.startswith("bot_"))
 async def cb_single_bot(callback: CallbackQuery,
                         child_manager: ChildManager) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if bot_info is None:
         if callback.message:
-            await callback.message.edit_text("⚠️ Бот не найден.", reply_markup=main_inline_kb())
+            await try_edit(callback.message, "⚠️ Бот не найден.", reply_markup=main_inline_kb())
         await callback.answer()
         return
 
@@ -90,8 +90,8 @@ async def cb_single_bot(callback: CallbackQuery,
 @router.callback_query(F.data.startswith("action_stop_"))
 async def cb_stop_bot(callback: CallbackQuery,
                       child_manager: ChildManager) -> None:
-    bot_id = int(callback.data.split("_")[-1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_")[-1])
+    user_id = cb_uid(callback)
 
     await child_manager.stop_child(bot_id)
     update_bot_field(user_id, bot_id, "stopped", 1)
@@ -106,8 +106,8 @@ async def cb_stop_bot(callback: CallbackQuery,
 @router.callback_query(F.data.startswith("action_start_"))
 async def cb_start_bot(callback: CallbackQuery,
                        child_manager: ChildManager) -> None:
-    bot_id = int(callback.data.split("_")[-1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_")[-1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -133,8 +133,8 @@ async def cb_start_bot(callback: CallbackQuery,
 @router.callback_query(F.data.startswith("action_anon_"))
 async def cb_toggle_anon(callback: CallbackQuery,
                          child_manager: ChildManager) -> None:
-    bot_id = int(callback.data.rsplit("_", 1)[-1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -191,8 +191,7 @@ def antispam_kb(bot_id: int, current_mode: str) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data.startswith("antispam_"))
 async def cb_antispam(callback: CallbackQuery) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
 
     current = get_antispam_mode(bot_id)
 
@@ -211,10 +210,10 @@ async def cb_antispam(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("setantispam_"))
 async def cb_set_antispam(callback: CallbackQuery,
                           child_manager: ChildManager) -> None:
-    parts = callback.data.split("_")
+    parts = cb_data(callback).split("_")
     bot_id = int(parts[1])
     mode = parts[2]
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
 
     set_antispam_mode(user_id, bot_id, mode)
 
@@ -239,8 +238,8 @@ async def cb_set_antispam(callback: CallbackQuery,
 
 @router.callback_query(F.data.startswith("stats_"))
 async def cb_stats(callback: CallbackQuery) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -275,8 +274,8 @@ async def cb_stats(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("action_delete_"))
 async def cb_delete_bot(callback: CallbackQuery,
                         child_manager: ChildManager) -> None:
-    bot_id = int(callback.data.split("_")[-1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_")[-1])
+    user_id = cb_uid(callback)
 
     await child_manager.stop_child(bot_id)
     removed = remove_user_bot(user_id, bot_id)

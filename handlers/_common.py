@@ -4,13 +4,21 @@ import asyncio
 import logging
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+    MaybeInaccessibleMessage,
+)
 
 _logger = logging.getLogger(__name__)
 
 # Приветствие, которое бот шлёт в привязанный «чат админов» (и при перезапуске).
 ADMIN_CHAT_WELCOME = (
     "🛡 <b>Чат админов привязан!</b>\n\n"
+    "⚠️ <b>Боту нужны права администратора</b> в этом чате — "
+    "выдай их через «Управление чатом → Администраторы → YamoBot → "
+    "Назначить администратором», иначе уведомления могут не доходить.\n\n"
     "👋 Приветствую тебя в чате админов YamoBot!\n\n"
     "🧭 <b>Команды в этом чате:</b>\n"
     "• <code>/стата</code> или <code>/.стата</code> — сводка по ПЗ всех ботов.\n"
@@ -66,7 +74,8 @@ async def _retry_send(coro_factory, attempts: int = 6):
     return None
 
 
-async def edit_or_answer(target, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
+                          reply_markup: InlineKeyboardMarkup | None = None) -> None:
     """Пытается отредактировать существующее сообщение, иначе отправляет новое.
 
     Ошибка «message is not modified» (контент не изменился) молча игнорируется,
@@ -74,14 +83,19 @@ async def edit_or_answer(target, text: str, reply_markup: InlineKeyboardMarkup |
     """
     if target is None:
         return
-    try:
-        await target.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest as e:
-        if _is_not_modified(e):
+    edit = getattr(target, "edit_text", None)
+    if edit is not None:
+        try:
+            await edit(text, reply_markup=reply_markup)
             return
-        await target.answer(text, reply_markup=reply_markup)
-    except Exception:
-        await target.answer(text, reply_markup=reply_markup)
+        except TelegramBadRequest as e:
+            if _is_not_modified(e):
+                return
+        except Exception:
+            pass
+    answer = getattr(target, "answer", None)
+    if answer is not None:
+        await answer(text, reply_markup=reply_markup)
 
 
 async def render_callback(callback: CallbackQuery, text: str,
@@ -91,11 +105,91 @@ async def render_callback(callback: CallbackQuery, text: str,
     await callback.answer()
 
 
-async def safe_edit(target: Message | None, text: str,
+async def safe_edit(target: MaybeInaccessibleMessage | None, text: str,
                     reply_markup: InlineKeyboardMarkup | None = None) -> None:
     """Только редактирует сообщение, молча игнорируя ошибки (сообщение изменили/удалили)."""
     if target:
+        edit = getattr(target, "edit_text", None)
+        if edit is not None:
+            try:
+                await edit(text, reply_markup=reply_markup)
+            except Exception:
+                pass
+
+
+# ═══════════════ Доступ к полям aiogram ═══════════════════════════════
+# Стубы типов aiogram помечают некоторые поля как Optional (callback.data,
+# from_user у message/callback), хотя в обработанных фильтрами апдейтах они
+# гарантированно присутствуют. Хелперы ниже сужают тип без «тихания» ошибок
+# Pyright/Pylance и без лишних проверок на каждом вызове.
+
+def cb_data(callback: CallbackQuery) -> str:
+    """data колбэка (в зарегистрированных фильтрах всегда непустая строка)."""
+    return callback.data or ""
+
+
+def cb_uid(callback: CallbackQuery) -> int:
+    """from_user.id колбэка (в ЛС всегда есть отправитель)."""
+    user = callback.from_user
+    return user.id if user else 0
+
+
+def msg_uid(message: Message) -> int:
+    """from_user.id сообщения (в ЛС/группах всегда есть отправитель)."""
+    user = message.from_user
+    return user.id if user else 0
+
+
+def msg_username(message: Message) -> str:
+    """username отправителя сообщения (или пустая строка)."""
+    user = message.from_user
+    return (user.username or "") if user else ""
+
+
+def msg_firstname(message: Message) -> str:
+    """first_name отправителя сообщения (или пустая строка)."""
+    user = message.from_user
+    return (user.first_name or "") if user else ""
+
+
+def cb_username(callback: CallbackQuery) -> str:
+    """username отправителя колбэка (или пустая строка)."""
+    user = callback.from_user
+    return (user.username or "") if user else ""
+
+
+def cb_firstname(callback: CallbackQuery) -> str:
+    """first_name отправителя колбэка (или пустая строка)."""
+    user = callback.from_user
+    return (user.first_name or "") if user else ""
+
+
+async def try_edit(target: MaybeInaccessibleMessage | None, text: str,
+                   reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Вызывает edit_text, молча игнорируя ошибки и отсутствие метода
+    (безопасно для InaccessibleMessage и None)."""
+    if target is None:
+        return
+    edit = getattr(target, "edit_text", None)
+    if edit is not None:
         try:
-            await target.edit_text(text, reply_markup=reply_markup)
+            await edit(text, reply_markup=reply_markup)
         except Exception:
             pass
+
+
+async def try_edit_answer(target: MaybeInaccessibleMessage | None, text: str,
+                          reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """edit_text с фолбэком на answer на случай ошибки (InaccessibleMessage-safe)."""
+    if target is None:
+        return
+    edit = getattr(target, "edit_text", None)
+    if edit is not None:
+        try:
+            await edit(text, reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+    answer = getattr(target, "answer", None)
+    if answer is not None:
+        await answer(text, reply_markup=reply_markup)

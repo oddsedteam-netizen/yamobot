@@ -7,7 +7,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import render_callback, cb_data, cb_uid, msg_uid
 from services.child_manager import ChildManager
 from services.storage import (
     get_user_bots,
@@ -81,7 +81,7 @@ def _bot_list_text(bots: list[dict], bot_type: str | None) -> str:
         f"🟢 — работает  🔴 — остановлен\n\nВыбери бота:"
     )
 async def show_my_bots(message: Message, child_manager: ChildManager) -> None:
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     all_bots = get_user_bots(user_id)
 
     if not all_bots:
@@ -112,7 +112,7 @@ async def show_my_bots(message: Message, child_manager: ChildManager) -> None:
 async def cb_my_bots(callback: CallbackQuery, state: FSMContext,
                      child_manager: ChildManager) -> None:
     await state.clear()
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     all_bots = get_user_bots(user_id)
 
     if not all_bots:
@@ -142,8 +142,8 @@ async def cb_my_bots(callback: CallbackQuery, state: FSMContext,
 async def cb_my_bots_type(callback: CallbackQuery, state: FSMContext,
                           child_manager: ChildManager) -> None:
     await state.clear()
-    bot_type = _norm(callback.data.split("_")[-1])
-    user_id = callback.from_user.id
+    bot_type = _norm(cb_data(callback).split("_")[-1])
+    user_id = cb_uid(callback)
     bots = _filter_bots(get_user_bots(user_id), bot_type)
     if not bots:
         await callback.answer("В этой категории пока нет ботов")

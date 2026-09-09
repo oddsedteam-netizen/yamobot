@@ -9,7 +9,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import _is_not_modified, render_callback, safe_edit
+from handlers._common import (_is_not_modified, render_callback, safe_edit,
+                              cb_data, cb_uid, try_edit_answer)
 from services.storage import (
     get_bot_by_id,
     bot_display_name,
@@ -17,9 +18,7 @@ from services.storage import (
     get_topic_by_user_id_search,
     get_pz_stats,
     get_user_info_from_pz,
-    get_admin_by_user_id,
     is_user_banned,
-    is_bot_anonymous,
 )
 
 router = Router()
@@ -44,7 +43,6 @@ def pz_menu_kb(bot_id: int, anon_mode: bool = False) -> InlineKeyboardMarkup:
 def _pz_menu_text(bot_info: dict, topics: list[dict]) -> str:
     """Текст меню ПЗ (с учётом анонимного режима)."""
     name = bot_display_name(bot_info)
-    bot_id = bot_info["id"]
     anon_mode = bool(bot_info.get("anonymous_mode", 0))
 
     assigned = sum(1 for t in topics if t.get("admin_user_id"))
@@ -73,8 +71,8 @@ def _pz_menu_text(bot_info: dict, topics: list[dict]) -> str:
 @router.callback_query(F.data.regexp(r"^pz_\d+$"))
 async def cb_pz_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -93,10 +91,10 @@ async def cb_pz_menu(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.regexp(r"^pzlist_\d+_\d+$"))
 async def cb_pz_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    parts = callback.data.split("_")
+    parts = cb_data(callback).split("_")
     bot_id = int(parts[1])
     page = int(parts[2])
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -172,8 +170,8 @@ async def cb_noop(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.regexp(r"^pzsearch_\d+$"))
 async def cb_pz_search(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if bot_info and bool(bot_info.get("anonymous_mode", 0)):
@@ -195,19 +193,17 @@ async def cb_pz_search(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"pz_{bot_id}")]
-            ]))
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"pz_{bot_id}")]
+                              ]))
     await callback.answer()
 
 
 @router.message(PZFSM.waiting_search_id)
 async def fsm_pz_search(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    bot_id = data.get("pz_bot_id")
+    bot_id = int(data.get("pz_bot_id") or 0)
 
     raw = (message.text or "").strip()
     try:
@@ -305,7 +301,7 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
 
 @router.callback_query(F.data.regexp(r"^pzview_\d+_\d+$"))
 async def cb_pz_view(callback: CallbackQuery) -> None:
-    parts = callback.data.split("_")
+    parts = cb_data(callback).split("_")
     bot_id = int(parts[1])
     user_chat_id = int(parts[2])
     await _show_pz_details(callback, bot_id, user_chat_id)

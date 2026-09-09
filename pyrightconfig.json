@@ -1,0 +1,4 @@
+{
+  "typeCheckingMode": "basic",
+  "include": ["app.py", "handlers", "services"]
+}

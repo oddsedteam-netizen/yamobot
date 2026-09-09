@@ -1,5 +1,3 @@
-import json
-
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,7 +8,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, safe_edit
+from handlers._common import (render_callback, safe_edit, cb_data, cb_uid,
+                              msg_uid, try_edit_answer, try_edit)
 from services.storage import (
     get_bot_by_id,
     update_bot_field,
@@ -60,8 +59,8 @@ def links_kb(bot_id: int, links: list[dict]) -> InlineKeyboardMarkup:
 @router.callback_query(F.data.startswith("editor_"))
 async def cb_editor(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    bot_id = int(callback.data.split("_", 1)[1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_", 1)[1])
+    user_id = cb_uid(callback)
 
     bot_info = get_bot_by_id(user_id, bot_id)
     if not bot_info:
@@ -89,7 +88,7 @@ async def cb_editor(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("edit_welcome_"))
 async def cb_edit_welcome(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_")[-1])
+    bot_id = int(cb_data(callback).split("_")[-1])
 
     await state.set_state(EditorFSM.waiting_welcome_text)
     await state.update_data(editing_bot_id=bot_id)
@@ -100,20 +99,18 @@ async def cb_edit_welcome(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"editor_{bot_id}")]
-            ]))
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"editor_{bot_id}")]
+                              ]))
     await callback.answer()
 
 
 @router.message(EditorFSM.waiting_welcome_text)
 async def fsm_welcome_text(message: Message, state: FSMContext, child_manager: ChildManager) -> None:
     data = await state.get_data()
-    bot_id = data.get("editing_bot_id")
-    user_id = message.from_user.id
+    bot_id = int(data.get("editing_bot_id") or 0)
+    user_id = msg_uid(message)
 
     if not bot_id:
         await state.clear()
@@ -146,8 +143,8 @@ async def fsm_welcome_text(message: Message, state: FSMContext, child_manager: C
 @router.callback_query(F.data.startswith("edit_links_"))
 async def cb_edit_links(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    bot_id = int(callback.data.split("_")[-1])
-    user_id = callback.from_user.id
+    bot_id = int(cb_data(callback).split("_")[-1])
+    user_id = cb_uid(callback)
 
     links = get_bot_links(user_id, bot_id)
 
@@ -163,7 +160,7 @@ async def cb_edit_links(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("addlink_"))
 async def cb_add_link(callback: CallbackQuery, state: FSMContext) -> None:
-    bot_id = int(callback.data.split("_", 1)[1])
+    bot_id = int(cb_data(callback).split("_", 1)[1])
 
     await state.set_state(EditorFSM.waiting_link_name)
     await state.update_data(link_bot_id=bot_id)
@@ -171,12 +168,10 @@ async def cb_add_link(callback: CallbackQuery, state: FSMContext) -> None:
     text = "🔗 <b>Новый линк</b>\n\nОтправь <b>название кнопки</b>.\nПример: <code>Наш ТГК</code>"
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"edit_links_{bot_id}")]
-            ]))
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"edit_links_{bot_id}")]
+                              ]))
     await callback.answer()
 
 
@@ -210,9 +205,9 @@ async def fsm_link_url(message: Message, state: FSMContext, child_manager: Child
         return
 
     data = await state.get_data()
-    bot_id = data.get("link_bot_id")
+    bot_id = int(data.get("link_bot_id") or 0)
     link_name = data.get("link_name", "Кнопка")
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
 
     await state.clear()
 
@@ -238,10 +233,10 @@ async def fsm_link_url(message: Message, state: FSMContext, child_manager: Child
 
 @router.callback_query(F.data.startswith("dellink_"))
 async def cb_delete_link(callback: CallbackQuery, child_manager: ChildManager) -> None:
-    parts = callback.data.split("_")
+    parts = cb_data(callback).split("_")
     bot_id = int(parts[1])
     link_idx = int(parts[2])
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
 
     links = get_bot_links(user_id, bot_id)
     if 0 <= link_idx < len(links):
@@ -268,10 +263,10 @@ async def cb_delete_link(callback: CallbackQuery, child_manager: ChildManager) -
 
 @router.callback_query(F.data.startswith("viewlink_"))
 async def cb_view_link(callback: CallbackQuery) -> None:
-    parts = callback.data.split("_")
+    parts = cb_data(callback).split("_")
     bot_id = int(parts[1])
     link_idx = int(parts[2])
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
 
     links = get_bot_links(user_id, bot_id)
     if 0 <= link_idx < len(links):
@@ -295,7 +290,7 @@ def global_editor_kb() -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "all_editor")
 async def cb_all_editor(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     text = (
@@ -305,10 +300,7 @@ async def cb_all_editor(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=global_editor_kb())
-        except Exception:
-            await callback.message.answer(text, reply_markup=global_editor_kb())
+        await try_edit_answer(callback.message, text, reply_markup=global_editor_kb())
     await callback.answer()
 
 
@@ -323,18 +315,16 @@ async def cb_all_edit_welcome(callback: CallbackQuery, state: FSMContext) -> Non
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="all_editor")]
-            ]))
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="all_editor")]
+                              ]))
     await callback.answer()
 
 
 @router.message(EditorFSM.waiting_global_welcome)
 async def fsm_global_welcome(message: Message, state: FSMContext, child_manager: ChildManager) -> None:
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
     new_welcome = message.html_text or message.text or ""
 
     if not new_welcome.strip():
@@ -373,12 +363,10 @@ async def cb_all_edit_link(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="all_editor")]
-            ]))
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="all_editor")]
+                              ]))
     await callback.answer()
 
 
@@ -410,7 +398,7 @@ async def fsm_global_link_url(message: Message, state: FSMContext, child_manager
 
     data = await state.get_data()
     link_name = data.get("global_link_name", "Кнопка")
-    user_id = message.from_user.id
+    user_id = msg_uid(message)
 
     await state.clear()
 
@@ -442,7 +430,7 @@ async def fsm_global_link_url(message: Message, state: FSMContext, child_manager
 
 @router.callback_query(F.data == "all_clear_links")
 async def cb_all_clear_links(callback: CallbackQuery, child_manager: ChildManager) -> None:
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     bots = get_user_bots(user_id)
 
     set_links_for_all(user_id, [])
@@ -454,13 +442,11 @@ async def cb_all_clear_links(callback: CallbackQuery, child_manager: ChildManage
             restarted += 1
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                f"✅ <b>Все линки удалены!</b>\n\n"
-                f"📊 Ботов: <b>{len(bots)}</b>\n"
-                f"🔄 Перезапущено: <b>{restarted}</b>",
-                reply_markup=global_editor_kb()
-            )
-        except Exception:
-            pass
+        await try_edit(
+            callback.message,
+            f"✅ <b>Все линки удалены!</b>\n\n"
+            f"📊 Ботов: <b>{len(bots)}</b>\n"
+            f"🔄 Перезапущено: <b>{restarted}</b>",
+            reply_markup=global_editor_kb(),
+        )
     await callback.answer("Все линки удалены")

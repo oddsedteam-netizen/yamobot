@@ -2,11 +2,11 @@ from aiogram import Bot, Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
 )
 import asyncio
 
-from handlers._common import render_callback
+from handlers._common import render_callback, cb_data, cb_uid
 from services.child_manager import ChildManager
 from services.storage import (
     add_user_bot, bot_display_name, set_bot_type, set_bot_keyboard,
@@ -83,7 +83,7 @@ async def fsm_receive_token(message, state):
 @router.callback_query(F.data.startswith('bot_type_'))
 async def cb_choose_bot_type(callback: CallbackQuery, state: FSMContext,
                              child_manager: ChildManager) -> None:
-    bot_type = callback.data.split('_')[-1]
+    bot_type = cb_data(callback).split('_')[-1]
     if bot_type == 'back':
         await state.set_state(AddBotFSM.waiting_for_token)
         await render_callback(callback, 'Отправь токен ещё раз.', _back_kb())
@@ -102,7 +102,7 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
     info = data.get('bot_info')
     bot_type = data.get('bot_type', 'standard')
     preset_key = bot_type if bot_type in REPLY_PRESETS else 'standard'
-    user_id = callback.from_user.id
+    user_id = cb_uid(callback)
     if not info:
         await state.clear()
         return
@@ -121,4 +121,5 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
             f'🤖 {bot_display_name(info)}\n'
             f'Тип: <b>{REPLY_PRESETS[preset_key]["label"]}</b>\n'
             f'Статус: {status}')
-    await callback.message.answer(text, reply_markup=main_menu_kb())
+    if callback.message:
+        await callback.message.answer(text, reply_markup=main_menu_kb())

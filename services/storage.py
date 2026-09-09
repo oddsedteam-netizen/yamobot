@@ -1,5 +1,4 @@
 import json
-import logging
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1707,7 +1706,7 @@ def create_complaint(user_id: int, username: str, category: str,
             (user_id, username, category, screenshot_id, comment)
         )
         conn.commit()
-        return cur.lastrowid
+        return cur.lastrowid or 0
 
 
 def get_complaints(status: str | None = None) -> list[dict]:

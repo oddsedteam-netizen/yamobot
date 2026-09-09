@@ -4,6 +4,7 @@ import json
 import logging
 import time
 from collections import defaultdict
+from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -21,6 +22,10 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
+                              msg_uid, msg_username, msg_firstname,
+                              try_edit_answer, try_edit)
+
 from services.storage import (
     add_child_user,
     add_stat,
@@ -36,8 +41,6 @@ from services.storage import (
     get_bot_by_id_any_owner,
     get_child_users,
     get_admin_by_user_id,
-    get_admin_message_stats,
-    get_admin_active_topics,
     mark_user_blocked,
     save_mailing,
     get_antispam_mode,
@@ -54,7 +57,6 @@ from services.storage import (
     get_feedback_msg_by_user_msg,
     get_bot_owner,
     get_bot_keyboard_by_bot,
-    get_bot_type,
     bot_display_name,
     is_bot_anonymous,
     get_bound_chat,
@@ -221,7 +223,7 @@ def _build_reply_kb(bot_data: dict) -> ReplyKeyboardMarkup | None:
 async def _send_to_topic(source_msg: Message, bot: Bot,
                          group_chat_id: int, topic_id: int,
                          reply_to: int | None = None) -> Message | None:
-    kwargs = {"chat_id": group_chat_id, "message_thread_id": topic_id}
+    kwargs: dict[str, Any] = {"chat_id": group_chat_id, "message_thread_id": topic_id}
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
 
@@ -260,7 +262,7 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
 async def _send_to_user(source_msg: Message, bot: Bot,
                         chat_id: int, reply_to: int | None = None,
                         bot_id: int | None = None) -> Message | None:
-    kwargs = {"chat_id": chat_id}
+    kwargs: dict[str, Any] = {"chat_id": chat_id}
     if reply_to:
         kwargs["reply_to_message_id"] = reply_to
 
@@ -350,13 +352,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
     async def child_start(message: Message) -> None:
-        if is_user_banned(bot_id, message.from_user.id):
+        if is_user_banned(bot_id, msg_uid(message)):
             return
 
         add_child_user(
-            bot_id, message.from_user.id,
-            message.from_user.username or "",
-            message.from_user.first_name or ""
+            bot_id, msg_uid(message),
+            msg_username(message) or "",
+            msg_firstname(message) or ""
         )
         add_stat(bot_id, "message_in")
 
@@ -560,7 +562,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.callback_query(F.data.startswith("picknew_"))
     async def cb_pick_new(callback: CallbackQuery) -> None:
-        parts = callback.data.split("_")
+        parts = cb_data(callback).split("_")
         thread_id = int(parts[1])
         group_chat_id = int(parts[2])
 
@@ -595,10 +597,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         except Exception:
             pass
 
-        try:
-            await callback.message.edit_text("✅ Запрос нового админа отправлен.")
-        except Exception:
-            pass
+        await try_edit(callback.message, "✅ Запрос нового админа отправлен.")
         await callback.answer()
 
     # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
@@ -649,35 +648,35 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.callback_query(F.data.startswith("take_user_"))
     async def cb_take_user(callback: CallbackQuery) -> None:
-        parts = callback.data.split("_")
+        parts = cb_data(callback).split("_")
         topic_id = int(parts[2])
         group_chat_id = int(parts[3])
 
         # Владелец чата — тот, кому принадлежит бот. После «передачи прав»
         # этим владельцем становится новый юзер, поэтому админа ищем именно у него.
         owner_id = get_bot_owner(bot_id) or 0
-        admin = get_admin_by_user_id(owner_id, callback.from_user.id)
+        admin = get_admin_by_user_id(owner_id, cb_uid(callback))
         if not admin and owner_id != 0:
             # Легаси-записи (до введения owner_id) лежат с owner_id = 0.
-            admin = get_admin_by_user_id(0, callback.from_user.id)
+            admin = get_admin_by_user_id(0, cb_uid(callback))
 
         if admin:
             tag = admin["tag"]
-        elif owner_id == callback.from_user.id:
+        elif owner_id == cb_uid(callback):
             # Владелец/новый владелец, у которого нет записи админа — используем его
             # ник как тег, чтобы топик назывался админским тегом, а не личным именем.
             if getattr(callback.from_user, "username", None):
-                tag = f"@{callback.from_user.username}"
+                tag = f"@{cb_username(callback)}"
             elif getattr(callback.from_user, "first_name", None):
-                tag = callback.from_user.first_name
+                tag = cb_firstname(callback)
             else:
-                tag = str(callback.from_user.id)
+                tag = str(cb_uid(callback))
             logger.debug("Владелец %s взял ПЗ без тега админа, используем ник как тег", owner_id)
         else:
-            tag = callback.from_user.first_name or str(callback.from_user.id)
+            tag = cb_firstname(callback) or str(cb_uid(callback))
 
         # Назначаем и получаем инфу
-        result = assign_admin_to_topic(bot_id, topic_id, group_chat_id, callback.from_user.id, tag)
+        result = assign_admin_to_topic(bot_id, topic_id, group_chat_id, cb_uid(callback), tag)
 
         try:
             await bot_obj.edit_forum_topic(
@@ -687,16 +686,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             logger.warning("Не удалось переименовать топик: %s", e)
 
         if admin:
-            add_admin_message(bot_id, callback.from_user.id, "action")
+            add_admin_message(bot_id, cb_uid(callback), "action")
 
         # Только редактируем текст — НЕ удаляем инфу о юзере
         try:
-            # Если это было сообщение с кнопкой "Я беру" — просто убираем кнопку
-            if callback.message and callback.message.reply_markup:
-                # Оставляем оригинальный текст, но добавляем строку
-                original_text = callback.message.html_text or callback.message.text or ""
-                new_text = f"{original_text}\n\n✅ Взял: <b>#{tag}</b>"
-                await callback.message.edit_text(new_text, reply_markup=None)
+            if callback.message:
+                rm = getattr(callback.message, "reply_markup", None)
+                if rm:
+                    original_text = getattr(callback.message, "html_text", None) \
+                        or getattr(callback.message, "text", None) or ""
+                    new_text = f"{original_text}\n\n✅ Взял: <b>#{tag}</b>"
+                    await try_edit(callback.message, new_text, reply_markup=None)
         except Exception:
             pass
 
@@ -717,7 +717,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.callback_query(F.data.startswith("find_admin_"))
     async def cb_find_admin(callback: CallbackQuery) -> None:
-        parts = callback.data.split("_")
+        parts = cb_data(callback).split("_")
         topic_id = int(parts[2])
         group_chat_id = int(parts[3])
 
@@ -739,17 +739,14 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             ])
         )
 
-        try:
-            await callback.message.edit_text("✅ Запрос отправлен.")
-        except Exception:
-            pass
+        await try_edit(callback.message, "✅ Запрос отправлен.")
         await callback.answer()
 
     # ═══════════════ Callback: подтверждение смены ═══════════════
 
     @child_dp.callback_query(F.data.startswith("confirm_change_"))
     async def cb_confirm_change(callback: CallbackQuery) -> None:
-        parts = callback.data.split("_")
+        parts = cb_data(callback).split("_")
         answer = parts[2]
         topic_id = int(parts[3])
         group_chat_id = int(parts[4])
@@ -773,15 +770,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 ])
             )
 
-            try:
-                await callback.message.edit_text("✅ Запрос на смену админа отправлен.")
-            except Exception:
-                pass
+            await try_edit(callback.message, "✅ Запрос на смену админа отправлен.")
         else:
-            try:
-                await callback.message.edit_text("👌 Оставляем текущего админа.")
-            except Exception:
-                pass
+            await try_edit(callback.message, "👌 Оставляем текущего админа.")
 
         await callback.answer()
 
@@ -789,9 +780,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.message(F.chat.type == ChatType.PRIVATE)
     async def private_message(message: Message) -> None:
-        if is_user_banned(bot_id, message.from_user.id):
+        if is_user_banned(bot_id, msg_uid(message)):
             return
-        if is_user_muted(bot_id, message.from_user.id):
+        if is_user_muted(bot_id, msg_uid(message)):
             try:
                 await message.answer("🔇 Вы временно ограничены в отправке сообщений. Попробуйте позже.")
             except Exception:
@@ -800,12 +791,12 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         add_stat(bot_id, "message_in")
         add_child_user(
-            bot_id, message.from_user.id,
-            message.from_user.username or "",
-            message.from_user.first_name or ""
+            bot_id, msg_uid(message),
+            msg_username(message) or "",
+            msg_firstname(message) or ""
         )
 
-        user_chat_id = message.from_user.id
+        user_chat_id = msg_uid(message)
 
         # Обработка "сменить админа"
         if message.text and message.text.strip().lower() == "сменить админа":
@@ -912,7 +903,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             if anon_mode:
                 header_text = "📩 <b>Новое сообщение</b> 🕶"
             else:
-                user_name = message.from_user.first_name or message.from_user.username or str(user_chat_id)
+                user_name = msg_firstname(message) or msg_username(message) or str(user_chat_id)
                 header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
 
             await bot_obj.send_message(
@@ -986,9 +977,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         add_stat(bot_id, "message_out")
 
-        admin = get_admin_by_user_id(get_bot_owner(bot_id) or 0, message.from_user.id)
+        admin = get_admin_by_user_id(get_bot_owner(bot_id) or 0, msg_uid(message))
         if admin:
-            add_admin_message(bot_id, message.from_user.id, "out")
+            add_admin_message(bot_id, msg_uid(message), "out")
 
         reply_to_user = None
         if message.reply_to_message:

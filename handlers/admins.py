@@ -8,7 +8,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback
+from handlers._common import (render_callback, cb_data, cb_uid, msg_uid,
+                              try_edit_answer)
 from services.child_manager import ChildManager
 from services.constants import MIN_ADMIN_INVITE_USES, MAX_ADMIN_INVITE_USES
 from services.storage import (
@@ -76,7 +77,7 @@ def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
 
 async def show_admins(message: Message) -> None:
     """Показывает меню админов из reply-кнопки (не редактируя сообщение)."""
-    owner_id = message.from_user.id
+    owner_id = msg_uid(message)
     admins = get_admins_all(owner_id)
     text = (
         f"👤 <b>Управление админами</b>\n\n"
@@ -92,7 +93,7 @@ async def show_admins(message: Message) -> None:
 @router.callback_query(F.data == "gadmins")
 async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    owner_id = callback.from_user.id
+    owner_id = cb_uid(callback)
     admins = get_admins_all(owner_id)
 
     text = (
@@ -111,7 +112,7 @@ async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
-    owner_id = callback.from_user.id
+    owner_id = cb_uid(callback)
     admins = get_admins_all(owner_id)
 
     if admins:
@@ -148,9 +149,9 @@ async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.regexp(r"^gadmins_view_\d+$"))
 async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    admin_user_id = int(callback.data.split("_")[-1])
+    admin_user_id = int(cb_data(callback).split("_")[-1])
 
-    owner_id = callback.from_user.id
+    owner_id = cb_uid(callback)
     admin = get_admin_by_user_id(owner_id, admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
@@ -192,9 +193,9 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.regexp(r"^gadmins_editone_\d+$"))
 async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    admin_user_id = int(callback.data.split("_")[-1])
+    admin_user_id = int(cb_data(callback).split("_")[-1])
 
-    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
+    admin = get_admin_by_user_id(cb_uid(callback), admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
         return
@@ -208,24 +209,19 @@ async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")]
+                              ]))
     await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^gadmins_delone_\d+$"))
 async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    admin_user_id = int(callback.data.split("_")[-1])
+    admin_user_id = int(cb_data(callback).split("_")[-1])
 
-    admin = get_admin_by_user_id(callback.from_user.id, admin_user_id)
+    admin = get_admin_by_user_id(cb_uid(callback), admin_user_id)
     if not admin:
         await callback.answer("❌ Админ не найден")
         return
@@ -247,8 +243,8 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
 @router.callback_query(F.data.regexp(r"^gadmins_delconfirm_\d+$"))
 async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    admin_user_id = int(callback.data.split("_")[-1])
-    owner_id = callback.from_user.id
+    admin_user_id = int(cb_data(callback).split("_")[-1])
+    owner_id = cb_uid(callback)
 
     admin = get_admin_by_user_id(owner_id, admin_user_id)
     uname = f"@{admin['username']}" if admin and admin['username'] else f"ID:{admin_user_id}"
@@ -300,8 +296,8 @@ async def cb_delmail_no(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.regexp(r"^gadmins_delmail_yes_\d+$"))
 async def cb_delmail_yes(callback: CallbackQuery,
                          child_manager: ChildManager) -> None:
-    admin_user_id = int(callback.data.split("_")[-1])
-    owner_id = callback.from_user.id
+    admin_user_id = int(cb_data(callback).split("_")[-1])
+    owner_id = cb_uid(callback)
 
     topics = get_admin_active_topics_list(owner_id, admin_user_id)
     sent = 0
@@ -347,7 +343,7 @@ async def cb_delmail_yes(callback: CallbackQuery,
 @router.callback_query(F.data == "gadmins_stats")
 async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    all_stats = get_all_admins_stats(callback.from_user.id)
+    all_stats = get_all_admins_stats(cb_uid(callback))
 
     if not all_stats:
         text = "📊 <b>Статистика админов</b>\n\nНет админов."
@@ -414,7 +410,7 @@ async def fsm_invite_count(message: Message, state: FSMContext) -> None:
         )
         return
 
-    owner_id = message.from_user.id
+    owner_id = msg_uid(message)
     token = create_admin_invite(owner_id, count)
     await state.clear()
 
@@ -468,15 +464,10 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                              ]))
     await callback.answer()
 
 
@@ -506,7 +497,7 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    success = add_admin(message.from_user.id, admin_user_id, username, tag)
+    success = add_admin(msg_uid(message), admin_user_id, username, tag)
     await state.clear()
 
     if success:
@@ -534,7 +525,7 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "gadmins_del")
 async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
-    admins = get_admins_all(callback.from_user.id)
+    admins = get_admins_all(cb_uid(callback))
     if not admins:
         await callback.answer("Нет админов")
         return
@@ -556,15 +547,10 @@ async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                              ]))
     await callback.answer()
 
 
@@ -575,13 +561,13 @@ async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    admin = get_admin_by_tag(message.from_user.id, tag)
+    admin = get_admin_by_tag(msg_uid(message), tag)
     if not admin:
         await message.answer(f"⚠️ Админ с тегом <b>#{tag}</b> не найден.")
         return
 
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
-    remove_admin(message.from_user.id, admin["user_id"])
+    remove_admin(msg_uid(message), admin["user_id"])
     await state.clear()
 
     await message.answer(
@@ -604,15 +590,10 @@ async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                              ]))
     await callback.answer()
 
 
@@ -623,14 +604,14 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
 
     # Редактирование тега из карточки конкретного админа (вводим только новый тег)
     if admin_eid is not None:
-        admin = get_admin_by_user_id(message.from_user.id, admin_eid)
+        admin = get_admin_by_user_id(msg_uid(message), admin_eid)
         new_tag = (message.text or "").strip().lstrip("#")
         if not admin or not new_tag:
             await message.answer("❌ Некорректный тег. Введи тег ещё раз.")
             return
 
         old_tag = admin["tag"]
-        update_admin_tag(message.from_user.id, admin_eid, new_tag)
+        update_admin_tag(msg_uid(message), admin_eid, new_tag)
         await state.clear()
         uname = f"@{admin['username']}" if admin.get("username") else f"ID:{admin_eid}"
         await message.answer(
@@ -654,12 +635,12 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
     old_tag = parts[0].strip().lstrip("#")
     new_tag = parts[1].strip().lstrip("#")
 
-    admin = get_admin_by_tag(message.from_user.id, old_tag)
+    admin = get_admin_by_tag(msg_uid(message), old_tag)
     if not admin:
         await message.answer(f"⚠️ Админ с тегом <b>#{old_tag}</b> не найден.")
         return
 
-    update_admin_tag(message.from_user.id, admin["user_id"], new_tag)
+    update_admin_tag(msg_uid(message), admin["user_id"], new_tag)
     await state.clear()
 
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
@@ -684,15 +665,10 @@ async def cb_search_tag(callback: CallbackQuery, state: FSMContext) -> None:
     text = "🔍 <b>Поиск по тегу</b>\n\nОтправь тег.\nПример: <code>продажи</code>"
 
     if callback.message:
-        try:
-            await callback.message.edit_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
-                ])
-            )
-        except Exception:
-            await callback.message.answer(text)
+        await try_edit_answer(callback.message, text,
+                              InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                              ]))
     await callback.answer()
 
 
@@ -703,7 +679,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Тег не может быть пустым.")
         return
 
-    admin = get_admin_by_tag(message.from_user.id, tag)
+    admin = get_admin_by_tag(msg_uid(message), tag)
     await state.clear()
 
     if not admin:
@@ -718,9 +694,9 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
     uname = f"@{admin['username']}" if admin['username'] else f"ID:{admin['user_id']}"
     status = "✅ активен" if admin["active"] else "❌ неактивен"
 
-    stats = get_admin_message_stats(message.from_user.id, admin["user_id"])
-    topics = get_admin_active_topics(message.from_user.id, admin["user_id"])
-    history = get_admin_tag_history(message.from_user.id, admin["user_id"])
+    stats = get_admin_message_stats(msg_uid(message), admin["user_id"])
+    topics = get_admin_active_topics(msg_uid(message), admin["user_id"])
+    history = get_admin_tag_history(msg_uid(message), admin["user_id"])
 
     history_text = ""
     if history:
