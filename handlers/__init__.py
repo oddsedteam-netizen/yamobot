@@ -14,6 +14,7 @@ from handlers.overview import router as overview_router
 from handlers.profile import router as profile_router
 from handlers.complaints import router as complaints_router
 from handlers.admin_moderation import router as admin_moderation_router
+from handlers.restart import router as restart_router
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
@@ -31,3 +32,4 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(profile_router)
     dp.include_router(complaints_router)
     dp.include_router(admin_moderation_router)
+    dp.include_router(restart_router)
