@@ -75,11 +75,15 @@ async def _retry_send(coro_factory, attempts: int = 6):
 
 
 async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
-                          reply_markup: InlineKeyboardMarkup | None = None) -> None:
+                          reply_markup: InlineKeyboardMarkup | None = None,
+                          force_answer: bool = False) -> None:
     """Пытается отредактировать существующее сообщение, иначе отправляет новое.
 
     Ошибка «message is not modified» (контент не изменился) молча игнорируется,
     чтобы повторное нажатие «Обновить» не присылало дублирующее сообщение со статистикой.
+
+    Если `force_answer=True` (навигация в FAQ), то даже при «message is not modified»
+    отправляем новое сообщение, чтобы кнопка ВСЕГДА давала видимый результат.
     """
     if target is None:
         return
@@ -89,7 +93,7 @@ async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
             await edit(text, reply_markup=reply_markup)
             return
         except TelegramBadRequest as e:
-            if _is_not_modified(e):
+            if _is_not_modified(e) and not force_answer:
                 return
         except Exception:
             pass
@@ -99,9 +103,10 @@ async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
 
 
 async def render_callback(callback: CallbackQuery, text: str,
-                          reply_markup: InlineKeyboardMarkup | None = None) -> None:
+                          reply_markup: InlineKeyboardMarkup | None = None,
+                          force_answer: bool = False) -> None:
     """Редактирует сообщение колбэка (с фолбэком на новое) и гасит спиннер."""
-    await edit_or_answer(callback.message, text, reply_markup)
+    await edit_or_answer(callback.message, text, reply_markup, force_answer=force_answer)
     await callback.answer()
 
 
