@@ -12,6 +12,27 @@ DB_PATH = DATA_DIR / "yamobot.db"
 _lock = Lock()
 _conn: sqlite3.Connection | None = None
 
+_MSK_TZ = timezone(timedelta(hours=3))
+
+
+def utc_to_msk(utc_str: str | None) -> str:
+    """Переводит сохранённое в БД UTC-время (строку) в МСК (UTC+3).
+
+    SQLite хранит CURRENT_TIMESTAMP в UTC как наивную строку
+    'YYYY-MM-DD HH:MM:SS'. Интерпретируем её как UTC и переводим в МСК.
+    """
+    if not utc_str:
+        return "—"
+    s = str(utc_str)
+    try:
+        dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", ""))
+        except ValueError:
+            return s
+    return (dt.replace(tzinfo=timezone.utc).astimezone(_MSK_TZ)).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _get_conn() -> sqlite3.Connection:
     global _conn
@@ -499,24 +520,31 @@ def add_stat(bot_id: int, event: str, count: int = 1) -> None:
 def get_stats(bot_id: int) -> dict:
     conn = _get_conn()
 
-    def _sum(evt):
-        row = conn.execute(
-            "SELECT COALESCE(SUM(count), 0) FROM stats WHERE bot_id = ? AND event = ?",
-            (bot_id, evt)
-        ).fetchone()
-        return row[0]
-
     users = get_child_users_count(bot_id)
     mailings_count = conn.execute("SELECT COUNT(*) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
     mailings_sent = conn.execute("SELECT COALESCE(SUM(sent), 0) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
     mailings_failed = conn.execute("SELECT COALESCE(SUM(failed), 0) FROM mailings WHERE bot_id = ?", (bot_id,)).fetchone()[0]
 
+    # Сообщения считаем ТОЛЬКО из таблицы переписки feedback_messages — там каждая
+    # реальная переписка сохраняется ровно один раз (входящее от юзера и ответ
+    # админа). Это гарантирует 100% точность без «накрутки»: раньше первое
+    # сообщение юзера (создание топика) считалось и как «получено», и как
+    # «отправлено», завышая цифры.
+    messages_in = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND direction = 'in'",
+        (bot_id,),
+    ).fetchone()[0]
+    messages_out = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND direction = 'out'",
+        (bot_id,),
+    ).fetchone()[0]
+
     return {
         "users_total": users["total"],
         "users_blocked": users["blocked"],
         "users_active": users["active"],
-        "messages_in": _sum("message_in"),
-        "messages_out": _sum("message_out"),
+        "messages_in": messages_in,
+        "messages_out": messages_out,
         "mailings_count": mailings_count,
         "mailings_sent": mailings_sent,
         "mailings_failed": mailings_failed,

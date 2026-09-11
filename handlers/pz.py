@@ -19,6 +19,7 @@ from services.storage import (
     get_pz_stats,
     get_user_info_from_pz,
     is_user_banned,
+    utc_to_msk,
 )
 
 router = Router()
@@ -235,7 +236,7 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
         # Инфа о юзере
         username = f"@{user_info['username']}" if user_info and user_info.get('username') else "—"
         first_name = user_info.get('first_name', '—') if user_info else '—'
-        first_seen = user_info.get('first_seen', '—')[:16] if user_info else '—'
+        first_seen = utc_to_msk(user_info.get('first_seen'))[:16] if user_info else '—'
 
         # Инфа о топике
         if topic:
@@ -247,7 +248,7 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
                 admin_str = "⏳ без админа"
 
             topic_status = topic.get("status", "open")
-            topic_created = topic.get("created_at", "—")[:16]
+            topic_created = utc_to_msk(topic.get("created_at"))[:16]
         else:
             admin_str = "— (нет ПЗ)"
             topic_status = "—"
@@ -271,8 +272,8 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
             f"<b>Сообщения:</b>\n"
             f"  📩 От юзера: <b>{stats['messages_from_user']}</b>\n"
             f"  📤 Ответов админа: <b>{stats['messages_to_user']}</b>\n"
-            f"  🕐 Первое: {stats['first_message_at'][:16] if stats['first_message_at'] else '—'}\n"
-            f"  🕐 Последнее: {stats['last_message_at'][:16] if stats['last_message_at'] else '—'}"
+            f"  🕐 Первое: {utc_to_msk(stats['first_message_at'])[:16]}\n"
+            f"  🕐 Последнее: {utc_to_msk(stats['last_message_at'])[:16]}"
         )
 
         kb = InlineKeyboardMarkup(inline_keyboard=[

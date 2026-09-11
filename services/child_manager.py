@@ -920,8 +920,6 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 save_feedback_message(bot_id, new_topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
 
-            add_stat(bot_id, "message_out")
-
             try:
                 await _notify_new_pz(bot_id, group_chat_id, new_topic_id)
             except Exception as e:

@@ -1,5 +1,7 @@
 from aiogram import Router, F
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -16,12 +18,15 @@ from services.storage import (
     get_all_users_registry,
     get_user_bots,
     get_admins_all,
+    get_all_bots_flat,
     get_all_topics_for_bot,
     get_stats,
     bot_display_name,
+    utc_to_msk,
     is_registry_user_banned,
     set_registry_user_blocked,
     remove_user_bot,
+    remove_admin,
     get_bound_chat,
     set_bound_chat,
     get_pending_bind,
@@ -43,6 +48,10 @@ _PENDING_BINDS: dict[int, str] = {}
 _LAST_ADDED: dict[int, int] = {}
 
 
+class BroadcastFSM(StatesGroup):
+    waiting_text = State()
+
+
 
 def _user_line(u: dict) -> str:
     name = u.get("username") or u.get("first_name") or str(u["user_id"])
@@ -54,8 +63,105 @@ def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨 Список жалоб", callback_data="complaints_admin")],
         [InlineKeyboardButton(text="👥 Профили пользователей", callback_data="profiles_list")],
+        [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="broadcast")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
     ])
+
+
+# ═══════════════ Рассылка всем пользователям (только супер-админ) ═══════════════
+
+@router.callback_query(F.data == "broadcast")
+async def cb_broadcast(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    all_users = [u for u in get_all_users_registry() if not u.get("blocked")]
+    vld = [u for u in all_users if get_user_bots(u["user_id"])]
+    text = (
+        "📨 <b>Рассылка пользователям</b>\n\n"
+        f"👥 Всего пользователей: <b>{len(all_users)}</b>\n"
+        f"🤖 Только ВЛД (владельцев): <b>{len(vld)}</b>\n\n"
+        "Кому выслать?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Всем", callback_data="broadcast_all")],
+        [InlineKeyboardButton(text="🤖 Только ВЛД", callback_data="broadcast_vld")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+async def _ask_broadcast_message(callback: CallbackQuery, state: FSMContext, mode: str) -> None:
+    await state.set_state(BroadcastFSM.waiting_text)
+    await state.update_data(broadcast_mode=mode)
+    label = "Всем пользователям" if mode == "all" else "Только ВЛД (владельцам)"
+    if callback.message:
+        await try_edit_answer(
+            callback.message,
+            f"📨 <b>Рассылка — {label}</b>\n\n"
+            "Отправь <b>сообщение</b>, которое нужно разослать (текст с HTML "
+            "или премиум-эмодзи).",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_admin")]
+            ]),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_all")
+async def cb_broadcast_all(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await _ask_broadcast_message(callback, state, "all")
+
+
+@router.callback_query(F.data == "broadcast_vld")
+async def cb_broadcast_vld(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await _ask_broadcast_message(callback, state, "vld")
+
+
+@router.message(BroadcastFSM.waiting_text)
+async def fsm_broadcast(message: Message, state: FSMContext) -> None:
+    user_id = msg_uid(message)
+    if not is_super_admin(user_id):
+        await state.clear()
+        return
+    text = message.html_text or message.text or ""
+    if not text.strip():
+        await message.answer("❌ Сообщение не должно быть пустым.")
+        return
+    data = await state.get_data()
+    mode = data.get("broadcast_mode", "all")
+    await state.clear()
+
+    recipients = [u for u in get_all_users_registry() if not u.get("blocked")]
+    if mode == "vld":
+        recipients = [u for u in recipients if get_user_bots(u["user_id"])]
+
+    await message.answer(f"📨 Рассылка запущена... 👥 {len(recipients)}")
+    ok, fail = 0, 0
+    for u in recipients:
+        if u["user_id"] == user_id:
+            continue
+        try:
+            await message.bot.send_message(u["user_id"], text)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    await message.answer(
+        f"📨 <b>Рассылка завершена</b>\n\n"
+        f"👥 Получателей: <b>{len(recipients)}</b>\n"
+        f"✅ Доставлено: <b>{ok}</b>\n"
+        f"❌ Ошибок: <b>{fail}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")]
+        ]),
+    )
 
 
 def profiles_kb(users: list[dict]) -> InlineKeyboardMarkup:
@@ -401,12 +507,52 @@ async def cb_profiles_list(callback: CallbackQuery) -> None:
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    users = get_all_users_registry()
-    if not users:
-        await render_callback(callback, "👥 <b>Профили</b>\n\nПока нет пользователей.", admin_kb())
+    all_users = get_all_users_registry()
+    vld_count = sum(1 for u in all_users if get_user_bots(u["user_id"]))
+    bots_count = len(get_all_bots_flat())
+    text = (
+        "👥 <b>Профили пользователей</b>\n\n"
+        f"Всего пользователей: <b>{len(all_users)}</b>\n"
+        f"🤖 ВЛД (владельцы ботов): <b>{vld_count}</b>\n"
+        f"👥 Админы (по ботам): <b>{bots_count}</b>\n\n"
+        "Выбери категорию:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 ВЛД (владельцы)", callback_data="profiles_vld")],
+        [InlineKeyboardButton(text="👥 Админы (по ботам)", callback_data="profiles_admins_bots")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+# ═══════════════ ВЛД — владельцы (у кого есть хотя бы один бот) ═══════════════
+
+def _vld_kb(users: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for u in users:
+        name = u.get("username") or u.get("first_name") or str(u["user_id"])
+        status = "🚫" if u.get("blocked") else "🟢"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} {name} ({len(get_user_bots(u['user_id']))} бот.)",
+            callback_data=f"profile_view_{u['user_id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "profiles_vld")
+async def cb_profiles_vld(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    text = f"👥 <b>Профили пользователей</b> ({len(users)})\n\nВыбери пользователя:"
-    await render_callback(callback, text, profiles_kb(users))
+    vld = [u for u in get_all_users_registry() if get_user_bots(u["user_id"])]
+    if not vld:
+        await render_callback(
+            callback, "🤖 <b>ВЛД</b>\n\nПока нет владельцев с ботами.", admin_kb()
+        )
+        return
+    text = f"🤖 <b>ВЛД — владельцы</b> ({len(vld)})\n\nВыбери владельца:"
+    await render_callback(callback, text, _vld_kb(vld))
 
 
 @router.callback_query(F.data.startswith("profile_view_"))
@@ -425,7 +571,7 @@ async def cb_profile_view(callback: CallbackQuery) -> None:
     text = (
         f"👤 <b>{u.get('username') or u.get('first_name') or uid}</b>\n"
         f"🆔 ID: <code>{uid}</code>\n"
-        f"📅 Регистрация: {u.get('created_at', '—')[:10]}\n"
+        f"📅 Регистрация: {utc_to_msk(u.get('created_at'))[:10]}\n"
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"📌 Статус: {status}"
     )
@@ -450,6 +596,117 @@ async def cb_profile_unban(callback: CallbackQuery) -> None:
     uid = int(cb_data(callback).split("_")[-1])
     set_registry_user_blocked(uid, False)
     await render_callback(callback, f"✅ Пользователь <code>{uid}</code> разбанен.", profile_admin_kb(uid))
+
+
+# ═══════════════ Админы (по ботам) ═══════════════
+
+def _admins_bots_kb(bots: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for b in bots:
+        owner = b.get("owner_id", 0)
+        admins = get_admins_all(owner) if owner else []
+        label = f"{bot_display_name(b)} ⸱ 🆔 {b['id']} ⸱ адм.{len(admins)}"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"profiles_a_bot_{b['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "profiles_admins_bots")
+async def cb_profiles_admins_bots(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    bots = get_all_bots_flat()
+    if not bots:
+        await render_callback(callback, "👥 <b>Админы</b>\n\nБотов пока нет.", admin_kb())
+        return
+    text = f"👥 <b>Админы — по ботам</b> ({len(bots)} ботов)\n\nВыбери бот:"
+    await render_callback(callback, text, _admins_bots_kb(bots))
+
+
+def _bot_admins_kb(bot_id: int, owner_id: int, admins: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for a in admins:
+        uname = f"@{a['username']}" if a.get("username") else f"ID:{a['user_id']}"
+        banned = is_registry_user_banned(a["user_id"])
+        ban_action = "✅ Разбанить" if banned else "🚫 Забанить"
+        ban_data = f"profiles_a_unban_{a['user_id']}" if banned else f"profiles_a_ban_{a['user_id']}"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"👤 #{a['tag']} ({uname})",
+                callback_data=f"profile_view_{a['user_id']}",
+            ),
+            InlineKeyboardButton(text="🗑", callback_data=f"profiles_a_del_{owner_id}_{a['user_id']}"),
+        ])
+        rows.append([InlineKeyboardButton(text=ban_action, callback_data=ban_data)])
+    rows.append([InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_bot_\d+$"))
+async def cb_profiles_a_bot(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    bot_id = int(cb_data(callback).split("_")[-1])
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        await callback.answer("Бот не найден")
+        return
+    owner_id = bot.get("owner_id", 0)
+    admins = get_admins_all(owner_id)
+    if not admins:
+        await render_callback(
+            callback,
+            f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 {bot_id})\n\nУ владельца нет админов.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots")]
+            ]),
+        )
+        return
+    text = (
+        f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 <code>{bot_id}</code>)\n\n"
+        f"Владелец: <code>{owner_id}</code>\n"
+        f"Админов: <b>{len(admins)}</b>\n\n"
+        "Выбери действие:"
+    )
+    await render_callback(callback, text, _bot_admins_kb(bot_id, owner_id, admins))
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_del_\d+_\d+$"))
+async def cb_profiles_a_del(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    parts = cb_data(callback).split("_")
+    owner_id = int(parts[3])
+    admin_uid = int(parts[4])
+    remove_admin(owner_id, admin_uid)
+    await callback.answer("✅ Админ удалён")
+    await cb_profiles_admins_bots(callback)
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_ban_\d+$"))
+async def cb_profiles_a_ban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    admin_uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(admin_uid, True)
+    await callback.answer("🚫 Пользователь забанен")
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_unban_\d+$"))
+async def cb_profiles_a_unban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    admin_uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(admin_uid, False)
+    await callback.answer("✅ Пользователь разбанен")
 
 
 @router.callback_query(F.data.startswith("profile_stats_"))

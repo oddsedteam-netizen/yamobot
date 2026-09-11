@@ -25,6 +25,7 @@ from services.storage import (
     get_admin_active_topics_list,
     get_all_admins_stats,
     create_admin_invite,
+    utc_to_msk,
 )
 
 router = Router()
@@ -169,7 +170,7 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
         history_lines = []
         for h in history:
             old = f"#{h['old_tag']}" if h['old_tag'] else "—"
-            history_lines.append(f"  {old} → #{h['new_tag']} ({h['changed_at'][:10]})")
+            history_lines.append(f"  {old} → #{h['new_tag']} ({utc_to_msk(h['changed_at'])[:10]})")
         history_text = "\n\n🏷 <b>История тегов:</b>\n" + "\n".join(history_lines)
 
     text = (
@@ -178,7 +179,7 @@ async def cb_admin_view(callback: CallbackQuery, state: FSMContext) -> None:
         f"🆔 ID: <code>{admin['user_id']}</code>\n"
         f"🏷 Тег: <b>#{admin['tag']}</b>\n"
         f"📌 Статус: {status}\n"
-        f"📅 Добавлен: {admin['created_at'][:10]}\n\n"
+        f"📅 Добавлен: {utc_to_msk(admin['created_at'])[:10]}\n\n"
         f"📊 <b>Сообщения:</b>\n"
         f"  📅 День: <b>{stats['day']}</b>  📅 Неделя: <b>{stats['week']}</b>\n"
         f"  📅 Месяц: <b>{stats['month']}</b>  📊 Всего: <b>{stats['total']}</b>\n"
@@ -703,7 +704,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         history_lines = []
         for h in history:
             old = f"#{h['old_tag']}" if h['old_tag'] else "—"
-            history_lines.append(f"  {old} → #{h['new_tag']} ({h['changed_at'][:10]})")
+            history_lines.append(f"  {old} → #{h['new_tag']} ({utc_to_msk(h['changed_at'])[:10]})")
         history_text = "\n🏷 История тегов:\n" + "\n".join(history_lines)
 
     text = (
@@ -712,7 +713,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         f"🆔 ID: <code>{admin['user_id']}</code>\n"
         f"🏷 Тег: #{admin['tag']}\n"
         f"📌 Статус: {status}\n"
-        f"📅 Добавлен: {admin['created_at'][:10]}\n\n"
+        f"📅 Добавлен: {utc_to_msk(admin['created_at'])[:10]}\n\n"
         f"📊 <b>Сообщения:</b>\n"
         f"  📅 День: <b>{stats['day']}</b>\n"
         f"  📅 Неделя: <b>{stats['week']}</b>\n"

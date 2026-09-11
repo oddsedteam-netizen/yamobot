@@ -114,14 +114,19 @@ async def cb_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "all_mailing")
 async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = cb_uid(callback)
-    bots = [b for b in get_user_bots(user_id) if not b.get("stopped")]
+    # Рассылка идёт ТОЛЬКО в ботов категории «стандарт». Боты-анкетницы
+    # не участвуют в рассылках.
+    bots = [
+        b for b in get_user_bots(user_id)
+        if not b.get("stopped") and (b.get("bot_type") or "standard") == "standard"
+    ]
 
     if not bots:
         await safe_edit(
             callback.message,
-            "📨 <b>Рассылка для всех ботов</b>\n\n"
-            "⚠️ Нет запущенных ботов.\n"
-            "Остановленные боты не участвуют в рассылке.",
+            "📨 <b>Рассылка — только стандарт-боты</b>\n\n"
+            "⚠️ Нет запущенных ботов категории «стандарт» для рассылки.\n"
+            "Остановленные и боты-анкетницы не участвуют в рассылке.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
             ]),
@@ -139,8 +144,8 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
     if total_users == 0:
         await safe_edit(
             callback.message,
-            "📨 <b>Рассылка для всех ботов</b>\n\n"
-            "❌ Ни у одного бота нет активных пользователей.",
+            "📨 <b>Рассылка — только стандарт-боты</b>\n\n"
+            "❌ Ни у одного стандарт-бота нет активных пользователей.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
             ]),
@@ -155,9 +160,10 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
     )
 
     text = (
-        f"📨 <b>Рассылка для ВСЕХ ботов</b>\n\n"
+        f"📨 <b>Рассылка — только стандарт-боты</b>\n\n"
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"👥 Всего активных пользователей: <b>{total_users}</b>\n\n"
+        f"<i>Боты-анкетницы пропускаются.</i>\n\n"
         f"Отправь <b>сообщение для рассылки</b>.\n\n"
         f"Поддерживается:\n"
         f"• текст, фото, видео, GIF, документ, стикер\n"
