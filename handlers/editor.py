@@ -39,8 +39,10 @@ class EditorFSM(StatesGroup):
 def editor_kb(bot_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Изменить приветствие", callback_data=f"edit_welcome_{bot_id}")],
-        [InlineKeyboardButton(text="🔗 Линки", callback_data=f"edit_links_{bot_id}")],
-        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")],
+        [
+            InlineKeyboardButton(text="🔗 Линки", callback_data=f"edit_links_{bot_id}"),
+            InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}"),
+        ],
     ])
 
 

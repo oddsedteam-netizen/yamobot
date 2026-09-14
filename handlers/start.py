@@ -76,6 +76,13 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 async def _show_main(message: Message) -> None:
     await message.answer(_welcome_text_with_version(), reply_markup=main_menu_kb())
+    # Инлайн-кнопка на FAQ — под приветствием при каждом новом запуске (/start, /menu).
+    await message.answer(
+        "❓ <b>Есть вопросы?</b> Загляни в FAQ — там ответы на частые вопросы.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❓ FAQ", callback_data="faq")]
+        ]),
+    )
 
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -305,10 +312,15 @@ FAQ_TEXT = (
 
 def faq_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Админы", callback_data="faq_admins")],
-        [InlineKeyboardButton(text="🤖 Боты", callback_data="faq_bots")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="faq_profile")],
-        [InlineKeyboardButton(text="⌨️ Команды", callback_data="faq_commands")],
+        [
+            InlineKeyboardButton(text="👥 Админы", callback_data="faq_admins"),
+            InlineKeyboardButton(text="🤖 Боты", callback_data="faq_bots"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data="faq_profile"),
+            InlineKeyboardButton(text="⌨️ Команды", callback_data="faq_commands"),
+        ],
+        [InlineKeyboardButton(text="⚙️ Основные настройки бота", callback_data="faq_settings")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
     ])
 
@@ -429,6 +441,47 @@ async def cb_faq_admins(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "faq_bots")
 async def cb_faq_bots(callback: CallbackQuery) -> None:
     await render_callback(callback, FAQ_BOTS, _faq_back_kb(), force_answer=True)
+
+
+FAQ_SETTINGS = (
+    "⚙️ <b>Основные настройки бота</b>\n\n"
+    "Здесь собрано главное: как редактировать бота и как подключить его "
+    "к рабочему чату.\n\n"
+    "—— <b>Как отредактировать бота</b> ——\n"
+    "1. В меню <b>«🤖 Боты»</b> нажми на нужного бота — откроется его карточка "
+    "со статусом, приветствием и списком действий.\n"
+    "2. Нажми <b>«✏️ Редактор»</b>.\n"
+    "3. <b>«💬 Изменить приветствие»</b> — отправь новый текст приветствия. "
+    "Поддерживаются HTML-разметка и премиум-эмодзи.\n"
+    "4. <b>«🔗 Линки»</b> — добавь кнопки-ссылки к приветствию: укажи название "
+    "кнопки и её ссылку. Кнопки появятся прямо под приветствием у всех новых "
+    "пользователей, их можно удалять по одной.\n"
+    "5. Изменения применяются сразу — бот автоматически перезапускается "
+    "и подхватывает новое приветствие и кнопки.\n"
+    "6. В карточке бота также доступны: <b>«🛡 Антиспам»</b>, "
+    "<b>«🕶 Аноним»</b>, <b>«📊 Статистика»</b>, <b>«📨 Рассылка»</b> "
+    "и <b>«📋 ПЗ»</b>.\n\n"
+    "Чтобы отредактировать несколько ботов сразу, открой <b>«📌 Выбрать все»</b>: "
+    "там общий редактор, общая рассылка и статистика по всем ботам.\n\n"
+    "—— <b>Как подключить бота к рабочему чату</b> ——\n"
+    "Дочерний бот работает только в чатах с темами (топиками). Чтобы он начал "
+    "принимать обращения:\n"
+    "1. Создай или выбери групповой чат и включи в нём темы.\n"
+    "2. Добавь дочернего бота в этот чат и выдай ему <b>права администратора</b> "
+    "— без этого он не сможет создавать и переименовывать топики.\n"
+    "3. В общей теме <b>General</b> напиши команду <code>/connect</code> — "
+    "бот подключит этот чат.\n"
+    "4. Готово: теперь все, кто напишет боту в личку, будут создавать топики "
+    "в этом чате, а админы смогут отвечать в них.\n\n"
+    "Если бот завис или перестал отвечать — открой <b>«👤 Профиль»</b> "
+    "и нажми <b>«🔄 Полный перезапуск»</b>: это перезапустит всех твоих "
+    "дочерних ботов без удаления и перепривязки."
+)
+
+
+@router.callback_query(F.data == "faq_settings")
+async def cb_faq_settings(callback: CallbackQuery) -> None:
+    await render_callback(callback, FAQ_SETTINGS, _faq_back_kb(), force_answer=True)
 
 
 FAQ_PROFILE = (

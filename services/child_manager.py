@@ -1012,6 +1012,8 @@ class ChildManager:
         self._stopping: set[int] = set()
         # Счётчик попыток автоперезапуска после аварийного падения.
         self._restart_attempts: dict[int, int] = {}
+        # Боты, для которых уже идёт ретрай-цикл перезапуска (защита от дублей).
+        self._restarting: set[int] = set()
 
     async def start_child(self, bot_data: dict) -> bool:
         bot_id = bot_data["id"]
@@ -1039,7 +1041,12 @@ class ChildManager:
             logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
             child_dp = _make_child_dp(fresh, child_bot)
-            await child_bot.delete_webhook(drop_pending_updates=True)
+            try:
+                await child_bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                # Конфликт/сетевые ошибки не должны ронять запуск: сам polling
+                # обработает конфликт (409), а ретрай-цикл доведёт бота до старта.
+                logger.warning("Не удалось сбросить webhook бота %s: %s", bot_id, e)
 
             task = asyncio.create_task(child_dp.start_polling(child_bot), name=f"child_{bot_id}")
             task.add_done_callback(self._make_task_done_callback(bot_id))
@@ -1080,20 +1087,36 @@ class ChildManager:
         return _on_done
 
     async def _restart_bot_later(self, bot_id: int) -> None:
-        """Через паузу перезапускает бота, если он не был остановлен вручную."""
-        await asyncio.sleep(5)
-        if bot_id in self._stopping:
+        """Перезапускает упавший бот с нарастающей паузой, пока он не поднимется.
+
+        Бот может временно падать из-за конфликта токена (например, он ещё
+        подключён к livegram или другому сервису). После отвязки такой бот
+        должен подняться САМ, без удаления и повторного добавления — поэтому
+        ретраим не ограничиваем тремя попытками, а наращиваем паузу:
+        5 → 15 → 30 → 60с (далее каждые 60с).
+        """
+        if bot_id in self._restarting:
             return
-        fresh = get_bot_by_id_any_owner(bot_id)
-        if not fresh or fresh.get("stopped"):
-            return
-        attempts = self._restart_attempts.get(bot_id, 0)
-        if attempts >= 3:
-            logger.error("Бот %s падает повторно — отключаю автоперезапуск", bot_id)
-            return
-        self._restart_attempts[bot_id] = attempts + 1
-        logger.info("Перезапускаю упавший бот %s (попытка %d/3)", bot_id, attempts + 1)
-        await self.start_child(fresh)
+        self._restarting.add(bot_id)
+        try:
+            delay = min(5 * (2 ** self._restart_attempts.get(bot_id, 0)), 60)
+            await asyncio.sleep(delay)
+
+            if bot_id in self._stopping:
+                return
+            fresh = get_bot_by_id_any_owner(bot_id)
+            if not fresh or fresh.get("stopped"):
+                return
+
+            attempts = self._restart_attempts.get(bot_id, 0)
+            self._restart_attempts[bot_id] = attempts + 1
+            logger.info(
+                "Перезапускаю упавший бот %s (попытка %d, пауза %.0fс)",
+                bot_id, attempts + 1, delay,
+            )
+            await self.start_child(fresh)
+        finally:
+            self._restarting.discard(bot_id)
 
     async def stop_child(self, bot_id: int) -> bool:
         if bot_id not in self._tasks:
@@ -1122,6 +1145,30 @@ class ChildManager:
     async def restart_child(self, bot_data: dict) -> bool:
         await self.stop_child(bot_data["id"])
         return await self.start_child(bot_data)
+
+    async def restart_all_for_owner(self, owner_id: int) -> dict:
+        """Полный перезапуск всех дочерних ботов владельца.
+
+        Используется кнопкой «🔄 Полный перезапуск» в профиле: перезапускает
+        всех ботов владельца, чтобы «разбудить» зависших — без удаления и
+        перепривязки чатов.
+        """
+        bots = [
+            b for b in get_all_bots_flat()
+            if b.get("owner_id") == owner_id and not b.get("stopped")
+        ]
+        results = await asyncio.gather(
+            *(self.restart_child(b) for b in bots),
+            return_exceptions=True,
+        )
+        ok = 0
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error("Ошибка полного перезапуска: %s", res)
+            elif res:
+                ok += 1
+        logger.info("Полный перезапуск владельца %s: %s/%s", owner_id, ok, len(bots))
+        return {"total": len(bots), "ok": ok}
 
     async def start_all_children(self) -> None:
         all_bots = get_all_bots_flat()

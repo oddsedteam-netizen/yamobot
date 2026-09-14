@@ -10,6 +10,7 @@ from handlers._common import render_callback, cb_data, cb_uid
 from services.child_manager import ChildManager
 from services.storage import (
     add_user_bot, bot_display_name, set_bot_type, set_bot_keyboard,
+    get_feedback_chat,
 )
 router = Router()
 
@@ -97,7 +98,6 @@ async def cb_choose_bot_type(callback: CallbackQuery, state: FSMContext,
 
 async def _finish_add(callback: CallbackQuery, state: FSMContext,
                       child_manager: ChildManager) -> None:
-    from handlers.start import main_menu_kb
     data = await state.get_data()
     info = data.get('bot_info')
     bot_type = data.get('bot_type', 'standard')
@@ -116,10 +116,58 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
         await asyncio.sleep(1.0)
         if not child_manager.is_running(info['id']):
             ok = False
-    status = 'Бот запущен' if ok else 'Бот сохранён, но не удалось запустить'
-    text = ('✅ <b>Бот подключён!</b>\n\n'
-            f'🤖 {bot_display_name(info)}\n'
-            f'Тип: <b>{REPLY_PRESETS[preset_key]["label"]}</b>\n'
-            f'Статус: {status}')
+    status = '🟢 Бот запущен' if ok else '⚠️ Бот сохранён, но не удалось запустить'
+    name = bot_display_name(info)
+    username = info.get('username', '')
+    bot_link = f"https://t.me/{username}" if username else f"бот (ID <code>{info['id']}</code>)"
+
+    text = (
+        '✅ <b>Бот подключён!</b>\n\n'
+        f'🤖 {name}\n'
+        f'Тип: <b>{REPLY_PRESETS[preset_key]["label"]}</b>\n'
+        f'Статус: {status}\n\n'
+        f'Теперь добавь бота {bot_link} в рабочий чат с темами, '
+        'выдай ему права администратора и напиши команду '
+        '<code>/connect</code> в тему <b>General</b>, чтобы бот начал работу.'
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text='▶️ Заработал', callback_data=f'addbot_done_{info["id"]}'),
+            InlineKeyboardButton(text='⏭ Пропустить', callback_data='addbot_skip'),
+        ],
+    ])
     if callback.message:
-        await callback.message.answer(text, reply_markup=main_menu_kb())
+        await callback.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == 'addbot_skip')
+async def cb_addbot_skip(callback: CallbackQuery) -> None:
+    from handlers.start import main_menu_kb
+    if callback.message:
+        await callback.message.answer(
+            '👌 Ок. Когда захочешь подключить бота к рабочему чату — '
+            'добавь его туда и напиши <code>/connect</code> в тему <b>General</b>.',
+            reply_markup=main_menu_kb(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith('addbot_done_'))
+async def cb_addbot_done(callback: CallbackQuery) -> None:
+    from handlers.start import main_menu_kb
+    bot_id = int(cb_data(callback).split('_')[-1])
+    connected = get_feedback_chat(bot_id) is not None
+    if not connected:
+        await callback.answer(
+            '⚠️ Команда /connect ещё не получена. Добавь бота в рабочий чат '
+            'с темами и напиши /connect в теме General, затем нажми снова.',
+            show_alert=True,
+        )
+        return
+    if callback.message:
+        await callback.message.answer(
+            '✅ <b>Бот работает!</b>\n\nЧат подключён — новые обращения будут '
+            'создавать топики в рабочем чате.',
+            reply_markup=main_menu_kb(),
+        )
+    await callback.answer()

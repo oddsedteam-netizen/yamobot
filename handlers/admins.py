@@ -44,13 +44,19 @@ class AdminFSM(StatesGroup):
 def admins_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list")],
-            [InlineKeyboardButton(text="📊 Статистика админов", callback_data="gadmins_stats")],
-            [InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")],
+            [
+                InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats"),
+            ],
+            [
+                InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add"),
+                InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del"),
+            ],
             [InlineKeyboardButton(text="🔗 Добавить админа ссылкой", callback_data="gadmins_addlink")],
-            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del")],
-            [InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit")],
-            [InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search")],
+            [
+                InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit"),
+                InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
         ]
     )
@@ -61,16 +67,20 @@ def admins_list_kb(extra_rows: list[list[InlineKeyboardButton]] | None = None) -
     if extra_rows:
         rows.extend(extra_rows)
     rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")])
-    rows.append([InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins"),
+        InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Изменить тег", callback_data=f"gadmins_editone_{admin_user_id}")],
-            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"gadmins_delone_{admin_user_id}")],
+            [
+                InlineKeyboardButton(text="✏️ Изменить тег", callback_data=f"gadmins_editone_{admin_user_id}"),
+                InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"gadmins_delone_{admin_user_id}"),
+            ],
             [InlineKeyboardButton(text="⬅️ К списку", callback_data="gadmins_list")],
         ]
     )

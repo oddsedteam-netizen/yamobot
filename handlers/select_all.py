@@ -14,11 +14,15 @@ router = Router()
 
 def select_all_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Рассылка", callback_data="all_mailing")],
-        [InlineKeyboardButton(text="✏️ Редактор", callback_data="all_editor")],
-        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="all_stats")],
-        [InlineKeyboardButton(text="⛔ Остановить все", callback_data="all_stop")],
-        [InlineKeyboardButton(text="▶️ Запустить все", callback_data="all_start_all")],
+        [
+            InlineKeyboardButton(text="📨 Рассылка", callback_data="all_mailing"),
+            InlineKeyboardButton(text="✏️ Редактор", callback_data="all_editor"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="all_stats"),
+        ],
+        [
+            InlineKeyboardButton(text="⛔ Остановить все", callback_data="all_stop"),
+            InlineKeyboardButton(text="▶️ Запустить все", callback_data="all_start_all"),
+        ],
         [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots")],
     ])
 

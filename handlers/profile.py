@@ -12,6 +12,7 @@ from aiogram.types import (
 from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
                               cb_uid, cb_username, cb_firstname, msg_uid,
                               msg_username, msg_firstname, try_edit_answer)
+from services.child_manager import ChildManager
 from services.config import is_super_admin
 from services.constants import BOT_VERSION
 from services.storage import (
@@ -61,8 +62,10 @@ def _user_line(u: dict) -> str:
 
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Список жалоб", callback_data="complaints_admin")],
-        [InlineKeyboardButton(text="👥 Профили пользователей", callback_data="profiles_list")],
+        [
+            InlineKeyboardButton(text="📨 Список жалоб", callback_data="complaints_admin"),
+            InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list"),
+        ],
         [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="broadcast")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
     ])
@@ -219,23 +222,31 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots")],
-        [InlineKeyboardButton(text="👥 Админы", callback_data="gadmins")],
-        [InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz")],
-        [InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work")],
-        [InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin")],
+        [
+            InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots"),
+            InlineKeyboardButton(text="👥 Админы", callback_data="gadmins"),
+            InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz"),
+        ],
+        [
+            InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work"),
+            InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin"),
+        ],
+        [
+            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer"),
+            InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all"),
+        ],
     ])
+    unbind_row = []
     if work_chat:
-        kb.inline_keyboard.append([
+        unbind_row.append(
             InlineKeyboardButton(text="❌ Отвязать чат работы", callback_data="unbind_work")
-        ])
+        )
     if admin_chat:
-        kb.inline_keyboard.append([
+        unbind_row.append(
             InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin")
-        ])
-    kb.inline_keyboard.append([
-        InlineKeyboardButton(text="👑 Передать права", callback_data="transfer")
-    ])
+        )
+    if unbind_row:
+        kb.inline_keyboard.append(unbind_row)
     if is_super_admin(user_id):
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
@@ -258,6 +269,27 @@ async def cb_profile_show(callback: CallbackQuery) -> None:
         return
     text, kb = _profile_payload(cb_uid(callback), cb_firstname(callback) or "—")
     await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "profile_restart_all")
+async def cb_profile_restart_all(callback: CallbackQuery,
+                                 child_manager: ChildManager) -> None:
+    """«🔄 Полный перезапуск» — перезапускает всех дочерних ботов владельца.
+
+    Помогает, когда боты зависли или перестали отвечать: не нужно отвязывать
+    и привязывать заново — просто перезапускаем всё одним нажатием.
+    """
+    user_id = cb_uid(callback)
+    result = await child_manager.restart_all_for_owner(user_id)
+    text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
+    if result["total"]:
+        status = (
+            f"🔄 <b>Полный перезапуск завершён:</b> "
+            f"{result['ok']} из {result['total']} ботов перезапущено."
+        )
+    else:
+        status = "🔄 У тебя нет запущенных ботов для перезапуска."
+    await render_callback(callback, f"{status}\n\n{text}", kb)
 
 
 # ═══════════════ Передача прав владельца ═══════════════
