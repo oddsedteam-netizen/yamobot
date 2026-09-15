@@ -121,6 +121,35 @@ def _migrate_admin_invites(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_antiraid_del_links_default(conn: sqlite3.Connection) -> None:
+    """Одноразово включает отзыв ссылок в антирейде у существующих владельцев.
+
+    Раньше «Удаление ссылок» (del_links) по умолчанию было выключено, из-за чего
+    даже при срабатывании антирейда ссылка-приглашение оставалась активной и
+    рейдеры могли вернуться по ней же. Миграция включается ОДИН раз (флаг в _meta),
+    чтобы потом не перетирать осознанный выбор владельца в профиле.
+    """
+    try:
+        done = conn.execute(
+            "SELECT 1 FROM _meta WHERE key = 'antiraid_del_links_default'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # _meta мог не существовать на самом старом наборе БД — пересоздадим.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT DEFAULT '')"
+        )
+        done = conn.execute(
+            "SELECT 1 FROM _meta WHERE key = 'antiraid_del_links_default'"
+        ).fetchone()
+    if done:
+        return
+    conn.execute("UPDATE antiraid_settings SET del_links = 1 WHERE del_links = 0")
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('antiraid_del_links_default', '1')"
+    )
+    conn.commit()
+
+
 
 def ensure_db() -> None:
     conn = _get_conn()
@@ -311,6 +340,23 @@ def ensure_db() -> None:
             added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (owner_id, user_id)
         );
+
+        -- Настройки антирейда для «чата админов» владельца.
+        CREATE TABLE IF NOT EXISTS antiraid_settings (
+            owner_id        INTEGER PRIMARY KEY,
+            enabled         INTEGER DEFAULT 0,
+            threshold       INTEGER DEFAULT 10,
+            del_links       INTEGER DEFAULT 1,
+            del_members     INTEGER DEFAULT 0,
+            triggered       INTEGER DEFAULT 0,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Служебные флаги миграций (одноразовые действия).
+        CREATE TABLE IF NOT EXISTS _meta (
+            key     TEXT PRIMARY KEY,
+            value   TEXT DEFAULT ''
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
@@ -318,6 +364,7 @@ def ensure_db() -> None:
     _migrate_registry_chats(conn)
     _migrate_registry_pending_bind(conn)
     _migrate_admin_invites(conn)
+    _migrate_antiraid_del_links_default(conn)
     conn.commit()
 
 
@@ -1686,6 +1733,83 @@ def get_pending_bind(user_id: int) -> str | None:
         return None
     val = (row[0] or "").strip()
     return val if val else None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Антирейд «чата админов»
+# ═══════════════════════════════════════════════════════════
+
+_ANTIRAID_DEFAULTS = {
+    "enabled": 0,
+    "threshold": 10,
+    # «Удаление ссылок» включено по умолчанию: при рейде ссылку-приглашение
+    # надо отзывать, чтобы рейдеры не вернулись по ней же.
+    "del_links": 1,
+    "del_members": 0,
+    "triggered": 0,
+}
+
+
+def get_antiraid_settings(owner_id: int) -> dict:
+    """Настройки антирейда владельца (с значениями по умолчанию)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM antiraid_settings WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    settings = dict(_ANTIRAID_DEFAULTS)
+    if row:
+        for k in settings:
+            if k in row.keys():
+                settings[k] = row[k]
+    settings["enabled"] = int(settings.get("enabled") or 0)
+    settings["threshold"] = max(1, int(settings.get("threshold") or 10))
+    settings["del_links"] = int(settings.get("del_links") or 0)
+    settings["del_members"] = int(settings.get("del_members") or 0)
+    settings["triggered"] = int(settings.get("triggered") or 0)
+    return settings
+
+
+def set_antiraid_field(owner_id: int, field: str, value) -> bool:
+    """Обновляет одно поле настроек антирейда владельца."""
+    if field not in _ANTIRAID_DEFAULTS:
+        return False
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            f"INSERT INTO antiraid_settings (owner_id, {field}) VALUES (?, ?) "
+            f"ON CONFLICT(owner_id) DO UPDATE SET {field}=excluded.{field}, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (owner_id, int(value)),
+        )
+        conn.commit()
+    return True
+
+
+def set_antiraid_enabled(owner_id: int, enabled: bool) -> bool:
+    return set_antiraid_field(owner_id, "enabled", 1 if enabled else 0)
+
+
+def set_antiraid_threshold(owner_id: int, threshold: int) -> bool:
+    return set_antiraid_field(owner_id, "threshold", max(1, int(threshold)))
+
+
+def set_antiraid_del_links(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "del_links", 1 if value else 0)
+
+
+def set_antiraid_del_members(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "del_members", 1 if value else 0)
+
+
+def set_antiraid_triggered(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "triggered", 1 if value else 0)
+
+
+def reset_all_antiraid_triggered() -> None:
+    """Сбрасывает флаг сработавшего антирейда у всех владельцев (при старте бота)."""
+    conn = _get_conn()
+    conn.execute("UPDATE antiraid_settings SET triggered = 0")
+    conn.commit()
 
 
 def get_admin_active_topics_list(owner_id: int, admin_user_id: int) -> list[dict]:

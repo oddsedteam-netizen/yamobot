@@ -126,9 +126,9 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
         f'🤖 {name}\n'
         f'Тип: <b>{REPLY_PRESETS[preset_key]["label"]}</b>\n'
         f'Статус: {status}\n\n'
-        f'Теперь добавь бота {bot_link} в рабочий чат с темами, '
-        'выдай ему права администратора и напиши команду '
-        '<code>/connect</code> в тему <b>General</b>, чтобы бот начал работу.'
+        f'Теперь добавь бота {bot_link} в рабочий чат с темами — '
+        'бот <b>подключится сам</b>, как только окажется в чате с '
+        'включёнными темами. Никаких команд вводить не нужно.'
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -146,7 +146,9 @@ async def cb_addbot_skip(callback: CallbackQuery) -> None:
     if callback.message:
         await callback.message.answer(
             '👌 Ок. Когда захочешь подключить бота к рабочему чату — '
-            'добавь его туда и напиши <code>/connect</code> в тему <b>General</b>.',
+            'просто добавь его туда (с включёнными темами): бот подключится сам. '
+            'Если вдруг не подключится — напиши <code>/connect</code> в тему '
+            '<b>General</b>.',
             reply_markup=main_menu_kb(),
         )
     await callback.answer()
@@ -159,8 +161,9 @@ async def cb_addbot_done(callback: CallbackQuery) -> None:
     connected = get_feedback_chat(bot_id) is not None
     if not connected:
         await callback.answer(
-            '⚠️ Команда /connect ещё не получена. Добавь бота в рабочий чат '
-            'с темами и напиши /connect в теме General, затем нажми снова.',
+            '⚠️ Бот ещё не подключился к рабочему чату. Добавь его в чат '
+            'с включёнными темами — он подключится сам. Если не подключился '
+            'сам, напиши /connect в теме General, затем нажми снова.',
             show_alert=True,
         )
         return

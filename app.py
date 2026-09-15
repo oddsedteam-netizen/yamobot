@@ -12,7 +12,7 @@ from handlers import register_all_handlers
 from services.child_manager import ChildManager
 from services.config import BOT_TOKEN, OWNER_ID
 from services.constants import BOT_VERSION
-from services.storage import ensure_db
+from services.storage import ensure_db, reset_all_antiraid_triggered
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -47,6 +47,9 @@ def load_token() -> str:
 
 async def main() -> None:
     ensure_db()
+    # После рестарта бота сбрасываем флаг сработавшего антирейда: если чат
+    # остался заблокированным, владелец сам выключит защиту через /выкланти.
+    reset_all_antiraid_triggered()
     token = load_token()
 
     bot = Bot(

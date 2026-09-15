@@ -8,11 +8,12 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ContentType, ChatType
+from aiogram.enums import ParseMode, ContentType, ChatType, ChatMemberStatus
 from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -25,6 +26,7 @@ from aiogram.types import (
 from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
                               try_edit_answer, try_edit)
+from services.constants import BOT_CREDIT
 
 from services.storage import (
     add_child_user,
@@ -372,6 +374,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if is_bot_anonymous(bot_id):
             welcome = f"{welcome}\n\n🕶 <b>Анонимный режим включён.</b>"
 
+        # В самом низу любого приветствия — плашка-кредит.
+        welcome = f"{welcome}{BOT_CREDIT}"
+
         # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
         # В одном сообщении reply- и inline-клавиатуру показать нельзя, поэтому
         # приветствие отправляется РОВНО ОДИН раз, а reply-клавиатура (если она
@@ -398,11 +403,77 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     @child_dp.message(Command("connect"), F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
     async def cmd_connect_group(message: Message) -> None:
         chat = message.chat
+        is_forum = bool(getattr(chat, "is_forum", False))
+        if not is_forum:
+            await message.answer(
+                "⚠️ <b>В этом чате не включены темы.</b>\n\n"
+                "Включи «Темы» в настройках чата, после чего напиши "
+                "<code>/connect</code> ещё раз — тогда бот начнёт работу."
+            )
+            return
         set_feedback_chat(bot_id, chat.id)
         await message.answer(
             f"✅ Чат <b>{chat.title}</b> подключён.\n"
             f"Сообщения от пользователей будут создавать топики здесь."
         )
+
+    # ═══════════════ Автоподключение при добавлении в группу ═══════════════
+
+    @child_dp.my_chat_member()
+    async def on_child_my_chat_member(event: ChatMemberUpdated) -> None:
+        """Бот сам подключается, когда его добавили в рабочий чат с темами.
+
+        Правила безопасности:
+          • подключение происходит ТОЛЬКО если чат ещё не привязан
+            (get_feedback_chat вернул None) — уже подключённых ботов
+            мы НИКОГДА не отключаем и не переподключаем;
+          • подключаемся только к чату с включёнными темами (is_forum);
+          • если бота добавили в «обычный» чат без тем — подсказываем,
+            как включить темы, и ничего не трогаем.
+        """
+        chat = event.chat
+        if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            return
+
+        old_status = getattr(event.old_chat_member, "status", "")
+        new_status = getattr(event.new_chat_member, "status", "")
+        was_member = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+        is_member_now = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+        if was_member or not is_member_now:
+            # Это удаление/выход или повышение уже добавленного бота.
+            return
+
+        # Не отключаем и не переподключаем уже подключённые боты.
+        if get_feedback_chat(bot_id) is not None:
+            return
+
+        is_forum = bool(getattr(chat, "is_forum", False))
+        title = chat.title or f"чат {chat.id}"
+        if not is_forum:
+            try:
+                await bot_obj.send_message(
+                    chat.id,
+                    "👋 Привет! Я подключусь к этому чату, как только ты "
+                    "<b>включишь темы</b>:\n"
+                    "«Управление чатом → ⋮ → Включить темы».\n"
+                    "После этого добавь меня заново или напиши <code>/connect</code>.",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить подсказку про темы: %s", e)
+            return
+
+        set_feedback_chat(bot_id, chat.id)
+        logger.info("Бот %s автоподключён к чату %s (%s)", bot_id, chat.id, title)
+        try:
+            await bot_obj.send_message(
+                chat.id,
+                f"✅ <b>Чат <code>{title}</code> подключён автоматически!</b>\n"
+                f"Сообщения от пользователей будут создавать топики здесь.\n\n"
+                f"На всякий случай: команда <code>/connect</code> в теме General "
+                f"тоже сработает — она нужна, если бот вдруг «потерял» чат.",
+            )
+        except Exception as e:
+            logger.warning("Не удалось поздравить с подключением: %s", e)
 
     # ═══════════════ /ban в топике ═══════════════
 
@@ -1194,7 +1265,8 @@ class ChildManager:
         for bot_data in pending:
             if get_feedback_chat(bot_data["id"]) is None:
                 logger.info(
-                    "Бот %s (%s): не подключён чат топиков — нужен /connect в группе",
+                    "Бот %s (%s): чат топиков не подключён — подключится сам "
+                    "при добавлении в группу с темами (или через /connect)",
                     bot_data["id"], bot_data.get("username") or bot_data.get("first_name") or "?",
                 )
 

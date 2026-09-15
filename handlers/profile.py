@@ -221,6 +221,10 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
         f"⚙️ Версия бота: <b>{BOT_VERSION}</b>"
     )
 
+    # Кнопка чатов: «Привязать чаты» — пока ничего не привязано, иначе «Чаты».
+    any_chat = work_chat or admin_chat
+    chats_label = "📎 Чаты" if any_chat else "🔗 Привязать чаты"
+    chats_data = "chats_info" if any_chat else "chats_bind"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots"),
@@ -228,25 +232,14 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
             InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz"),
         ],
         [
-            InlineKeyboardButton(text="💼 Чат работы", callback_data="bind_work"),
-            InlineKeyboardButton(text="🛡 Чат админов", callback_data="bind_admin"),
+            InlineKeyboardButton(text=chats_label, callback_data=chats_data),
+            InlineKeyboardButton(text="🛡 Антирейд", callback_data="antiraid"),
         ],
         [
             InlineKeyboardButton(text="👑 Передать права", callback_data="transfer"),
             InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all"),
         ],
     ])
-    unbind_row = []
-    if work_chat:
-        unbind_row.append(
-            InlineKeyboardButton(text="❌ Отвязать чат работы", callback_data="unbind_work")
-        )
-    if admin_chat:
-        unbind_row.append(
-            InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin")
-        )
-    if unbind_row:
-        kb.inline_keyboard.append(unbind_row)
     if is_super_admin(user_id):
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin")
@@ -785,6 +778,119 @@ _BIND_LABELS = {
     "admin": "🛡 Чат админов",
 }
 
+# ═══════════════ «Привязать чаты» / «Чаты» (страницы профиля) ═══════════════
+
+def _chats_bind_payload() -> tuple[str, InlineKeyboardMarkup]:
+    """Инструкция по привязке обоих чатов + кнопки выбора чата."""
+    text = (
+        "🔗 <b>Привязка чатов</b>\n\n"
+        "YamoBot работает с двумя чатами:\n\n"
+        "💼 <b>Чат работы</b> — чат с дочерним ботом, где админы общаются "
+        "с пользователями по заявкам (ПЗ).\n"
+        "🛡 <b>Чат админов</b> — общий чат админов, где они переписываются "
+        "между собой.\n\n"
+        "<b>Как привязать:</b>\n"
+        "1️⃣ Добавь YamoBot в нужный чат.\n"
+        "2️⃣ Нажми соответствующую кнопку ниже.\n"
+        "3️⃣ Дождись подтверждения.\n\n"
+        "Выбери, какой чат привязать:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Привязать чат админов", callback_data="bind_admin")],
+        [InlineKeyboardButton(text="💼 Привязать чат работы", callback_data="bind_work")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+    ])
+    return text, kb
+
+
+def _chats_info_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Инфо о привязанных чатах + привязка недостающего / отвязка / перезапуск."""
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+    work_line = f"<code>{work_chat}</code>" if work_chat else "— не привязан —"
+    admin_line = f"<code>{admin_chat}</code>" if admin_chat else "— не привязан —"
+
+    text = (
+        "📎 <b>Чаты</b>\n\n"
+        f"💼 <b>Чат работы:</b> {work_line}\n"
+        f"🛡 <b>Чат админов:</b> {admin_line}\n\n"
+        "Кнопки ниже позволяют привязать недостающий чат, отвязать "
+        "привязанные или перезапустить привязку."
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Непривязанные чаты предлагаем привязать прямо отсюда.
+    if admin_chat is None:
+        rows.append([
+            InlineKeyboardButton(text="🛡 Привязать чат админов", callback_data="bind_admin")
+        ])
+    if work_chat is None:
+        rows.append([
+            InlineKeyboardButton(text="💼 Привязать чат работы", callback_data="bind_work")
+        ])
+    # Привязанные чаты можно отвязать.
+    if admin_chat:
+        rows.append([
+            InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin")
+        ])
+    if work_chat:
+        rows.append([
+            InlineKeyboardButton(text="❌ Отвязать чат работы", callback_data="unbind_work")
+        ])
+    rows.append([InlineKeyboardButton(text="🔄 Перезапуск", callback_data="chats_restart")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "chats_bind")
+async def cb_chats_bind(callback: CallbackQuery) -> None:
+    text, kb = _chats_bind_payload()
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "chats_info")
+async def cb_chats_info(callback: CallbackQuery) -> None:
+    text, kb = _chats_info_payload(cb_uid(callback))
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "chats_restart")
+async def cb_chats_restart(callback: CallbackQuery) -> None:
+    """Перезапуск: перепривязывает бота к уже сохранённым чатам."""
+    user_id = cb_uid(callback)
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+
+    set_bound_chat(user_id, "work", work_chat)
+    set_bound_chat(user_id, "admin", admin_chat)
+
+    statuses: list[str] = []
+    bot = getattr(callback, "bot", None)
+
+    if admin_chat:
+        try:
+            if bot is not None:
+                await bot.send_message(admin_chat, ADMIN_CHAT_WELCOME)
+            statuses.append("🛡 Чат админов: перепривязан, приветствие отправлено")
+        except Exception:
+            statuses.append("🛡 Чат админов: перепривязан (не удалось отправить приветствие)")
+    if work_chat:
+        try:
+            if bot is not None:
+                await bot.send_message(
+                    work_chat, "💼 Чат работы привязан к YamoBot. Бот активен. ✅"
+                )
+            statuses.append("💼 Чат работы: перепривязан")
+        except Exception:
+            statuses.append("💼 Чат работы: привязка сохранена (бот не в чате)")
+
+    status_text = "\n".join(statuses) if statuses else "Чат ещё не привязан."
+    text, kb = _chats_info_payload(user_id)
+    text = f"🔄 <b>Перезапуск привязки</b>\n\n{status_text}\n\n{text}"
+
+    await render_callback(callback, text, kb)
+
 
 def _bind_wait_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -896,29 +1002,32 @@ async def cb_bind_cancel(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "unbind_work")
 async def cb_unbind_work(callback: CallbackQuery) -> None:
     user_id = cb_uid(callback)
-    set_bound_chat(user_id, "work", None)
-    await callback.answer("💼 Чат работы отвязан")
-    if callback.message:
-        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
-        await render_callback(callback, text, kb)
+    if get_bound_chat(user_id, "work") is None:
+        await callback.answer("💼 Чат работы уже не привязан", show_alert=False)
+    else:
+        set_bound_chat(user_id, "work", None)
+        await callback.answer("💼 Чат работы отвязан")
+    text, kb = _chats_info_payload(user_id)
+    await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "unbind_admin")
 async def cb_unbind_admin(callback: CallbackQuery) -> None:
     user_id = cb_uid(callback)
     chat_id = get_bound_chat(user_id, "admin")
-    set_bound_chat(user_id, "admin", None)
-    if chat_id:
+    if chat_id is None:
+        await callback.answer("🛡 Чат админов уже не привязан", show_alert=False)
+    else:
+        set_bound_chat(user_id, "admin", None)
         bot = getattr(callback, "bot", None)
         try:
             if bot is not None:
                 await bot.leave_chat(chat_id)
         except Exception:
             pass
-    await callback.answer("🛡 Чат админов отвязан")
-    if callback.message:
-        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
-        await render_callback(callback, text, kb)
+        await callback.answer("🛡 Чат админов отвязан")
+    text, kb = _chats_info_payload(user_id)
+    await render_callback(callback, text, kb)
 
 
 # Событие: YamoBot добавили в группу/супергруппу.
@@ -934,6 +1043,14 @@ async def on_bot_added_to_chat(event) -> None:
     adder = getattr(event, "from_user", None)
     if adder is None or getattr(adder, "is_bot", False):
         return
+
+    # Антирейд: если бота повысили до администратора в уже привязанном
+    # «чате админов» с включённой защитой — уведомляем владельца о том,
+    # что защита теперь полностью работает (иначе бот не видит заходы и
+    # сообщения, а владелец думает, что «антирейд сломан»).
+    if event.chat and event.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        from handlers.antiraid import notify_antiraid_promoted_if_bound
+        await notify_antiraid_promoted_if_bound(event)
 
     kind = get_pending_bind(adder.id) or _PENDING_BINDS.pop(adder.id, None)
     if not kind:
