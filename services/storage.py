@@ -1,9 +1,12 @@
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -425,10 +428,21 @@ def get_accessible_bots(user_id: int) -> list[dict]:
     return unique
 
 
-def add_user_bot(user_id: int, bot_info: dict) -> None:
+def add_user_bot(user_id: int, bot_info: dict) -> bool:
+    """Привязывает бота к владельцу. False — если бот занят другим владельцем."""
     conn = _get_conn()
+    existing = conn.execute("SELECT owner_id FROM bots WHERE id = ?", (bot_info["id"],)).fetchone()
+    if existing and existing["owner_id"] != user_id:
+        # Токен даёт полный доступ к боту, но привязка уже занята другим владельцем
+        # панели: не даём «увести» бота к себе. Передавать права нужно через
+        # «👑 Передать права» (или сначала удалить бота у текущего владельца).
+        logger.warning(
+            "Отклонена привязка бота %s к %s: бот уже привязан к %s",
+            bot_info["id"], user_id, existing["owner_id"],
+        )
+        return False
+
     with _lock:
-        existing = conn.execute("SELECT id FROM bots WHERE id = ?", (bot_info["id"],)).fetchone()
         if existing:
             conn.execute(
                 "UPDATE bots SET token=?, username=?, first_name=?, owner_id=? WHERE id=?",
@@ -444,9 +458,11 @@ def add_user_bot(user_id: int, bot_info: dict) -> None:
                  bot_info.get("welcome_text", ""), json.dumps(bot_info.get("links", [])), 0)
             )
         conn.commit()
+    return True
 
 
 def remove_user_bot(user_id: int, bot_id: int) -> bool:
+    """Удаляет бота владельца вместе со всеми данными по нему."""
     conn = _get_conn()
     with _lock:
         cur = conn.execute("DELETE FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id))
@@ -2113,7 +2129,7 @@ def add_reminder(owner_id: int, mode: str, duration_seconds: int) -> int:
             (owner_id, mode, duration_seconds)
         )
         conn.commit()
-        return int(cur.lastrowid)
+        return int(cur.lastrowid or 0)
 
 
 def set_reminder_enabled(reminder_id: int, enabled: bool) -> bool:

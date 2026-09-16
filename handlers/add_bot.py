@@ -6,11 +6,11 @@ from aiogram.types import (
 )
 import asyncio
 
-from handlers._common import render_callback, cb_data, cb_uid
+from handlers._common import render_callback, cb_data, cb_uid, msg_uid
 from services.child_manager import ChildManager
 from services.storage import (
     add_user_bot, bot_display_name, set_bot_type, set_bot_keyboard,
-    get_feedback_chat,
+    get_feedback_chat, get_bot_by_id_any_owner,
 )
 router = Router()
 
@@ -43,13 +43,54 @@ async def verify_token(token: str) -> dict | None:
     try:
         tmp = Bot(token=token)
         me = await tmp.get_me()
+        # Пытаемся понять, не используется ли токен где-то ещё: чужой вебхук
+        # означает, что апдейты могут уходить на другой сервер (например, бот
+        # остался подключён к другому конструктору или к копии на тестовом
+        # сервере). Это не блокирует добавление — просто предупреждаем владельца.
+        webhook_url = ""
+        try:
+            hook = await tmp.get_webhook_info()
+            webhook_url = hook.url or ""
+        except Exception:
+            pass
         info = {'token': token, 'id': me.id,
                 'username': me.username or '', 'first_name': me.first_name or '',
-                'welcome_text': '', 'stopped': False, 'links': []}
+                'welcome_text': '', 'stopped': False, 'links': [],
+                'webhook_url': webhook_url}
         await tmp.session.close()
         return info
     except Exception:
         return None
+
+
+def _token_in_use_warning(info: dict, user_id: int) -> tuple[bool, str]:
+    """Проверяет, можно ли привязывать бота к этому пользователю.
+
+    Возвращает ``(blocked, text)``:
+
+    * ``blocked=True`` — привязка запрещена (бот принадлежит другому владельцу);
+    * ``blocked=False`` и непустой ``text`` — привязать можно, но есть о чём
+      предупредить (например, токен используется другим сервером);
+    * ``blocked=False`` и пустой ``text`` — всё чисто.
+    """
+    existing = get_bot_by_id_any_owner(int(info['id']))
+    if existing and int(existing.get('owner_id') or 0) != user_id:
+        # Токен даёт полный доступ к боту, поэтому такой бот мог бы «уехать»
+        # к чужому владельцу. Привязку не даём — только через передачу прав.
+        return True, (
+            '🚫 <b>Этот бот уже привязан к другому владельцу.</b>\n\n'
+            'Забрать его себе напрямую нельзя — попроси текущего владельца '
+            'передать права: <b>👤 Профиль → 👑 Передать права</b>.'
+        )
+    if info.get('webhook_url'):
+        return False, (
+            '⚠️ <b>Токен используется где-то ещё.</b>\n\n'
+            f'🔗 Чужой вебхук: <code>{info["webhook_url"]}</code>\n\n'
+            'Пока он стоит, часть сообщений уходит на тот сервер, а не нам. '
+            'Если это осталось от старого сервиса/копии бота — отвяжи бота там, '
+            'иначе бот будет работать нестабильно.'
+        )
+    return False, ''
 
 
 @router.callback_query(F.data == 'add_bot')
@@ -62,6 +103,7 @@ async def cb_add_bot(callback, state):
 
 @router.message(AddBotFSM.waiting_for_token)
 async def fsm_receive_token(message, state):
+    user_id = msg_uid(message)
     token = message.text.strip() if message.text else ''
     if ':' not in token or len(token) < 30:
         await message.answer('Неверный формат токена.', reply_markup=_back_kb())
@@ -71,14 +113,25 @@ async def fsm_receive_token(message, state):
     if info is None:
         await wait_msg.edit_text('Токен недействителен.', reply_markup=_back_kb())
         return
+
+    blocked, warning = _token_in_use_warning(info, user_id)
+    if blocked:
+        # Чужого бота не отдаём: привязка возможна только через передачу прав.
+        await state.clear()
+        await wait_msg.edit_text(warning, reply_markup=_back_kb())
+        return
+
     await state.update_data(bot_info=info)
-    await wait_msg.edit_text(
+    text = (
         'Отлично! Теперь выбери тип бота:\n\n'
         '🗂 <b>Стандарт</b> — обычный бот, к нему привяжется '
         'reply-клавиатура «сменить админа».\n'
         '📝 <b>Анкетница</b> — бот-анкета без reply-кнопок, '
-        'только инлайн-кнопки.',
-        reply_markup=_type_kb())
+        'только инлайн-кнопки.'
+    )
+    if warning:
+        text = f'{warning}\n\n{text}'
+    await wait_msg.edit_text(text, reply_markup=_type_kb())
 
 
 @router.callback_query(F.data.startswith('bot_type_'))
@@ -106,7 +159,19 @@ async def _finish_add(callback: CallbackQuery, state: FSMContext,
     if not info:
         await state.clear()
         return
-    add_user_bot(user_id, info)
+    if not add_user_bot(user_id, info):
+        # add_user_bot вернул False — бота уже привязал другой владелец панели.
+        # Раньше это молча игнорировалось, и пользователь видел «Бот подключён!»,
+        # хотя дочерний бот ему не принадлежал.
+        await state.clear()
+        if callback.message:
+            await callback.message.answer(
+                '🚫 <b>Этот бот уже привязан к другому владельцу.</b>\n\n'
+                'Привязать его к себе напрямую нельзя. Попроси текущего владельца '
+                'передать права: <b>👤 Профиль → 👑 Передать права</b>.',
+                reply_markup=_back_kb(),
+            )
+        return
     set_bot_type(user_id, info['id'], bot_type)
     set_bot_keyboard(user_id, info['id'], REPLY_PRESETS[preset_key]['buttons'])
     await state.clear()

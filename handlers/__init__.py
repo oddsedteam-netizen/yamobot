@@ -1,26 +1,32 @@
 from aiogram import Dispatcher
 
-from handlers.start import router as start_router
-from handlers.my_bots import router as my_bots_router
-from handlers.add_bot import router as add_bot_router
-from handlers.bot_actions import router as bot_actions_router
-from handlers.select_all import router as select_all_router
-from handlers.editor import router as editor_router
-from handlers.mailing import router as mailing_router
-from handlers.admins import router as admins_router
-from handlers.coowners import router as coowners_router
-from handlers.pz import router as pz_router
-from handlers.overview import router as overview_router
-from handlers.profile import router as profile_router
-from handlers.complaints import router as complaints_router
-from handlers.admin_moderation import router as admin_moderation_router
-from handlers.restart import router as restart_router
-from handlers.antiraid import router as antiraid_router
-from handlers.reminders import router as reminders_router
 from services.premium_emoji import PremiumEmojiLearningMiddleware
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
+    # Импортируем роутеры ВНУТРИ функции: так `import handlers.<любой модуль>` и
+    # `import services.child_manager` безопасны в любом порядке. Раньше импорт
+    # на уровне модуля создавал цикл
+    # handlers/__init__ → handlers.start → services.child_manager → handlers._common
+    # и падал с ImportError, если первым импортировали services.child_manager.
+    from handlers.start import router as start_router
+    from handlers.my_bots import router as my_bots_router
+    from handlers.add_bot import router as add_bot_router
+    from handlers.bot_actions import router as bot_actions_router
+    from handlers.select_all import router as select_all_router
+    from handlers.editor import router as editor_router
+    from handlers.mailing import router as mailing_router
+    from handlers.admins import router as admins_router
+    from handlers.coowners import router as coowners_router
+    from handlers.pz import router as pz_router
+    from handlers.overview import router as overview_router
+    from handlers.profile import router as profile_router
+    from handlers.complaints import router as complaints_router
+    from handlers.admin_moderation import router as admin_moderation_router
+    from handlers.restart import router as restart_router
+    from handlers.antiraid import router as antiraid_router
+    from handlers.reminders import router as reminders_router
+
     # Учим словарь премиум-эмодзи по ВСЕМ сообщениям (до фильтров): Telegram сам
     # присылает custom_emoji-сущности, а по ним бот потом возвращает премиум в
     # приветствиях, где эмодзи потерял «премиум» (см. services/premium_emoji.py).

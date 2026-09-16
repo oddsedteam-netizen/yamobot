@@ -151,7 +151,10 @@ async def fsm_broadcast(message: Message, state: FSMContext) -> None:
         if u["user_id"] == user_id:
             continue
         try:
-            await message.bot.send_message(u["user_id"], text)
+            bot = message.bot
+            if bot is None:
+                continue
+            await bot.send_message(u["user_id"], text)
             ok += 1
         except Exception:
             fail += 1

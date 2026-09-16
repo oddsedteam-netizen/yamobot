@@ -9,7 +9,9 @@ from typing import Any
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType, ChatType, ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramConflictError, TelegramForbiddenError, TelegramRetryAfter,
+)
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
@@ -27,7 +29,7 @@ from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
                               try_edit_answer, try_edit)
 from services import premium_emoji as premium
-from services.constants import BOT_CREDIT
+from services.constants import BASE_WELCOME, BOT_CREDIT
 
 from services.storage import (
     add_child_user,
@@ -133,6 +135,58 @@ def repair_premium_emoji_for_owner(owner_id: int) -> dict:
     return {"checked": checked, "fixed": fixed_bots, "learned": learned}
 
 
+# Боты, о которых уже сообщали в лог, что Telegram выбросил премиум-эмодзи.
+# Нужно только для того, чтобы не спамить одним и тем же предупреждением.
+_premium_drop_warned: set[int] = set()
+
+# Боты, про токен которых уже сообщали владельцу, что он используется где-то ещё
+# (чужой вебхук / второй polling-процесс). Тоже только против спама.
+_token_used_warned: set[int] = set()
+
+
+def check_premium_delivered(sent: Message | None, source_text: str,
+                            bot_id: int | None = None) -> bool:
+    """True, если Telegram выбросил премиум-эмодзи из отправленного сообщения.
+
+    Бывает так: разметка ``<tg-emoji>`` в тексте есть, но сервер её игнорирует —
+    сообщение уходит, а премиум-эмодзи превращается в обычный смайлик. Ошибки
+    при этом нет, поэтому единственный способ заметить проблему — сверить
+    сущности отправленного сообщения с тем, что мы отправляли.
+
+    Такое встречается после передачи прав на бота через @BotFather: Telegram
+    привязывает «право» на премиум-эмодзи к боту/владельцу, и после передачи
+    разметка может тихо перестать работать. Починить это со стороны кода
+    нельзя (решение сервера Telegram), но мы это замечаем и пишем в лог.
+    """
+    expected = premium.count_premium_markup(source_text)
+    if sent is None or not expected:
+        return False
+
+    delivered = sum(
+        1 for e in (sent.entities or []) if str(getattr(e, "type", "")) == "custom_emoji"
+    )
+    if delivered >= expected:
+        if bot_id is not None:
+            # Заработало — разрешаем сообщить снова, если опять сломается.
+            _premium_drop_warned.discard(bot_id)
+        return False
+
+    if bot_id is not None:
+        if bot_id in _premium_drop_warned:
+            return True
+        _premium_drop_warned.add(bot_id)
+
+    logger.warning(
+        "Бот %s: Telegram не принял премиум-эмодзи (%d из %d) — сообщение ушло "
+        "обычными смайликами. Чаще всего так бывает после передачи прав на бота "
+        "в @BotFather: «право» на премиум-эмодзи остаётся у прежнего владельца, "
+        "и сервер тихо вырезает разметку. Со стороны кода это не лечится — "
+        "если нужно, пересоздай бота или оставь обычные эмодзи.",
+        bot_id, delivered, expected,
+    )
+    return True
+
+
 def get_main_bot() -> Bot | None:
     """Возвращает основной бот YamoBot (используется фоновыми сервисами)."""
     return _MAIN_BOT
@@ -186,6 +240,24 @@ def _is_thread_not_found(err: Exception) -> bool:
     return ("message thread not found" in msg
             or "thread not found" in msg
             or "topic not found" in msg)
+
+
+async def notify_owner(bot_id: int, text: str) -> None:
+    """Шлёт владельцу бота сообщение от основного бота (если это возможно).
+
+    Используется для «мягких» предупреждений: например, что токен бота уже
+    используется другой программой (конфликт polling) — владелец видит это
+    прямо в чате с YamoBot, а не ищет в логах.
+    """
+    if _MAIN_BOT is None:
+        return
+    owner_id = get_bot_owner(bot_id)
+    if not owner_id:
+        return
+    try:
+        await _MAIN_BOT.send_message(chat_id=owner_id, text=text)
+    except Exception as e:
+        logger.warning("Не удалось уведомить владельца %s: %s", owner_id, e)
 
 
 async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None:
@@ -287,6 +359,12 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _msg_bot_id(message: Message) -> int | None:
+    """id бота, который прислал сообщение (None, если бот неизвестен/нет id)."""
+    bot = getattr(message, "bot", None)
+    return getattr(bot, "id", None)
+
+
 async def _safe_answer(message: Message, text: str, reply_markup=None) -> bool:
     """Отправляет сообщение, переживая ошибки HTML-разметки.
 
@@ -296,7 +374,10 @@ async def _safe_answer(message: Message, text: str, reply_markup=None) -> bool:
     ``<tg-emoji>``, и только в крайнем случае — совсем без форматирования.
     """
     try:
-        await message.answer(text, reply_markup=reply_markup)
+        sent = await message.answer(text, reply_markup=reply_markup)
+        # Тихий сбой: разметка есть, а Telegram её вырезал (например, после
+        # передачи прав на бота в @BotFather). Пишем в лог один раз на бота.
+        check_premium_delivered(sent, text, _msg_bot_id(message))
         return True
     except TelegramBadRequest:
         logger.warning("HTML-отправка не удалась, отправляю без форматирования: %.120s", text)
@@ -592,7 +673,19 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if not fresh:
             return
 
-        welcome = fresh.get("welcome_text", "") or f"👋 Привет! Я {fresh.get('first_name', 'бот')}."
+        welcome = fresh.get("welcome_text", "") or ""
+
+        # Если премиум-эмодзи в приветствии потерял разметку (владелец вставил
+        # эмодзи копированием) — мягко возвращаем её по словарю, см.
+        # services/premium_emoji.py. Пустое приветствие НЕ восстанавливаем.
+        if welcome.strip() and not premium.has_premium_markup(welcome):
+            if repair_premium_emoji_for_bot(bot_id):
+                fresh = get_bot_by_id_any_owner(bot_id) or fresh
+                welcome = fresh.get("welcome_text", "") or welcome
+
+        # Приветствие не задано — показываем базовое, зашитое в боте.
+        if not welcome.strip():
+            welcome = BASE_WELCOME
 
         # В анонимном режиме в конце приветствия добавляем плашку.
         if is_bot_anonymous(bot_id):
@@ -1373,6 +1466,13 @@ class ChildManager:
         fresh = get_bot_by_id_any_owner(bot_id)
         if fresh is None:
             fresh = bot_data
+
+        # Мягкий ремонт: возвращаем «премиум» эмодзи в сохранённом приветствии
+        # (например, если эмодзи скопировали обычным символом). Данные бота
+        # (пользователи, топики, диалоги) при этом не трогаются.
+        if repair_premium_emoji_for_bot(bot_id):
+            fresh = get_bot_by_id_any_owner(bot_id) or fresh
+
         token = fresh.get("token") or bot_data.get("token", "")
 
         try:
@@ -1381,6 +1481,34 @@ class ChildManager:
             logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
             child_dp = _make_child_dp(fresh, child_bot)
+
+            # Проверяем, не используется ли токен посторонним сервером: если у
+            # бота стоит чужой вебхук, апдейты уходят туда, а не нам. Само по
+            # себе это не ошибка (мы вебхук сбросим ниже), но владельцу полезно
+            # знать, что токен «светился» на другом сервере/в другом сервисе.
+            try:
+                hook = await child_bot.get_webhook_info()
+                if hook.url:
+                    logger.warning(
+                        "Бот %s: у токена установлен чужой вебхук %s — "
+                        "токен используется другим сервером/сервисом",
+                        bot_id, hook.url,
+                    )
+                    if bot_id not in _token_used_warned:
+                        _token_used_warned.add(bot_id)
+                        await notify_owner(
+                            bot_id,
+                            "⚠️ <b>Токен бота используется где-то ещё</b>\n\n"
+                            f"🤖 Бот: <b>{bot_display_name(fresh)}</b>\n"
+                            f"🔗 Внешний вебхук: <code>{hook.url}</code>\n\n"
+                            "Пока вебхук стоит, часть сообщений уходит на тот сервер, "
+                            "а не нам. Я сбрасываю вебхук при каждом запуске бота, но "
+                            "если его ставят снова — отвяжи бота от того сервиса "
+                            "(например, от другого конструктора ботов).",
+                        )
+            except Exception as e:
+                logger.debug("Не удалось получить webhook_info бота %s: %s", bot_id, e)
+
             try:
                 await child_bot.delete_webhook(drop_pending_updates=True)
             except Exception as e:
@@ -1415,10 +1543,35 @@ class ChildManager:
                 return
             exc = task.exception()
             if exc is not None:
-                logger.error(
-                    "Дочерний бот %s аварийно завершился: %s\n%s",
-                    bot_id, exc, exc.__traceback__,
-                )
+                if isinstance(exc, TelegramConflictError):
+                    # Токен одновременно «слушает» кто-то ещё (другая копия бота
+                    # на тестовом/основном сервере, livegram и т.п.). Сообщения в
+                    # этом случае делятся между процессами случайным образом —
+                    # именно поэтому бот «иногда» отвечает не тем приветствием.
+                    logger.warning(
+                        "Бот %s: конфликт токена (кто-то ещё получает апдейты): %s",
+                        bot_id, exc,
+                    )
+                    if bot_id not in _token_used_warned:
+                        _token_used_warned.add(bot_id)
+                        try:
+                            asyncio.create_task(notify_owner(
+                                bot_id,
+                                "⚠️ <b>Токен бота занят другим процессом</b>\n\n"
+                                "У этого бота второй экземпляр получает сообщения "
+                                "(например, копия на другом сервере или подключение к "
+                                "другому сервису). Из-за этого ответы и приветствие "
+                                "могут приходить не от нашей панели.\n\n"
+                                "Останови второго «слушателя» — и бот сам заработает "
+                                "нормально (перезапускать вручную не нужно).",
+                            ))
+                        except RuntimeError:
+                            pass
+                else:
+                    logger.error(
+                        "Дочерний бот %s аварийно завершился: %s\n%s",
+                        bot_id, exc, exc.__traceback__,
+                    )
                 # Планируем автоперезапуск (не из колбэка — это sync).
                 try:
                     asyncio.create_task(self._restart_bot_later(bot_id))

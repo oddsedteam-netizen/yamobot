@@ -318,15 +318,17 @@ async def cmd_vklasti(message: Message) -> None:
         "Отключить можно командой <code>/выкланти</code>."
     )
 
-    try:
-        await message.bot.send_message(
-            owner,
-            "🛡 <b>Антирейд включён</b> для твоего чата админов.\n"
-            "Бот будет следить за заходами и спамом; при подозрении на рейд "
-            "заблокирует чат и позовёт тебя.",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить владельца об антирейде: %s", e)
+    bot = message.bot
+    if bot is not None:
+        try:
+            await bot.send_message(
+                owner,
+                "🛡 <b>Антирейд включён</b> для твоего чата админов.\n"
+                "Бот будет следить за заходами и спамом; при подозрении на рейд "
+                "заблокирует чат и позовёт тебя.",
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить владельца об антирейде: %s", e)
 
 
 @router.message(
@@ -364,13 +366,15 @@ async def cmd_vylasti(message: Message) -> None:
         "Снова включить можно командой <code>/вкланти</code>."
     )
 
-    try:
-        await message.bot.send_message(
-            owner,
-            "🔻 <b>Антирейд выключен</b> для твоего чата админов.",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить владельца об отключении антирейда: %s", e)
+    bot = message.bot
+    if bot is not None:
+        try:
+            await bot.send_message(
+                owner,
+                "🔻 <b>Антирейд выключен</b> для твоего чата админов.",
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить владельца об отключении антирейда: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -419,15 +423,17 @@ async def cmd_vklchat(message: Message) -> None:
         + "Полностью выключить защиту можно командой <code>/выкланти</code>."
     )
 
-    try:
-        await message.bot.send_message(
-            owner,
-            f"🔓 <b>Чат админов разблокирован после антирейда.</b>\n\n"
-            f"{state_line}\n"
-            + (f"{enabled_line}\n" if enabled_line else ""),
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить владельца о разблокировке: %s", e)
+    bot = message.bot
+    if bot is not None:
+        try:
+            await bot.send_message(
+                owner,
+                f"🔓 <b>Чат админов разблокирован после антирейда.</b>\n\n"
+                f"{state_line}\n"
+                + (f"{enabled_line}\n" if enabled_line else ""),
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить владельца о разблокировке: %s", e)
 # ═══════════════════════════════════════════════════════════════
 #  Следим за заходами в «чат админов»
 # ═══════════════════════════════════════════════════════════════
@@ -695,17 +701,19 @@ async def notify_antiraid_promoted_if_bound(event: ChatMemberUpdated) -> None:
     settings = get_antiraid_settings(owner_id)
     if not settings["enabled"] or settings["triggered"]:
         return
-    try:
-        await event.bot.send_message(
-            owner_id,
-            f"🛡 <b>Антирейд теперь полностью активен!</b>\n\n"
-            "YamoBot получил права администратора в чате админов — "
-            "видит заходы и сообщения, может блокировать нарушителей.\n\n"
-            "Если защита была отключена с пометкой «не хватает прав» — "
-            "напиши в чате <code>/вкланти</code>, чтобы включить её.",
-        )
-    except Exception as e:
-        logger.warning("Не удалось уведомить владельца о повышении прав: %s", e)
+    bot = event.bot
+    if bot is not None:
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🛡 <b>Антирейд теперь полностью активен!</b>\n\n"
+                "YamoBot получил права администратора в чате админов — "
+                "видит заходы и сообщения, может блокировать нарушителей.\n\n"
+                "Если защита была отключена с пометкой «не хватает прав» — "
+                "напиши в чате <code>/вкланти</code>, чтобы включить её.",
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить владельца о повышении прав: %s", e)
 
 
 async def _trigger_antiraid(bot, chat_id: int, chat_title: str,
@@ -802,7 +810,7 @@ async def on_new_chat_members(message: Message) -> None:
 
     now = time.monotonic()
     added = 0
-    for member in message.new_chat_members:
+    for member in message.new_chat_members or []:
         uid = getattr(member, "id", None)
         if not uid or getattr(member, "is_bot", False):
             continue

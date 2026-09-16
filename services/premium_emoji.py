@@ -77,6 +77,13 @@ def has_premium_markup(text: str | None) -> bool:
     return bool(text) and bool(EMOJI_TAG_RE.search(text or ""))
 
 
+def count_premium_markup(text: str | None) -> int:
+    """Сколько премиум-эмодзи размечено в тексте тегами ``<tg-emoji>``."""
+    if not text:
+        return 0
+    return len(EMOJI_TAG_RE.findall(text))
+
+
 def build_markup(emoji: str, emoji_id: str) -> str:
     """Собирает тег премиум-эмодзи."""
     return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
