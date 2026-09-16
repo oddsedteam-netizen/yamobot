@@ -21,6 +21,7 @@ from services.storage import (
     set_links_for_all,
 )
 from services.child_manager import ChildManager
+from services.premium_emoji import prepare_welcome
 
 router = Router()
 
@@ -100,8 +101,7 @@ async def cb_edit_welcome(callback: CallbackQuery, state: FSMContext) -> None:
         "Отправь текст. HTML и премиум-эмодзи поддерживаются.\n\n"
         "⚠️ <b>Важно:</b> премиум-эмодзи вставляй из панели эмодзи — "
         "выбором фиолетового смайлика. Если просто скопировать эмодзи "
-        "из сообщения бота, Telegram превратит его в обычный, и премиум-эмодзи "
-        "не сохранится."
+        "из сообщения бота, Telegram превратит его в обычный."
     )
 
     if callback.message:
@@ -122,7 +122,7 @@ async def fsm_welcome_text(message: Message, state: FSMContext, child_manager: C
         await state.clear()
         return
 
-    new_welcome = message.html_text or message.text or ""
+    new_welcome = prepare_welcome(message)
     if not new_welcome.strip():
         await message.answer("❌ Текст не может быть пустым.")
         return
@@ -331,7 +331,7 @@ async def cb_all_edit_welcome(callback: CallbackQuery, state: FSMContext) -> Non
 @router.message(EditorFSM.waiting_global_welcome)
 async def fsm_global_welcome(message: Message, state: FSMContext, child_manager: ChildManager) -> None:
     user_id = msg_uid(message)
-    new_welcome = message.html_text or message.text or ""
+    new_welcome = prepare_welcome(message)
 
     if not new_welcome.strip():
         await message.answer("❌ Текст не может быть пустым.")

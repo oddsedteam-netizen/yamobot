@@ -26,6 +26,7 @@ from aiogram.types import (
 from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
                               try_edit_answer, try_edit)
+from services import premium_emoji as premium
 from services.constants import BOT_CREDIT
 
 from services.storage import (
@@ -62,6 +63,8 @@ from services.storage import (
     bot_display_name,
     is_bot_anonymous,
     get_bound_chat,
+    get_user_bots,
+    update_bot_field,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,56 @@ def set_main_bot(bot: Bot) -> None:
     """Сохраняет ссылку на основной бот YamoBot для отправки уведомлений."""
     global _MAIN_BOT
     _MAIN_BOT = bot
+
+
+def repair_premium_emoji_for_bot(bot_id: int) -> int:
+    """Мягко возвращает премиум-эмодзи в приветствие одного бота.
+
+    Ничего не удаляет и не перепривязывает: если в сохранённом приветствии
+    эмодзи потерял премиум (например, владелец вставил его копированием),
+    оборачиваем такой эмодзи в ``<tg-emoji>`` по известному словарю
+    (services/premium_emoji.py). Возвращает сколько эмодзи восстановлено.
+    """
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        return 0
+    welcome = bot.get("welcome_text") or ""
+    if not welcome:
+        return 0
+    if premium.has_premium_markup(welcome):
+        # Уже размечено — чинить нечего (ремонт идемпотентен).
+        return 0
+
+    upgraded, fixed = premium.upgrade_markup(welcome)
+    if fixed and upgraded != welcome:
+        update_bot_field(bot.get("owner_id") or 0, bot_id, "welcome_text", upgraded)
+        logger.info("Бот %s: восстановлено премиум-эмодзи в приветствии: %d", bot_id, fixed)
+    return fixed
+
+
+def repair_premium_emoji_for_owner(owner_id: int) -> dict:
+    """Мягкий ремонт премиум-эмодзи во всех ботах владельца.
+
+    Возвращает: сколько ботов проверено, в скольких приветствиях удалось
+    восстановить премиум-эмодзи и сколько новых эмодзи добавлено в словарь
+    (словарь обновляется по сохранённым приветствиям ботов).
+    """
+    fixed_bots = 0
+    checked = 0
+    learned = 0
+    try:
+        for bot in get_user_bots(owner_id):
+            checked += 1
+            welcome = bot.get("welcome_text") or ""
+            # Если приветствие уже размечено — просто пополняем словарь.
+            for emoji_id, emoji in premium.EMOJI_TAG_RE.findall(welcome):
+                if premium.remember_custom_emoji(emoji, emoji_id):
+                    learned += 1
+            if repair_premium_emoji_for_bot(bot["id"]):
+                fixed_bots += 1
+    except Exception as e:
+        logger.error("Ошибка ремонта премиум-эмодзи владельца %s: %s", owner_id, e)
+    return {"checked": checked, "fixed": fixed_bots, "learned": learned}
 
 
 def get_main_bot() -> Bot | None:
@@ -235,13 +288,26 @@ def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
 
 
 async def _safe_answer(message: Message, text: str, reply_markup=None) -> bool:
-    """Отправляет сообщение, переживая ошибки HTML-разметки (fallback на parse_mode=None)."""
+    """Отправляет сообщение, переживая ошибки HTML-разметки.
+
+    Если Telegram не смог распарсить HTML (в тексте владельца попался символ,
+    который ломает разметку), сообщение НЕ должно потерять премиум-эмодзи:
+    повторяем отправку с сущностями ``custom_emoji``, собранными из тегов
+    ``<tg-emoji>``, и только в крайнем случае — совсем без форматирования.
+    """
     try:
         await message.answer(text, reply_markup=reply_markup)
         return True
     except TelegramBadRequest:
-        # Возможно, текст сломал HTML — пробуем без форматирования.
         logger.warning("HTML-отправка не удалась, отправляю без форматирования: %.120s", text)
+        raw_text, entities = premium.markup_to_entities(text)
+        if entities:
+            try:
+                await message.answer(raw_text, reply_markup=reply_markup,
+                                     entities=entities, parse_mode=None)
+                return True
+            except Exception:
+                logger.warning("Отправка сущностями тоже не удалась: %.120s", raw_text)
         try:
             await message.answer(text, reply_markup=reply_markup, parse_mode=None)
             return True
@@ -276,6 +342,85 @@ def _build_reply_kb(bot_data: dict) -> ReplyKeyboardMarkup | None:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def _caption_kwargs(source_msg: Message, native: bool) -> dict[str, Any]:
+    """Аргументы caption/caption_entities для копии сообщения.
+
+    native=False — HTML-разметка (как раньше);
+    native=True — обычный текст + родные сущности Telegram (премиум-эмодзи
+    и форматирование сохраняются, даже если HTML не парсится).
+    """
+    if native:
+        return {
+            "caption": source_msg.caption or "",
+            "caption_entities": source_msg.caption_entities,
+        }
+    return {"caption": source_msg.html_text or source_msg.caption or ""}
+
+
+def _text_kwargs(source_msg: Message, native: bool) -> dict[str, Any]:
+    """Аргументы text/entities для копии сообщения (см. _caption_kwargs)."""
+    if native:
+        return {"text": source_msg.text or "", "entities": source_msg.entities}
+    return {"text": source_msg.html_text or source_msg.text or ""}
+
+
+async def _copy_message(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
+                        native: bool = False) -> Message | None:
+    """Копирует сообщение юзера/админа в другой чат.
+
+    Родной режим (native=True) отправляет текст и сущности как есть —
+    это страховка на случай, если HTML-разметку не удалось распарсить:
+    сообщение дойдёт с премиум-эмодзи и форматированием вместо того,
+    чтобы потеряться целиком.
+    """
+    extra: dict[str, Any] = {"parse_mode": None} if native else {}
+    cap = _caption_kwargs(source_msg, native)
+
+    if source_msg.photo:
+        return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
+                                     **cap, **extra)
+    if source_msg.video:
+        return await bot.send_video(**kwargs, video=source_msg.video.file_id,
+                                     **cap, **extra)
+    if source_msg.animation:
+        return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
+                                         **cap, **extra)
+    if source_msg.document:
+        return await bot.send_document(**kwargs, document=source_msg.document.file_id,
+                                        **cap, **extra)
+    if source_msg.sticker:
+        return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
+    if source_msg.voice:
+        return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
+                                     **cap, **extra)
+    if source_msg.video_note:
+        return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
+    if source_msg.audio:
+        return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
+                                     **cap, **extra)
+
+    text_kw = _text_kwargs(source_msg, native)
+    if not text_kw["text"]:
+        return None
+    return await bot.send_message(**kwargs, **text_kw, **extra)
+
+
+async def _copy_message_smart(source_msg: Message, bot: Bot,
+                              kwargs: dict[str, Any]) -> Message | None:
+    """Копирует сообщение: сначала HTML, при ошибке разметки — родными сущностями."""
+    try:
+        return await _copy_message(source_msg, bot, kwargs, native=False)
+    except TelegramBadRequest as html_error:
+        logger.warning("Копия сообщения HTML-разметкой не удалась (%s) — пробую сущностями",
+                       html_error)
+        try:
+            return await _copy_message(source_msg, bot, kwargs, native=True)
+        except TelegramBadRequest:
+            # Пробрасываем ИСХОДНУЮ ошибку: по её тексту вызывающий код понимает,
+            # что топик удалён (message thread not found) и его нужно пересоздать.
+            raise html_error from None
+
+
 async def _send_to_topic(source_msg: Message, bot: Bot,
                          group_chat_id: int, topic_id: int,
                          reply_to: int | None = None) -> Message | None:
@@ -284,32 +429,7 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
         kwargs["reply_to_message_id"] = reply_to
 
     try:
-        if source_msg.photo:
-            return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.video:
-            return await bot.send_video(**kwargs, video=source_msg.video.file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.animation:
-            return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
-                                             caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.document:
-            return await bot.send_document(**kwargs, document=source_msg.document.file_id,
-                                            caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.sticker:
-            return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
-        elif source_msg.voice:
-            return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
-                                         caption=source_msg.caption or "")
-        elif source_msg.video_note:
-            return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
-        elif source_msg.audio:
-            return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        else:
-            text = source_msg.html_text or source_msg.text or ""
-            if text:
-                return await bot.send_message(**kwargs, text=text)
+        return await _copy_message_smart(source_msg, bot, kwargs)
     except Exception as e:
         # НЕ глотаем ошибку: вызывающий код (_send_to_topic_retry) сам решает,
         # повторить отправку на временном сбое или пересоздать удалённый топик.
@@ -368,32 +488,7 @@ async def _send_to_user(source_msg: Message, bot: Bot,
         kwargs["reply_to_message_id"] = reply_to
 
     try:
-        if source_msg.photo:
-            return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.video:
-            return await bot.send_video(**kwargs, video=source_msg.video.file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.animation:
-            return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
-                                             caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.document:
-            return await bot.send_document(**kwargs, document=source_msg.document.file_id,
-                                            caption=source_msg.html_text or source_msg.caption or "")
-        elif source_msg.sticker:
-            return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
-        elif source_msg.voice:
-            return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
-                                         caption=source_msg.caption or "")
-        elif source_msg.video_note:
-            return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
-        elif source_msg.audio:
-            return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
-                                         caption=source_msg.html_text or source_msg.caption or "")
-        else:
-            text = source_msg.html_text or source_msg.text or ""
-            if text:
-                return await bot.send_message(**kwargs, text=text)
+        return await _copy_message_smart(source_msg, bot, kwargs)
     except TelegramForbiddenError:
         # Юзер заблокировал/забанил бота — обрабатываем топик
         if bot_id:
@@ -1397,7 +1492,15 @@ class ChildManager:
         Используется кнопкой «🔄 Полный перезапуск» в профиле: перезапускает
         всех ботов владельца, чтобы «разбудить» зависших — без удаления и
         перепривязки чатов.
+
+        Молча (без сообщений в интерфейсе) выполняет «мягкий ремонт» данных:
+        возвращает в приветствия премиум-эмодзи, которые владелец раньше
+        отправлял как премиум (см. services/premium_emoji.py). Данные
+        (пользователи, топики, админы, диалоги) при этом НЕ трогаются —
+        меняется только разметка эмодзи в сохранённом приветствии.
         """
+        repaired = repair_premium_emoji_for_owner(owner_id)
+
         bots = [
             b for b in get_all_bots_flat()
             if b.get("owner_id") == owner_id and not b.get("stopped")
@@ -1412,7 +1515,10 @@ class ChildManager:
                 logger.error("Ошибка полного перезапуска: %s", res)
             elif res:
                 ok += 1
-        logger.info("Полный перезапуск владельца %s: %s/%s", owner_id, ok, len(bots))
+        logger.info(
+            "Полный перезапуск владельца %s: %s/%s ботов; ремонт премиум-эмодзи: %s",
+            owner_id, ok, len(bots), repaired,
+        )
         return {"total": len(bots), "ok": ok}
 
     async def start_all_children(self) -> None:

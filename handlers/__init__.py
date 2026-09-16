@@ -17,9 +17,15 @@ from handlers.admin_moderation import router as admin_moderation_router
 from handlers.restart import router as restart_router
 from handlers.antiraid import router as antiraid_router
 from handlers.reminders import router as reminders_router
+from services.premium_emoji import PremiumEmojiLearningMiddleware
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
+    # Учим словарь премиум-эмодзи по ВСЕМ сообщениям (до фильтров): Telegram сам
+    # присылает custom_emoji-сущности, а по ним бот потом возвращает премиум в
+    # приветствиях, где эмодзи потерял «премиум» (см. services/premium_emoji.py).
+    dp.message.outer_middleware(PremiumEmojiLearningMiddleware())
+
     dp.include_router(start_router)
     dp.include_router(my_bots_router)
     dp.include_router(add_bot_router)
