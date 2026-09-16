@@ -357,6 +357,25 @@ def ensure_db() -> None:
             key     TEXT PRIMARY KEY,
             value   TEXT DEFAULT ''
         );
+
+        -- Напоминалки: «авточек ответа админа» и «напоминание про ПЗ».
+        CREATE TABLE IF NOT EXISTS reminders (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id         INTEGER NOT NULL,
+            mode             TEXT NOT NULL,
+            duration_seconds INTEGER NOT NULL,
+            enabled          INTEGER DEFAULT 1,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Когда последний раз слали напоминание по конкретному топику
+        -- (защита от дублирования уведомлений при каждом сканировании).
+        CREATE TABLE IF NOT EXISTS reminder_ticks (
+            reminder_id  INTEGER NOT NULL,
+            topic_key    TEXT NOT NULL,
+            last_sent_at TIMESTAMP,
+            PRIMARY KEY (reminder_id, topic_key)
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
@@ -1942,8 +1961,10 @@ def transfer_all_rights(
 ) -> int:
     """Полная передача всех прав владельца новому юзеру.
 
-    Мигрируют: боты, админы, совладельцы, привязанные чаты (работа/админов),
-    настройки предов (warn_settings) и модераторы «чата админов».
+    Мигрируют: боты (приветствие, линки/инлайн-кнопки, тип, анонимность,
+    антиспам, клавиатуры), админы, совладельцы, привязанные чаты
+    (работа/админов), настройки предов (warn_settings), модераторы «чата
+    админов», настройки антирейда, напоминалки.
     Возвращает количество переданных ботов.
     """
     register_user(to_id, to_username, to_first_name)
@@ -1965,7 +1986,10 @@ def transfer_all_rights(
         conn.execute("UPDATE coowners SET owner_id = ? WHERE owner_id = ?", (to_id, from_id))
         # Настройки предов
         conn.execute(
-            "UPDATE warn_settings SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+            "INSERT OR REPLACE INTO warn_settings (owner_id, max_warns, punish_type, punish_duration) "
+            "SELECT ?, max_warns, punish_type, punish_duration "
+            "FROM warn_settings WHERE owner_id = ?",
+            (to_id, from_id),
         )
         conn.execute(
             "DELETE FROM warn_settings WHERE owner_id = ?", (from_id,)
@@ -1979,6 +2003,24 @@ def transfer_all_rights(
             "UPDATE admin_chat_moderators SET owner_id = ? WHERE owner_id = ?",
             (to_id, from_id),
         )
+        # Напоминалки
+        conn.execute(
+            "UPDATE reminders SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+        )
+        # Клавиатуры дочерних ботов (кнопки) — переезжают к новому владельцу,
+        # чтобы «настройки редактора» не сбрасывались после передачи прав.
+        conn.execute(
+            "UPDATE bot_keyboards SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+        )
+        # Настройки антирейда «чата админов» — полностью переезжают вместе с чатом.
+        conn.execute(
+            "INSERT OR REPLACE INTO antiraid_settings "
+            "(owner_id, enabled, threshold, del_links, del_members, triggered, updated_at) "
+            "SELECT ?, enabled, threshold, del_links, del_members, triggered, updated_at "
+            "FROM antiraid_settings WHERE owner_id = ?",
+            (to_id, from_id),
+        )
+        conn.execute("DELETE FROM antiraid_settings WHERE owner_id = ?", (from_id,))
         conn.commit()
 
     # Привязанные чаты передаём новому владельцу (только если у старого они были).
@@ -2013,6 +2055,13 @@ def transfer_bot(
             "UPDATE bots SET owner_id = ? WHERE id = ? AND owner_id = ?",
             (to_id, bot_id, from_id),
         )
+        # Клавиатура (кнопки) бота переезжает вместе с ним — иначе у нового
+        # владельца настройки бота «сбрасывались» бы в значения по умолчанию.
+        if cur.rowcount > 0:
+            conn.execute(
+                "UPDATE bot_keyboards SET owner_id = ? WHERE bot_id = ? AND owner_id = ?",
+                (to_id, bot_id, from_id),
+            )
         conn.commit()
         ok = cur.rowcount > 0
         if not ok:
@@ -2028,3 +2077,92 @@ def transfer_bot(
     # Новый владелец бота становится его админом со своим тегом.
     ensure_admin(to_id, to_id, to_username)
     return True
+
+
+# ═══════════════════════════════════════════════════════════
+#  Напоминалки (авточек ответа админа / напоминание про ПЗ)
+# ═══════════════════════════════════════════════════════════
+
+def get_reminders(owner_id: int) -> list[dict]:
+    """Все настройки напоминалок владельца (новые сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM reminders WHERE owner_id = ? ORDER BY id DESC",
+        (owner_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_reminder(owner_id: int, mode: str, duration_seconds: int) -> int:
+    """Создаёт напоминалку и возвращает её id."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT INTO reminders (owner_id, mode, duration_seconds) VALUES (?, ?, ?)",
+            (owner_id, mode, duration_seconds)
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def set_reminder_enabled(reminder_id: int, enabled: bool) -> bool:
+    """Включает/выключает напоминалку."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE reminders SET enabled = ? WHERE id = ?",
+            (1 if enabled else 0, reminder_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_reminder(reminder_id: int) -> bool:
+    """Удаляет напоминалку вместе с историей отправок."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        conn.execute("DELETE FROM reminder_ticks WHERE reminder_id = ?", (reminder_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_all_enabled_reminders() -> list[dict]:
+    """Все включённые напоминалки всех владельцев (для фонового сканера)."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM reminders WHERE enabled = 1").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_reminder_tick(reminder_id: int, topic_key: str) -> str | None:
+    """UTC-время последней отправки напоминания по топику (или None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT last_sent_at FROM reminder_ticks WHERE reminder_id = ? AND topic_key = ?",
+        (reminder_id, topic_key)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_reminder_tick(reminder_id: int, topic_key: str, last_sent_at: str) -> None:
+    """Записывает время последней отправки напоминания по топику."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO reminder_ticks (reminder_id, topic_key, last_sent_at) "
+            "VALUES (?, ?, ?)",
+            (reminder_id, topic_key, last_sent_at)
+        )
+        conn.commit()
+
+
+def get_last_admin_reply_at(bot_id: int, topic_id: int, group_chat_id: int) -> str | None:
+    """Время последнего ответа админа в топике (direction='out'), UTC-строка."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT created_at FROM feedback_messages "
+        "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ? AND direction = 'out' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (bot_id, topic_id, group_chat_id)
+    ).fetchone()
+    return row[0] if row else None

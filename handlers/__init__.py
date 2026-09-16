@@ -16,6 +16,7 @@ from handlers.complaints import router as complaints_router
 from handlers.admin_moderation import router as admin_moderation_router
 from handlers.restart import router as restart_router
 from handlers.antiraid import router as antiraid_router
+from handlers.reminders import router as reminders_router
 
 
 def register_all_handlers(dp: Dispatcher) -> None:
@@ -37,3 +38,4 @@ def register_all_handlers(dp: Dispatcher) -> None:
     # (мониторинг спама), и он не должен перехватывать /perezap и /perestart.
     dp.include_router(restart_router)
     dp.include_router(antiraid_router)
+    dp.include_router(reminders_router)

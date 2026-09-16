@@ -9,7 +9,7 @@ from typing import Any
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType, ChatType, ChatMemberStatus
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
@@ -69,11 +69,20 @@ logger = logging.getLogger(__name__)
 # Основной (YamoBot) бот — используется для уведомлений в привязанный «чат админов».
 _MAIN_BOT: Bot | None = None
 
+# Минимальный интервал (секунды) между /start одного и того же пользователя
+# в дочернем боте — защита от спама командой.
+CHILD_START_MIN_INTERVAL = 3.0
+
 
 def set_main_bot(bot: Bot) -> None:
     """Сохраняет ссылку на основной бот YamoBot для отправки уведомлений."""
     global _MAIN_BOT
     _MAIN_BOT = bot
+
+
+def get_main_bot() -> Bot | None:
+    """Возвращает основной бот YamoBot (используется фоновыми сервисами)."""
+    return _MAIN_BOT
 
 
 # Кэш скачанных байт медиа по file_id: file_id -> bytes.
@@ -113,6 +122,19 @@ def _topic_web_link(group_chat_id: int, topic_id: int) -> str:
     return f"https://t.me/c/{chat_part}/{topic_id}"
 
 
+def topic_web_link(group_chat_id: int, topic_id: int) -> str:
+    """Публичная обёртка для формирования ссылки на топик."""
+    return _topic_web_link(group_chat_id, topic_id)
+
+
+def _is_thread_not_found(err: Exception) -> bool:
+    """True, если ошибка означает, что топик удалён/недоступен (message thread not found)."""
+    msg = (getattr(err, "message", "") or "").lower()
+    return ("message thread not found" in msg
+            or "thread not found" in msg
+            or "topic not found" in msg)
+
+
 async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None:
     """Шлёт в привязанный «чат админов» владельца уведомление о новом ПЗ.
 
@@ -142,6 +164,37 @@ async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None
         await _MAIN_BOT.send_message(chat_id=admin_chat, text=text)
     except Exception as e:
         logger.warning("Не удалось отправить уведомление о новом ПЗ в чат админов: %s", e)
+
+
+async def _notify_admin_change(bot_id: int, group_chat_id: int, topic_id: int) -> None:
+    """Шлёт в «чат админов» владельца уведомление о запросе смены админа.
+
+    Топик к этому моменту уже сброшен в «без админа», поэтому автоматически
+    попадает в список «ПЗ без админов» (/стата → «ПЗ без админов»).
+    """
+    if _MAIN_BOT is None:
+        return
+    owner_id = get_bot_owner(bot_id)
+    if not owner_id:
+        return
+    admin_chat = get_bound_chat(owner_id, "admin")
+    if not admin_chat:
+        return
+
+    bot_info = get_bot_by_id_any_owner(bot_id)
+    bot_name = bot_display_name(bot_info) if bot_info else f"bot_{bot_id}"
+    link = _topic_web_link(group_chat_id, topic_id)
+
+    text = (
+        f"🔄 <b>ПЗ просит смену админа!</b>\n"
+        f"🤖 Бот: <b>{bot_name}</b>\n"
+        f"🔗 Топик: {link}"
+    )
+
+    try:
+        await _MAIN_BOT.send_message(chat_id=admin_chat, text=text)
+    except Exception as e:
+        logger.warning("Не удалось отправить уведомление о смене админа: %s", e)
 
 
 def _build_welcome_kb(bot_data: dict) -> InlineKeyboardMarkup | None:
@@ -188,6 +241,7 @@ async def _safe_answer(message: Message, text: str, reply_markup=None) -> bool:
         return True
     except TelegramBadRequest:
         # Возможно, текст сломал HTML — пробуем без форматирования.
+        logger.warning("HTML-отправка не удалась, отправляю без форматирования: %.120s", text)
         try:
             await message.answer(text, reply_markup=reply_markup, parse_mode=None)
             return True
@@ -257,8 +311,53 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
             if text:
                 return await bot.send_message(**kwargs, text=text)
     except Exception as e:
+        # НЕ глотаем ошибку: вызывающий код (_send_to_topic_retry) сам решает,
+        # повторить отправку на временном сбое или пересоздать удалённый топик.
         logger.error("Ошибка отправки в топик: %s", e)
-    return None
+        raise
+
+
+async def _send_to_topic_retry(source_msg: Message, bot: Bot,
+                               group_chat_id: int, topic_id: int,
+                               reply_to: int | None = None,
+                               attempts: int = 3) -> tuple[Message | None, bool]:
+    """Отправляет сообщение в топик с ретраями на временные сбои.
+
+    Возвращает (sent, thread_not_found):
+      • sent             — доставленное сообщение или None;
+      • thread_not_found — True, только если топик реально удалён/устарел
+        (такие ошибки ретраить бессмысленно — топик надо пересоздавать).
+
+    Временные ошибки (сеть, 429) повторяются с короткой паузой, чтобы
+    НЕ терять сообщения и НЕ плодить дубликаты топиков при спаме.
+    """
+    for attempt in range(attempts):
+        try:
+            sent = await _send_to_topic(source_msg, bot, group_chat_id, topic_id, reply_to)
+            return sent, False
+        except TelegramRetryAfter as e:
+            delay = min(float(getattr(e, "retry_after", 1) or 1), 5.0)
+            logger.warning(
+                "Flood wait %.1fs при отправке в топик %s (попытка %d/%d)",
+                delay, topic_id, attempt + 1, attempts,
+            )
+            await asyncio.sleep(delay)
+        except TelegramBadRequest as e:
+            if _is_thread_not_found(e):
+                logger.warning("Топик %s не найден (thread not found) — требуется пересоздание.", topic_id)
+                return None, True
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            logger.error("Ошибка отправки в топик %s: %s", topic_id, e)
+        except Exception as e:
+            # Сетевая/временная ошибка — подождём и попробуем ещё раз.
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            logger.error("Не удалось отправить в топик %s после %d попыток: %s",
+                         topic_id, attempts, e)
+    return None, False
 
 
 async def _send_to_user(source_msg: Message, bot: Bot,
@@ -350,10 +449,40 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     sticker_warnings: dict[int, bool] = defaultdict(bool)
     last_message_time: dict[int, float] = {}
 
+    # Анти-спам /start: повторные /start в течение интервала игнорируются,
+    # чтобы наплыв команд не ронял бота и не плодил дубликаты приветствий.
+    last_start_time: dict[int, float] = {}
+    # Локи на пользователя: сообщения одного ПЗ обрабатываются строго по очереди,
+    # благодаря чему топик создаётся ровно один раз даже при спаме сразу после
+    # нажатия /start, и каждое сообщение попадает в один и тот же топик.
+    user_locks: dict[tuple[int, int], asyncio.Lock] = {}
+
+    def _get_user_lock(user_chat_id: int) -> asyncio.Lock:
+        key = (bot_id, user_chat_id)
+        lock = user_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            user_locks[key] = lock
+        return lock
+
     # ═══════════════ /start в ЛС ═══════════════
 
     @child_dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
     async def child_start(message: Message) -> None:
+        """/start дочернего бота с защитой от спама и от падений."""
+        try:
+            uid = msg_uid(message)
+            now = time.monotonic()
+            prev = last_start_time.get(uid, 0.0)
+            if now - prev < CHILD_START_MIN_INTERVAL:
+                logger.debug("Пропускаю повторный /start от %s (анти-спам)", uid)
+                return
+            last_start_time[uid] = now
+            await _do_child_start(message)
+        except Exception as e:
+            logger.exception("Ошибка в /start дочернего бота %s: %s", bot_id, e)
+
+    async def _do_child_start(message: Message) -> None:
         if is_user_banned(bot_id, msg_uid(message)):
             return
 
@@ -611,6 +740,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         user_chat_id = topic["user_chat_id"]
         reset_topic_admin(bot_id, thread_id, group_chat_id)
+        try:
+            await _notify_admin_change(bot_id, group_chat_id, thread_id)
+        except Exception as e:
+            logger.warning("Не удалось уведомить о смене админа: %s", e)
 
         try:
             await bot_obj.edit_forum_topic(
@@ -643,6 +776,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
 
         reset_topic_admin(bot_id, thread_id, group_chat_id)
+        try:
+            await _notify_admin_change(bot_id, group_chat_id, thread_id)
+        except Exception as e:
+            logger.warning("Не удалось уведомить о смене админа: %s", e)
 
         try:
             await bot_obj.edit_forum_topic(
@@ -687,6 +824,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         user_chat_id = topic["user_chat_id"]
         reset_topic_admin(bot_id, thread_id, group_chat_id)
+        try:
+            await _notify_admin_change(bot_id, group_chat_id, thread_id)
+        except Exception as e:
+            logger.warning("Не удалось уведомить о смене админа: %s", e)
 
         # Уведомляем самого юзера, что его админа меняют
         try:
@@ -824,6 +965,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         if answer == "yes":
             reset_topic_admin(bot_id, topic_id, group_chat_id)
+            try:
+                await _notify_admin_change(bot_id, group_chat_id, topic_id)
+            except Exception as e:
+                logger.warning("Не удалось уведомить о смене админа: %s", e)
 
             try:
                 await bot_obj.edit_forum_topic(
@@ -956,10 +1101,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
 
         anon_mode = is_bot_anonymous(bot_id)
-        topic = get_topic_by_user(bot_id, user_chat_id)
 
-        async def _open_new_topic() -> None:
-            """Создаёт свежий топик, присылает заголовок и пересылает сообщение."""
+        async def _open_new_topic() -> dict | None:
+            """Создаёт свежий топик и пересылает сообщение.
+
+            Вызывается ТОЛЬКО под локом на пользователя, поэтому даже при спаме
+            топик создаётся ровно один раз. Возвращает словарь топика или None.
+            """
+            # Топик мог появиться, пока мы ждали лок — перепроверяем.
+            existing = get_topic_by_user(bot_id, user_chat_id)
+            if existing:
+                return existing
             try:
                 forum_topic = await bot_obj.create_forum_topic(
                     chat_id=group_chat_id, name="⏳ без админа"
@@ -967,7 +1119,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 new_topic_id = forum_topic.message_thread_id
             except Exception as e:
                 logger.error("Не удалось создать топик: %s", e)
-                return
+                return None
 
             create_topic_record(bot_id, user_chat_id, group_chat_id, new_topic_id)
 
@@ -977,16 +1129,19 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 user_name = msg_firstname(message) or msg_username(message) or str(user_chat_id)
                 header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
 
-            await bot_obj.send_message(
-                chat_id=group_chat_id, message_thread_id=new_topic_id,
-                text=header_text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✋ Я беру",
-                                           callback_data=f"take_user_{new_topic_id}_{group_chat_id}")]
-                ])
-            )
+            try:
+                await bot_obj.send_message(
+                    chat_id=group_chat_id, message_thread_id=new_topic_id,
+                    text=header_text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✋ Я беру",
+                                               callback_data=f"take_user_{new_topic_id}_{group_chat_id}")]
+                    ])
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить заголовок топика: %s", e)
 
-            sent = await _send_to_topic(message, bot_obj, group_chat_id, new_topic_id)
+            sent, _ = await _send_to_topic_retry(message, bot_obj, group_chat_id, new_topic_id)
             if sent:
                 save_feedback_message(bot_id, new_topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
@@ -996,33 +1151,52 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             except Exception as e:
                 logger.warning("Не удалось отправить уведомление о новом ПЗ: %s", e)
 
-        if not topic:
-            await _open_new_topic()
-            return
+            return get_topic_by_user(bot_id, user_chat_id) or {
+                "topic_id": new_topic_id, "group_chat_id": group_chat_id,
+            }
 
-        topic_id = topic["topic_id"]
+        # ── Доставка сообщения в топик под локом на пользователя ──
+        # Если ПЗ спамит сразу после /start, сообщения обрабатываются по очереди:
+        # топик создаётся ровно один раз, а каждое сообщение попадает в него.
+        async with _get_user_lock(user_chat_id):
+            topic = get_topic_by_user(bot_id, user_chat_id)
 
-        reply_to_group = None
-        if message.reply_to_message:
-            orig = get_feedback_msg_by_user_msg(bot_id, user_chat_id, message.reply_to_message.message_id)
-            if orig:
-                reply_to_group = orig["group_msg_id"]
+            if not topic:
+                await _open_new_topic()
+                return
 
-        sent = await _send_to_topic(message, bot_obj, group_chat_id, topic_id, reply_to_group)
+            topic_id = topic["topic_id"]
 
-        if sent:
-            save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
-                                   "in", sent.message_id, message.message_id)
-        else:
-            # Отправка не удалась (вероятно, топик устарел или удалён —
-            # "message thread not found"). Удаляем запись и создаём свежий топик.
-            if group_chat_id == topic.get("group_chat_id"):
+            reply_to_group = None
+            if message.reply_to_message:
+                orig = get_feedback_msg_by_user_msg(bot_id, user_chat_id, message.reply_to_message.message_id)
+                if orig:
+                    reply_to_group = orig["group_msg_id"]
+
+            sent, thread_not_found = await _send_to_topic_retry(
+                message, bot_obj, group_chat_id, topic_id, reply_to_group
+            )
+
+            if sent:
+                save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
+                                       "in", sent.message_id, message.message_id)
+            elif thread_not_found:
+                # Топик реально удалён/устарел — пересоздаём ровно один раз
+                # под тем же локом, чтобы не наплодить дубликатов при спаме.
+                if group_chat_id == topic.get("group_chat_id"):
+                    logger.warning(
+                        "Топик %s для юзера %s недоступен — пересоздаю.", topic_id, user_chat_id
+                    )
+                    delete_topic_record(bot_id, user_chat_id)
+                await _open_new_topic()
+            else:
+                # Временный сбой доставки — топик НЕ трогаем: иначе при спаме
+                # каждое неудачное сообщение плодило бы новый топик, а ПЗ
+                # «размазывался» бы по нескольким топикам.
                 logger.warning(
-                    "Топик %s для юзера %s недоступен — пересоздаю.", topic_id, user_chat_id
+                    "Не удалось доставить сообщение в топик %s (юзера %s).",
+                    topic_id, user_chat_id,
                 )
-                delete_topic_record(bot_id, user_chat_id)
-            await _open_new_topic()
-            return
 
     # ═══════════════ Сообщения из топика → юзеру ═══════════════
 

@@ -1,4 +1,5 @@
 import logging
+import time
 
 from aiogram import Router, F
 from aiogram.enums import ChatType
@@ -37,6 +38,11 @@ from services.storage import (
 router = Router()
 
 _logger = logging.getLogger(__name__)
+
+# Анти-спам /start: повторные /start одного пользователя в течение интервала
+# (секунды) игнорируются, чтобы наплыв команд не ронял бота.
+MAIN_START_MIN_INTERVAL = 3.0
+_LAST_START: dict[int, float] = {}
 
 
 class StartFSM(StatesGroup):
@@ -87,6 +93,15 @@ async def _show_main(message: Message) -> None:
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    # Анти-спам /start: повторные команды одного пользователя в течение интервала
+    # игнорируются, чтобы бот не падал от наплыва /start (например, при долгом
+    # нажатии на кнопку Start или автокликерах).
+    _uid = msg_uid(message)
+    _now = time.monotonic()
+    if _now - _LAST_START.get(_uid, 0.0) < MAIN_START_MIN_INTERVAL:
+        return
+    _LAST_START[_uid] = _now
+
     await state.clear()
     user_id = msg_uid(message)
     register_user(user_id, msg_username(message) or "", msg_firstname(message) or "")

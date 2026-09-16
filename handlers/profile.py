@@ -236,6 +236,9 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
             InlineKeyboardButton(text="🛡 Антирейд", callback_data="antiraid"),
         ],
         [
+            InlineKeyboardButton(text="⏰ Напоминалка", callback_data="reminder_menu"),
+        ],
+        [
             InlineKeyboardButton(text="👑 Передать права", callback_data="transfer"),
             InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all"),
         ],
@@ -438,7 +441,8 @@ async def handle_transfer_link(message: Message, token: str) -> None:
 
 
 @router.callback_query(F.data.startswith("transfer_accept_"))
-async def cb_transfer_accept(callback: CallbackQuery) -> None:
+async def cb_transfer_accept(callback: CallbackQuery,
+                             child_manager: ChildManager) -> None:
     from aiogram.exceptions import TelegramBadRequest
     token = cb_data(callback).split("transfer_accept_", 1)[1]
     transfer = get_transfer(token)
@@ -471,6 +475,26 @@ async def cb_transfer_accept(callback: CallbackQuery) -> None:
         count = transfer_all_rights(int(from_uid or 0), to_uid, username, first_name)
         rights_text = "все права"
         summary = f"👑 <b>Все права приняты!</b>\n\nПередано ботов: <b>{count}</b>."
+
+    # Перезапускаем переданные дочерние боты, чтобы новый владелец сразу получил
+    # актуальные настройки (приветствие, кнопки, анонимность) без ручного рестарта.
+    restart_count = 0
+    try:
+        if kind == "bot":
+            bot = get_bot_by_id_any_owner(bot_id)
+            if bot and child_manager.is_running(bot_id):
+                if await child_manager.restart_child(bot):
+                    restart_count += 1
+        else:
+            for b in get_user_bots(to_uid):
+                if child_manager.is_running(b["id"]):
+                    if await child_manager.restart_child(b):
+                        restart_count += 1
+    except Exception:
+        pass
+
+    if restart_count:
+        summary += f"\n\n🔄 Перезапущено ботов: <b>{restart_count}</b>"
 
     delete_transfer(token)
 
