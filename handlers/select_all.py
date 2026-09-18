@@ -1,3 +1,115 @@
+<<<<<<< HEAD
+from aiogram import Router, F
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
+from handlers._common import render_callback, safe_edit, cb_uid
+from services.storage import get_user_bots, bot_display_name, get_all_stats
+from services.child_manager import ChildManager
+
+router = Router()
+
+
+def select_all_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📨 Рассылка", callback_data="all_mailing", style="primary"),
+            InlineKeyboardButton(text="✏️ Редактор", callback_data="all_editor", style="primary"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="all_stats", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="⛔ Остановить все", callback_data="all_stop", style="danger"),
+            InlineKeyboardButton(text="▶️ Запустить все", callback_data="all_start_all", style="success"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots", style="primary")],
+    ])
+
+
+@router.callback_query(F.data == "select_all")
+async def cb_select_all(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+
+    names = "\n".join(f"  • {bot_display_name(b)}" for b in bots)
+    text = f"📌 <b>Все боты</b> ({len(bots)})\n\n{names}\n\nВыбери действие:"
+
+    await render_callback(callback, text, select_all_kb())
+
+
+@router.callback_query(F.data == "all_stats")
+async def cb_all_stats(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+
+    if not bots:
+        await callback.answer("⚠️ Нет ботов")
+        return
+
+    bot_ids = [b["id"] for b in bots]
+    s = get_all_stats(bot_ids)
+
+    text = (
+        f"📊 <b>Общая статистика</b> ({len(bots)} ботов)\n\n"
+        f"👥 Всего пользователей: <b>{s['users_total']}</b>\n"
+        f"🚫 Заблокировали: <b>{s['users_blocked']}</b>\n"
+        f"✅ Активных: <b>{s['users_active']}</b>\n\n"
+        f"📩 Получено: <b>{s['messages_in']}</b>\n"
+        f"📤 Отправлено: <b>{s['messages_out']}</b>\n\n"
+        f"📨 Рассылок: <b>{s['mailings_count']}</b>\n"
+        f"  ├ Доставлено: <b>{s['mailings_sent']}</b>\n"
+        f"  └ Не доставлено: <b>{s['mailings_failed']}</b>"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="all_stats", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all", style="primary")],
+    ])
+
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "all_stop")
+async def cb_all_stop(callback: CallbackQuery, child_manager: ChildManager) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+
+    stopped = 0
+    for b in bots:
+        if child_manager.is_running(b["id"]):
+            await child_manager.stop_child(b["id"])
+            stopped += 1
+
+    await callback.answer(f"⛔ Остановлено: {stopped}")
+
+    await safe_edit(
+        callback.message,
+        f"⛔ <b>Все боты остановлены</b>\n\nОстановлено: {stopped}",
+        select_all_kb(),
+    )
+
+
+@router.callback_query(F.data == "all_start_all")
+async def cb_all_start(callback: CallbackQuery, child_manager: ChildManager) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+
+    started = 0
+    for b in bots:
+        if not child_manager.is_running(b["id"]):
+            ok = await child_manager.start_child(b)
+            if ok:
+                started += 1
+
+    await callback.answer(f"▶️ Запущено: {started}")
+
+    await safe_edit(
+        callback.message,
+        f"▶️ <b>Все боты запущены</b>\n\nЗапущено: {started}",
+        select_all_kb(),
+=======
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery,
@@ -108,4 +220,5 @@ async def cb_all_start(callback: CallbackQuery, child_manager: ChildManager) -> 
         callback.message,
         f"▶️ <b>Все боты запущены</b>\n\nЗапущено: {started}",
         select_all_kb(),
+>>>>>>> a26fa0ca2db5328dc4044ff97611847506600e74
     )

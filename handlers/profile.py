@@ -1,3 +1,1157 @@
+<<<<<<< HEAD
+from aiogram import Router, F
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
+                              cb_uid, cb_username, cb_firstname, msg_uid,
+                              msg_username, msg_firstname, try_edit_answer)
+from services.child_manager import ChildManager
+from services.config import is_super_admin
+from services.constants import BOT_VERSION
+from services.storage import (
+    get_all_users_registry,
+    get_user_bots,
+    get_admins_all,
+    get_all_bots_flat,
+    get_all_topics_for_bot,
+    get_stats,
+    bot_display_name,
+    utc_to_msk,
+    is_registry_user_banned,
+    set_registry_user_blocked,
+    remove_user_bot,
+    remove_admin,
+    get_bound_chat,
+    set_bound_chat,
+    get_pending_bind,
+    set_pending_bind,
+    get_user_registry,
+    get_bot_by_id_any_owner,
+    create_transfer,
+    get_transfer,
+    delete_transfer,
+    transfer_all_rights,
+    transfer_bot,
+)
+
+router = Router()
+
+# Ожидание привязки чатов: user_id -> kind ("work"|"admin").
+_PENDING_BINDS: dict[int, str] = {}
+# Последний добавленный чат для юзера: user_id -> chat_id (для кнопки «я добавил бота»).
+_LAST_ADDED: dict[int, int] = {}
+
+
+class BroadcastFSM(StatesGroup):
+    waiting_text = State()
+
+
+
+def _user_line(u: dict) -> str:
+    name = u.get("username") or u.get("first_name") or str(u["user_id"])
+    status = "🚫" if u.get("blocked") else "🟢"
+    return f"{status} {name}"
+
+
+def admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📨 Список жалоб", callback_data="complaints_admin", style="primary"),
+            InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list", style="primary"),
+        ],
+        [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="broadcast", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
+    ])
+
+
+# ═══════════════ Рассылка всем пользователям (только супер-админ) ═══════════════
+
+@router.callback_query(F.data == "broadcast")
+async def cb_broadcast(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    all_users = [u for u in get_all_users_registry() if not u.get("blocked")]
+    vld = [u for u in all_users if get_user_bots(u["user_id"])]
+    text = (
+        "📨 <b>Рассылка пользователям</b>\n\n"
+        f"👥 Всего пользователей: <b>{len(all_users)}</b>\n"
+        f"🤖 Только ВЛД (владельцев): <b>{len(vld)}</b>\n\n"
+        "Кому выслать?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Всем", callback_data="broadcast_all", style="primary")],
+        [InlineKeyboardButton(text="🤖 Только ВЛД", callback_data="broadcast_vld", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin", style="primary")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+async def _ask_broadcast_message(callback: CallbackQuery, state: FSMContext, mode: str) -> None:
+    await state.set_state(BroadcastFSM.waiting_text)
+    await state.update_data(broadcast_mode=mode)
+    label = "Всем пользователям" if mode == "all" else "Только ВЛД (владельцам)"
+    if callback.message:
+        await try_edit_answer(
+            callback.message,
+            f"📨 <b>Рассылка — {label}</b>\n\n"
+            "Отправь <b>сообщение</b>, которое нужно разослать (текст с HTML "
+            "или премиум-эмодзи).",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_admin", style="primary")]
+            ]),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "broadcast_all")
+async def cb_broadcast_all(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await _ask_broadcast_message(callback, state, "all")
+
+
+@router.callback_query(F.data == "broadcast_vld")
+async def cb_broadcast_vld(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await _ask_broadcast_message(callback, state, "vld")
+
+
+@router.message(BroadcastFSM.waiting_text)
+async def fsm_broadcast(message: Message, state: FSMContext) -> None:
+    user_id = msg_uid(message)
+    if not is_super_admin(user_id):
+        await state.clear()
+        return
+    text = message.html_text or message.text or ""
+    if not text.strip():
+        await message.answer("❌ Сообщение не должно быть пустым.")
+        return
+    data = await state.get_data()
+    mode = data.get("broadcast_mode", "all")
+    await state.clear()
+
+    recipients = [u for u in get_all_users_registry() if not u.get("blocked")]
+    if mode == "vld":
+        recipients = [u for u in recipients if get_user_bots(u["user_id"])]
+
+    await message.answer(f"📨 Рассылка запущена... 👥 {len(recipients)}")
+    ok, fail = 0, 0
+    for u in recipients:
+        if u["user_id"] == user_id:
+            continue
+        try:
+            bot = message.bot
+            if bot is None:
+                continue
+            await bot.send_message(u["user_id"], text)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    await message.answer(
+        f"📨 <b>Рассылка завершена</b>\n\n"
+        f"👥 Получателей: <b>{len(recipients)}</b>\n"
+        f"✅ Доставлено: <b>{ok}</b>\n"
+        f"❌ Ошибок: <b>{fail}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin", style="primary")]
+        ]),
+    )
+
+
+def profiles_kb(users: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for u in users:
+        rows.append([InlineKeyboardButton(
+            text=_user_line(u), callback_data=f"profile_view_{u['user_id']}"
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profile_admin", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_admin_kb(user_id: int) -> InlineKeyboardMarkup:
+    banned = is_registry_user_banned(user_id)
+    ban_btn = "🚫 Забанить" if not banned else "✅ Разбанить"
+    ban_data = f"profile_ban_{user_id}" if not banned else f"profile_unban_{user_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ban_btn, callback_data=ban_data, style=("danger" if not banned else "success"))],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data=f"profile_stats_{user_id}", style="primary")],
+        [InlineKeyboardButton(text="🗑 Удалить ботов", callback_data=f"profile_del_bots_{user_id}", style="danger")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="profiles_list", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="profile_admin", style="primary")],
+    ])
+
+
+def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Собирает текст и клавиатуру профиля (используется и для message, и для callback)."""
+    bots = get_user_bots(user_id)
+    admins = get_admins_all(user_id)
+
+    lines = []
+    total_pz = 0
+    for b in bots:
+        topics = get_all_topics_for_bot(b["id"])
+        total_pz += len(topics)
+        lines.append(f"  • {bot_display_name(b)} — 📋 ПЗ: <b>{len(topics)}</b>")
+    bots_list = "\n".join(lines) if lines else "  — нет ботов —"
+
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+    work_line = f"<code>{work_chat}</code>" if work_chat else "не привязан"
+    admin_line = f"<code>{admin_chat}</code>" if admin_chat else "не привязан"
+
+    text = (
+        f"👤 <b>Профиль</b>\n\n"
+        f"📛 Имя: <b>{first_name}</b>\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
+        f"🤖 Ботов: <b>{len(bots)}</b>\n"
+        f"👥 Админов: <b>{len(admins)}</b>\n"
+        f"📋 Всего ПЗ: <b>{total_pz}</b>\n\n"
+        f"💼 Чат работы: {work_line}\n"
+        f"🛡 Чат админов: {admin_line}\n\n"
+        f"<b>По ботам:</b>\n{bots_list}\n\n"
+        f"⚙️ Версия бота: <b>{BOT_VERSION}</b>"
+    )
+
+    # Кнопка чатов: «Привязать чаты» — пока ничего не привязано, иначе «Чаты».
+    any_chat = work_chat or admin_chat
+    chats_label = "📎 Чаты" if any_chat else "🔗 Привязать чаты"
+    chats_data = "chats_info" if any_chat else "chats_bind"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots", style="primary"),
+            InlineKeyboardButton(text="👥 Админы", callback_data="gadmins", style="primary"),
+            InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text=chats_label, callback_data=chats_data),
+            InlineKeyboardButton(text="🛡 Антирейд", callback_data="antiraid", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="⏰ Напоминалка", callback_data="reminder_menu", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="🚨 Антинакрутка", callback_data="antinakrutka",
+                                 style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer", style="primary"),
+            InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="📂 Мои ссылки и конфиги", callback_data="my_links",
+                                 style="primary"),
+        ],
+    ])
+    if is_super_admin(user_id):
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin", style="primary")
+        ])
+
+    return text, kb
+
+
+async def show_profile(message: Message) -> None:
+    text, kb = _profile_payload(msg_uid(message), msg_firstname(message) or "—")
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "profile_show")
+async def cb_profile_show(callback: CallbackQuery) -> None:
+    """Открывает профиль из инлайн-колбэка (без нового приветствия)."""
+    _PENDING_BINDS.pop(cb_uid(callback), None)
+    set_pending_bind(cb_uid(callback), None)
+    if callback.message is None:
+        return
+    text, kb = _profile_payload(cb_uid(callback), cb_firstname(callback) or "—")
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "profile_restart_all")
+async def cb_profile_restart_all(callback: CallbackQuery,
+                                 child_manager: ChildManager) -> None:
+    """«🔄 Полный перезапуск» — перезапускает всех дочерних ботов владельца.
+
+    Помогает, когда боты зависли или перестали отвечать: не нужно отвязывать
+    и привязывать заново — просто перезапускаем всё одним нажатием.
+    """
+    user_id = cb_uid(callback)
+    result = await child_manager.restart_all_for_owner(user_id)
+    text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
+    if result["total"]:
+        status = (
+            f"🔄 <b>Полный перезапуск завершён:</b> "
+            f"{result['ok']} из {result['total']} ботов перезапущено."
+        )
+    else:
+        status = "🔄 У тебя нет запущенных ботов для перезапуска."
+    await render_callback(callback, f"{status}\n\n{text}", kb)
+
+
+# ═══════════════ Передача прав владельца ═══════════════
+
+async def _master_bot_username(bot) -> str:
+    """Возвращает username мастер-бота (YamoBot) для ссылки-приглашения."""
+    try:
+        me = await bot.get_me()
+        return me.username or ""
+    except Exception:
+        return ""
+
+
+def _user_display(user_id: int) -> str:
+    """Имя пользователя YamoBot (для подписи «<ник> передаёт вам права»)."""
+    u = get_user_registry(user_id)
+    if u:
+        return u.get("username") or u.get("first_name") or f"ID:{user_id}"
+    return f"ID:{user_id}"
+
+
+def _rights_lines_from(transfer: dict) -> list[str]:
+    """Читаемый список того, что передаётся, по данным ссылки-передачи."""
+    kind = transfer.get("kind")
+    if kind == "bot" and transfer.get("bot_id"):
+        bot = get_bot_by_id_any_owner(int(transfer["bot_id"]))
+        if bot:
+            return [f"• {bot_display_name(bot)}"]
+        return ["• бот (удалён)"]
+    bots = get_user_bots(transfer.get("from_user_id") or 0)
+    if not bots:
+        return ["• все права"]
+    return [f"• {bot_display_name(b)}" for b in bots]
+
+
+@router.callback_query(F.data == "transfer")
+async def cb_transfer_open(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+    if not bots:
+        await render_callback(
+            callback,
+            "👑 <b>Передача прав</b>\n\nУ тебя нет ботов — передавать нечего.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")]
+            ]),
+        )
+        return
+
+    text = (
+        "👑 <b>Передача прав</b>\n\n"
+        "⚠️ <b>Внимание!</b> При передаче все привязанные данные "
+        "(боты, админы, совладельцы, привязанные чаты и настройки) "
+        "перейдут другому владельцу.\n\n"
+        "Что передаём?"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👑 Все права", callback_data="transfer_all", style="primary")],
+        [InlineKeyboardButton(text="🤖 Только одного бота", callback_data="transfer_one", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "transfer_one")
+async def cb_transfer_one(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    bots = get_user_bots(user_id)
+    if not bots:
+        await callback.answer("У тебя нет ботов", show_alert=True)
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=bot_display_name(b), callback_data=f"transfer_pick_{b['id']}")]
+        for b in bots
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="transfer", style="primary")])
+    await render_callback(
+        callback,
+        "🤖 <b>Передать одного бота</b>\n\nВыбери бота, которого хочешь передать:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _send_confirm_link(callback: CallbackQuery, token: str) -> None:
+    """Отправляет владельцу ссылку для передачи прав."""
+    username = await _master_bot_username(callback.bot)
+    if not username:
+        await callback.answer("⚠️ Не удалось сформировать ссылку", show_alert=True)
+        return
+    link = f"https://t.me/{username}?start=transfer_{token}"
+    text = (
+        "🔗 <b>Ссылка для передачи прав готова!</b>\n\n"
+        "Отправь её новому владельцу. После перехода он должен подтвердить принятие.\n\n"
+        f"<code>{link}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")]
+    ])
+    if callback.message:
+        await try_edit_answer(callback.message, text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "transfer_all")
+async def cb_transfer_all(callback: CallbackQuery) -> None:
+    token = create_transfer(cb_uid(callback), "all")
+    await _send_confirm_link(callback, token)
+
+
+@router.callback_query(F.data.startswith("transfer_pick_"))
+async def cb_transfer_pick(callback: CallbackQuery) -> None:
+    bot_id = int(cb_data(callback).split("_")[-1])
+    token = create_transfer(cb_uid(callback), "bot", bot_id)
+    await _send_confirm_link(callback, token)
+
+
+async def handle_transfer_link(message: Message, token: str) -> None:
+    """Обрабатывает переход нового владельца по ссылке `?start=transfer_<token>`."""
+    transfer = get_transfer(token)
+    if not transfer:
+        await message.answer("❌ Ссылка на передачу прав недействительна.")
+        return
+
+    from_uid = transfer.get("from_user_id")
+    to_uid = msg_uid(message)
+
+    if to_uid == from_uid:
+        await message.answer("⚠️ Ты не можешь передать права самому себе.")
+        return
+    if is_registry_user_banned(to_uid) and not is_super_admin(to_uid):
+        await message.answer("🚫 Вы заблокированы администрацией.")
+        return
+
+    lines = _rights_lines_from(transfer)
+
+    # Регистрируем нового владельца в реестре.
+    if not get_user_registry(to_uid):
+        from services.storage import register_user
+        register_user(to_uid, msg_username(message) or "", msg_firstname(message) or "")
+
+    text = (
+        f"👑 <b>Вам передают права!</b>\n\n"
+        f"Пользователь <b>{_user_display(int(from_uid or 0))}</b> передаёт вам следующие права:\n"
+        + "\n".join(lines)
+        + "\n\nПодтверди принятие, чтобы данные перешли к тебе навсегда."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"transfer_accept_{token}", style="success")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"transfer_reject_{token}", style="danger")],
+    ])
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("transfer_accept_"))
+async def cb_transfer_accept(callback: CallbackQuery,
+                             child_manager: ChildManager) -> None:
+    from aiogram.exceptions import TelegramBadRequest
+    token = cb_data(callback).split("transfer_accept_", 1)[1]
+    transfer = get_transfer(token)
+    if not transfer:
+        await callback.answer("⚠️ Ссылка уже недействительна.", show_alert=True)
+        return
+
+    from_uid = transfer.get("from_user_id")
+    to_uid = cb_uid(callback)
+    kind = transfer.get("kind")
+
+    if to_uid == from_uid:
+        await callback.answer("⚠️ Нельзя принять у самого себя.", show_alert=True)
+        return
+
+    username = cb_username(callback) or ""
+    first_name = cb_firstname(callback) or ""
+
+    if kind == "bot":
+        bot_id = int(transfer.get("bot_id") or 0)
+        ok = transfer_bot(int(from_uid or 0), to_uid, bot_id, username, first_name)
+        if not ok:
+            await callback.answer("⚠️ Не удалось передать бота.", show_alert=True)
+            return
+        bot = get_bot_by_id_any_owner(bot_id)
+        bot_name = bot_display_name(bot) if bot else f"бот {bot_id}"
+        rights_text = f"• {bot_name}"
+        summary = f"🤖 Теперь бот <b>{bot_name}</b> принадлежит тебе."
+    else:
+        count = transfer_all_rights(int(from_uid or 0), to_uid, username, first_name)
+        rights_text = "все права"
+        summary = f"👑 <b>Все права приняты!</b>\n\nПередано ботов: <b>{count}</b>."
+
+    # Перезапускаем переданные дочерние боты, чтобы новый владелец сразу получил
+    # актуальные настройки (приветствие, кнопки, анонимность) без ручного рестарта.
+    restart_count = 0
+    try:
+        if kind == "bot":
+            bot = get_bot_by_id_any_owner(bot_id)
+            if bot and child_manager.is_running(bot_id):
+                if await child_manager.restart_child(bot):
+                    restart_count += 1
+        else:
+            for b in get_user_bots(to_uid):
+                if child_manager.is_running(b["id"]):
+                    if await child_manager.restart_child(b):
+                        restart_count += 1
+    except Exception:
+        pass
+
+    if restart_count:
+        summary += f"\n\n🔄 Перезапущено ботов: <b>{restart_count}</b>"
+
+    delete_transfer(token)
+
+    if callback.message:
+        await try_edit_answer(
+            callback.message,
+            summary,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile_show")]
+            ]),
+        )
+
+    # Уведомляем старого владельца.
+    try:
+        bot = getattr(callback, "bot", None)
+        if bot is not None:
+            await bot.send_message(
+                int(from_uid or 0),
+                f"🔁 <b>Права переданы.</b>\n\n"
+                f"<b>{_user_display(to_uid)}</b> принял ваши права: {rights_text}.",
+            )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("transfer_reject_"))
+async def cb_transfer_reject(callback: CallbackQuery) -> None:
+    token = cb_data(callback).split("transfer_reject_", 1)[1]
+    transfer = get_transfer(token)
+    delete_transfer(token)
+
+    if callback.message:
+        await try_edit_answer(callback.message, "❌ <b>Вы отклонили передачу прав.</b>")
+
+    if transfer:
+        try:
+            bot = getattr(callback, "bot", None)
+            if bot is not None:
+                await bot.send_message(
+                    int(transfer.get("from_user_id") or 0),
+                    "❌ Новый владелец отклонил передачу прав.",
+                )
+        except Exception:
+            pass
+
+
+# ═══════════════ Админ-панель пользователей ═══════════════
+
+@router.callback_query(F.data == "profile_admin")
+async def cb_profile_admin(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await render_callback(callback, "🛡 <b>Админ-панель</b>\n\nВыбери раздел:", admin_kb())
+
+
+@router.callback_query(F.data == "profiles_list")
+async def cb_profiles_list(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    all_users = get_all_users_registry()
+    vld_count = sum(1 for u in all_users if get_user_bots(u["user_id"]))
+    bots_count = len(get_all_bots_flat())
+    text = (
+        "👥 <b>Профили пользователей</b>\n\n"
+        f"Всего пользователей: <b>{len(all_users)}</b>\n"
+        f"🤖 ВЛД (владельцы ботов): <b>{vld_count}</b>\n"
+        f"👥 Админы (по ботам): <b>{bots_count}</b>\n\n"
+        "Выбери категорию:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 ВЛД (владельцы)", callback_data="profiles_vld", style="primary")],
+        [InlineKeyboardButton(text="👥 Админы (по ботам)", callback_data="profiles_admins_bots", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin", style="primary")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+# ═══════════════ ВЛД — владельцы (у кого есть хотя бы один бот) ═══════════════
+
+def _vld_kb(users: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for u in users:
+        name = u.get("username") or u.get("first_name") or str(u["user_id"])
+        status = "🚫" if u.get("blocked") else "🟢"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} {name} ({len(get_user_bots(u['user_id']))} бот.)",
+            callback_data=f"profile_view_{u['user_id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "profiles_vld")
+async def cb_profiles_vld(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    vld = [u for u in get_all_users_registry() if get_user_bots(u["user_id"])]
+    if not vld:
+        await render_callback(
+            callback, "🤖 <b>ВЛД</b>\n\nПока нет владельцев с ботами.", admin_kb()
+        )
+        return
+    text = f"🤖 <b>ВЛД — владельцы</b> ({len(vld)})\n\nВыбери владельца:"
+    await render_callback(callback, text, _vld_kb(vld))
+
+
+@router.callback_query(F.data.startswith("profile_view_"))
+async def cb_profile_view(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    uid = int(cb_data(callback).split("_")[-1])
+    users = [u for u in get_all_users_registry() if u["user_id"] == uid]
+    if not users:
+        await callback.answer("Пользователь не найден")
+        return
+    u = users[0]
+    bots = get_user_bots(uid)
+    status = "🚫 заблокирован" if u.get("blocked") else "🟢 активен"
+    text = (
+        f"👤 <b>{u.get('username') or u.get('first_name') or uid}</b>\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"📅 Регистрация: {utc_to_msk(u.get('created_at'))[:10]}\n"
+        f"🤖 Ботов: <b>{len(bots)}</b>\n"
+        f"📌 Статус: {status}"
+    )
+    await render_callback(callback, text, profile_admin_kb(uid))
+
+
+@router.callback_query(F.data.startswith("profile_ban_"))
+async def cb_profile_ban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(uid, True)
+    await render_callback(callback, f"🚫 Пользователь <code>{uid}</code> забанен.", profile_admin_kb(uid))
+
+
+@router.callback_query(F.data.startswith("profile_unban_"))
+async def cb_profile_unban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(uid, False)
+    await render_callback(callback, f"✅ Пользователь <code>{uid}</code> разбанен.", profile_admin_kb(uid))
+
+
+# ═══════════════ Админы (по ботам) ═══════════════
+
+def _admins_bots_kb(bots: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for b in bots:
+        owner = b.get("owner_id", 0)
+        admins = get_admins_all(owner) if owner else []
+        label = f"{bot_display_name(b)} ⸱ 🆔 {b['id']} ⸱ адм.{len(admins)}"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"profiles_a_bot_{b['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "profiles_admins_bots")
+async def cb_profiles_admins_bots(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    bots = get_all_bots_flat()
+    if not bots:
+        await render_callback(callback, "👥 <b>Админы</b>\n\nБотов пока нет.", admin_kb())
+        return
+    text = f"👥 <b>Админы — по ботам</b> ({len(bots)} ботов)\n\nВыбери бот:"
+    await render_callback(callback, text, _admins_bots_kb(bots))
+
+
+def _bot_admins_kb(bot_id: int, owner_id: int, admins: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for a in admins:
+        uname = f"@{a['username']}" if a.get("username") else f"ID:{a['user_id']}"
+        banned = is_registry_user_banned(a["user_id"])
+        ban_action = "✅ Разбанить" if banned else "🚫 Забанить"
+        ban_data = f"profiles_a_unban_{a['user_id']}" if banned else f"profiles_a_ban_{a['user_id']}"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"👤 #{a['tag']} ({uname})",
+                callback_data=f"profile_view_{a['user_id']}",
+            ),
+            InlineKeyboardButton(text="🗑", callback_data=f"profiles_a_del_{owner_id}_{a['user_id']}"),
+        ])
+        rows.append([InlineKeyboardButton(text=ban_action, callback_data=ban_data, style=("danger" if not banned else "success"))])
+    rows.append([InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_bot_\d+$"))
+async def cb_profiles_a_bot(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    bot_id = int(cb_data(callback).split("_")[-1])
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        await callback.answer("Бот не найден")
+        return
+    owner_id = bot.get("owner_id", 0)
+    admins = get_admins_all(owner_id)
+    if not admins:
+        await render_callback(
+            callback,
+            f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 {bot_id})\n\nУ владельца нет админов.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots", style="primary")]
+            ]),
+        )
+        return
+    text = (
+        f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 <code>{bot_id}</code>)\n\n"
+        f"Владелец: <code>{owner_id}</code>\n"
+        f"Админов: <b>{len(admins)}</b>\n\n"
+        "Выбери действие:"
+    )
+    await render_callback(callback, text, _bot_admins_kb(bot_id, owner_id, admins))
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_del_\d+_\d+$"))
+async def cb_profiles_a_del(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    parts = cb_data(callback).split("_")
+    owner_id = int(parts[3])
+    admin_uid = int(parts[4])
+    remove_admin(owner_id, admin_uid)
+    await callback.answer("✅ Админ удалён")
+    await cb_profiles_admins_bots(callback)
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_ban_\d+$"))
+async def cb_profiles_a_ban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    admin_uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(admin_uid, True)
+    await callback.answer("🚫 Пользователь забанен")
+
+
+@router.callback_query(F.data.regexp(r"^profiles_a_unban_\d+$"))
+async def cb_profiles_a_unban(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    admin_uid = int(cb_data(callback).split("_")[-1])
+    set_registry_user_blocked(admin_uid, False)
+    await callback.answer("✅ Пользователь разбанен")
+
+
+@router.callback_query(F.data.startswith("profile_stats_"))
+async def cb_profile_stats(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    uid = int(cb_data(callback).split("_")[-1])
+    bots = get_user_bots(uid)
+    lines = []
+    total = {"users_total": 0, "messages_in": 0, "messages_out": 0}
+    for b in bots:
+        s = get_stats(b["id"])
+        for k in total:
+            total[k] += s[k]
+        lines.append(f"  • {bot_display_name(b)} — 👥 {s['users_total']}")
+    bot_lines = "\n".join(lines) if lines else "  — нет ботов —"
+    text = (
+        f"📊 <b>Статистика пользователя</b> <code>{uid}</code>\n\n"
+        f"👥 Всего пользователей: <b>{total['users_total']}</b>\n"
+        f"📩 Получено: <b>{total['messages_in']}</b>\n"
+        f"📤 Отправлено: <b>{total['messages_out']}</b>\n\n"
+        f"{bot_lines}"
+    )
+    await render_callback(callback, text, profile_admin_kb(uid))
+
+
+@router.callback_query(F.data.startswith("profile_del_bots_"))
+async def cb_profile_del_bots(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    uid = int(cb_data(callback).split("_")[-1])
+    bots = get_user_bots(uid)
+    for b in bots:
+        remove_user_bot(uid, b["id"])
+    await render_callback(callback, f"🗑 Удалены все боты пользователя <code>{uid}</code>.", profile_admin_kb(uid))
+
+
+# ═══════════════ Привязка «чата работы» и «чата админов» ═══════════════
+
+_BIND_LABELS = {
+    "work": "💼 Чат работы",
+    "admin": "🛡 Чат админов",
+}
+
+# ═══════════════ «Привязать чаты» / «Чаты» (страницы профиля) ═══════════════
+
+def _chats_bind_payload() -> tuple[str, InlineKeyboardMarkup]:
+    """Инструкция по привязке обоих чатов + кнопки выбора чата."""
+    text = (
+        "🔗 <b>Привязка чатов</b>\n\n"
+        "YamoBot работает с двумя чатами:\n\n"
+        "💼 <b>Чат работы</b> — чат с дочерним ботом, где админы общаются "
+        "с пользователями по заявкам (ПЗ).\n"
+        "🛡 <b>Чат админов</b> — общий чат админов, где они переписываются "
+        "между собой.\n\n"
+        "<b>Как привязать:</b>\n"
+        "1️⃣ Добавь YamoBot в нужный чат.\n"
+        "2️⃣ Нажми соответствующую кнопку ниже.\n"
+        "3️⃣ Дождись подтверждения.\n\n"
+        "Выбери, какой чат привязать:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Привязать чат админов", callback_data="bind_admin", style="primary")],
+        [InlineKeyboardButton(text="💼 Привязать чат работы", callback_data="bind_work", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+    ])
+    return text, kb
+
+
+def _chats_info_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Инфо о привязанных чатах + привязка недостающего / отвязка / перезапуск."""
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+    work_line = f"<code>{work_chat}</code>" if work_chat else "— не привязан —"
+    admin_line = f"<code>{admin_chat}</code>" if admin_chat else "— не привязан —"
+
+    text = (
+        "📎 <b>Чаты</b>\n\n"
+        f"💼 <b>Чат работы:</b> {work_line}\n"
+        f"🛡 <b>Чат админов:</b> {admin_line}\n\n"
+        "Кнопки ниже позволяют привязать недостающий чат, отвязать "
+        "привязанные или перезапустить привязку."
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Непривязанные чаты предлагаем привязать прямо отсюда.
+    if admin_chat is None:
+        rows.append([
+            InlineKeyboardButton(text="🛡 Привязать чат админов", callback_data="bind_admin", style="primary")
+        ])
+    if work_chat is None:
+        rows.append([
+            InlineKeyboardButton(text="💼 Привязать чат работы", callback_data="bind_work", style="primary")
+        ])
+    # Привязанные чаты можно отвязать.
+    if admin_chat:
+        rows.append([
+            InlineKeyboardButton(text="❌ Отвязать чат админов", callback_data="unbind_admin", style="danger")
+        ])
+    if work_chat:
+        rows.append([
+            InlineKeyboardButton(text="❌ Отвязать чат работы", callback_data="unbind_work", style="danger")
+        ])
+    rows.append([InlineKeyboardButton(text="🔄 Перезапуск", callback_data="chats_restart", style="primary")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "chats_bind")
+async def cb_chats_bind(callback: CallbackQuery) -> None:
+    text, kb = _chats_bind_payload()
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "chats_info")
+async def cb_chats_info(callback: CallbackQuery) -> None:
+    text, kb = _chats_info_payload(cb_uid(callback))
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "chats_restart")
+async def cb_chats_restart(callback: CallbackQuery) -> None:
+    """Перезапуск: перепривязывает бота к уже сохранённым чатам."""
+    user_id = cb_uid(callback)
+    work_chat = get_bound_chat(user_id, "work")
+    admin_chat = get_bound_chat(user_id, "admin")
+
+    set_bound_chat(user_id, "work", work_chat)
+    set_bound_chat(user_id, "admin", admin_chat)
+
+    statuses: list[str] = []
+    bot = getattr(callback, "bot", None)
+
+    if admin_chat:
+        try:
+            if bot is not None:
+                await bot.send_message(admin_chat, ADMIN_CHAT_WELCOME)
+            statuses.append("🛡 Чат админов: перепривязан, приветствие отправлено")
+        except Exception:
+            statuses.append("🛡 Чат админов: перепривязан (не удалось отправить приветствие)")
+    if work_chat:
+        try:
+            if bot is not None:
+                await bot.send_message(
+                    work_chat, "💼 Чат работы привязан к YamoBot. Бот активен. ✅"
+                )
+            statuses.append("💼 Чат работы: перепривязан")
+        except Exception:
+            statuses.append("💼 Чат работы: привязка сохранена (бот не в чате)")
+
+    status_text = "\n".join(statuses) if statuses else "Чат ещё не привязан."
+    text, kb = _chats_info_payload(user_id)
+    text = f"🔄 <b>Перезапуск привязки</b>\n\n{status_text}\n\n{text}"
+
+    await render_callback(callback, text, kb)
+
+
+def _bind_wait_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я добавил бота", callback_data="bind_done", style="success")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="bind_cancel")],
+    ])
+
+
+async def _bind_instructions(callback: CallbackQuery, kind: str) -> str:
+    try:
+        bot = getattr(callback, "bot", None)
+        me = await bot.get_me() if bot is not None else None
+        bot_ref = f"@{me.username}" if me and me.username else "бота"
+    except Exception:
+        bot_ref = "бота"
+
+    label = _BIND_LABELS[kind]
+    if kind == "work":
+        tail = "После привязки бот запомнит ID чата и <b>покинет</b> его."
+    else:
+        tail = "После привязки бот запомнит ID чата и <b>останется</b> в нём — "
+        tail += "сюда будут приходить уведомления о новых ПЗ."
+
+    admin_note = ""
+    if kind == "admin":
+        admin_note = (
+            "3. Выдай боту <b>права администратора</b> в этом чате — иначе "
+            "он не сможет в полной мере работать с уведомлениями.\n"
+        )
+
+    return (
+        f"📌 <b>{label}</b>\n\n"
+        f"1. Добавь <b>{bot_ref}</b> в групповой чат, который хочешь "
+        f"использовать как «{label}».\n"
+        f"2. Дождись подтверждения привязки.\n"
+        f"{admin_note}\n"
+        f"{tail}"
+    )
+
+
+@router.callback_query(F.data.in_({"bind_work", "bind_admin"}))
+async def cb_bind_start(callback: CallbackQuery) -> None:
+    kind = "work" if callback.data == "bind_work" else "admin"
+    _PENDING_BINDS[cb_uid(callback)] = kind
+    set_pending_bind(cb_uid(callback), kind)  # в БД — переживает рестарт бота
+    text = await _bind_instructions(callback, kind)
+    await render_callback(callback, text, _bind_wait_kb())
+
+
+@router.callback_query(F.data == "bind_done")
+async def cb_bind_done(callback: CallbackQuery) -> None:
+    """Пользователь сообщил, что добавил бота. Привязываем сами, если событие не пришло."""
+    user_id = cb_uid(callback)
+    kind = get_pending_bind(user_id) or _PENDING_BINDS.get(user_id)
+
+    # Если бот ещё ждёт привязку — попробуем привязать последний добавленный чат.
+    if kind:
+        chat_id = _LAST_ADDED.get(user_id)
+        if chat_id:
+            # Защита от путаницы: нельзя привязать «чат админов» как «чат работы»
+            # (и наоборот) и тем более выйти из нужного чата. Иначе при отвязке/
+            # привязке одного чата бот мог «уходить» из другого.
+            other = "admin" if kind == "work" else "work"
+            other_bound = get_bound_chat(user_id, other)
+            if other_bound and chat_id == other_bound:
+                set_pending_bind(user_id, None)
+                await callback.answer(
+                    "⚠️ Этот чат уже привязан как другой тип. Добавь бота в новый чат.",
+                    show_alert=True,
+                )
+                return
+
+            _PENDING_BINDS.pop(user_id, None)
+            set_pending_bind(user_id, None)
+            set_bound_chat(user_id, kind, chat_id)
+            if kind == "work":
+                # Чат работы — бот запоминает и покидает его.
+                bot = getattr(callback, "bot", None)
+                try:
+                    if bot is not None:
+                        await bot.leave_chat(chat_id)
+                except Exception:
+                    pass
+            await callback.answer("✅ Привязано!")
+            text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
+            await render_callback(callback, text, kb)
+        else:
+            # Бот пока не видит добавление — короткое уведомление, без повтора инструкции.
+            await callback.answer("⏳ Добавь бота в чат, затем нажми ещё раз")
+            return
+    else:
+        # Уже привязано через событие — просто открываем профиль.
+        await callback.answer()
+        text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
+        await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "bind_cancel")
+async def cb_bind_cancel(callback: CallbackQuery) -> None:
+    _PENDING_BINDS.pop(cb_uid(callback), None)
+    set_pending_bind(cb_uid(callback), None)
+    await callback.answer("❌ Привязка отменена")
+    if callback.message:
+        text, kb = _profile_payload(cb_uid(callback), cb_firstname(callback) or "—")
+        await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "unbind_work")
+async def cb_unbind_work(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    if get_bound_chat(user_id, "work") is None:
+        await callback.answer("💼 Чат работы уже не привязан", show_alert=False)
+    else:
+        set_bound_chat(user_id, "work", None)
+        await callback.answer("💼 Чат работы отвязан")
+    text, kb = _chats_info_payload(user_id)
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "unbind_admin")
+async def cb_unbind_admin(callback: CallbackQuery) -> None:
+    user_id = cb_uid(callback)
+    chat_id = get_bound_chat(user_id, "admin")
+    if chat_id is None:
+        await callback.answer("🛡 Чат админов уже не привязан", show_alert=False)
+    else:
+        set_bound_chat(user_id, "admin", None)
+        bot = getattr(callback, "bot", None)
+        try:
+            if bot is not None:
+                await bot.leave_chat(chat_id)
+        except Exception:
+            pass
+        await callback.answer("🛡 Чат админов отвязан")
+    text, kb = _chats_info_payload(user_id)
+    await render_callback(callback, text, kb)
+
+
+# Событие: YamoBot добавили в группу/супергруппу.
+@router.my_chat_member()
+async def on_bot_added_to_chat(event) -> None:
+    adder = getattr(event, "from_user", None)
+    if adder is not None and not getattr(adder, "is_bot", False):
+        # Запоминаем последний чат, куда добавили бота (для кнопки «я добавил бота»).
+        chat = event.chat
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            _LAST_ADDED[adder.id] = chat.id
+
+    adder = getattr(event, "from_user", None)
+    if adder is None or getattr(adder, "is_bot", False):
+        return
+
+    # Антирейд: если бота повысили до администратора в уже привязанном
+    # «чате админов» с включённой защитой — уведомляем владельца о том,
+    # что защита теперь полностью работает (иначе бот не видит заходы и
+    # сообщения, а владелец думает, что «антирейд сломан»).
+    if event.chat and event.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        from handlers.antiraid import notify_antiraid_promoted_if_bound
+        await notify_antiraid_promoted_if_bound(event)
+
+    kind = get_pending_bind(adder.id) or _PENDING_BINDS.pop(adder.id, None)
+    if not kind:
+        return
+
+    chat = event.chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        # Если это не группа — оставляем ожидание в БД, чтобы не потерять запрос.
+        return
+
+    new_status = getattr(event.new_chat_member, "status", None)
+    old_status = getattr(event.old_chat_member, "status", None)
+    was_member = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    is_member = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    if was_member or not is_member:
+        return
+
+    # Какой бы чат ни добавил бота — это и есть привязываемый чат, он точный.
+    set_bound_chat(adder.id, kind, chat.id)
+    set_pending_bind(adder.id, None)
+
+    bot = event.bot
+    chat_name = chat.title or f"чат {chat.id}"
+    if kind == "work":
+        try:
+            await bot.send_message(
+                chat.id,
+                "💼 Чат работы привязан. YamoBot запомнил его и покидает чат. 👋",
+            )
+        except Exception:
+            pass
+        try:
+            await bot.leave_chat(chat.id)
+        except Exception:
+            pass
+        confirm_text = (
+            f"✅ <b>Чат работы привязан!</b>\n\n"
+            f"📎 Чат: <b>{chat_name}</b>\n"
+            f"🆔 ID: <code>{chat.id}</code>\n\n"
+            f"Бот запомнил чат и вышел из него."
+        )
+    else:
+        welcome_admin = ADMIN_CHAT_WELCOME
+        try:
+            await bot.send_message(chat.id, welcome_admin)
+        except Exception:
+            pass
+        confirm_text = (
+            f"✅ <b>Чат админов привязан!</b>\n\n"
+            f"📎 Чат: <b>{chat_name}</b>\n"
+            f"🆔 ID: <code>{chat.id}</code>\n\n"
+            f"⚠️ <b>Выдай боту права администратора</b> в этом чате — "
+            f"иначе он не сможет в полной мере работать с уведомлениями.\n"
+            f"Сделай это через: «Управление чатом → Администраторы → YamoBot → "
+            f"Назначить администратором».\n\n"
+            f"Теперь сюда будут приходить уведомления о новых ПЗ. "
+            f"Я отправил в чат приветствие со списком команд."
+        )
+
+    try:
+        await bot.send_message(adder.id, confirm_text)
+    except Exception:
+        pass
+
+=======
 from aiogram import Router, F
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.fsm.context import FSMContext
@@ -1142,3 +2296,4 @@ async def on_bot_added_to_chat(event) -> None:
     except Exception:
         pass
 
+>>>>>>> a26fa0ca2db5328dc4044ff97611847506600e74
