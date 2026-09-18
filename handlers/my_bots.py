@@ -38,22 +38,34 @@ def _bot_list_kb(bots: list[dict], child_manager: ChildManager,
             text=f"{status} {bot_display_name(b)}",
             callback_data=f"bot_{b['id']}",
         )])
-    if bot_type:
-        rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="my_bots")])
+    footer = []
     if bots:
-        rows.append([InlineKeyboardButton(text="📌 Выбрать все", callback_data="select_all")])
-    rows.append([InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")])
+        footer.append(InlineKeyboardButton(text="📌 Выбрать все", callback_data="select_all", style="primary"))
+    footer.append(InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot", style="success"))
+    if footer:
+        rows.append(footer)
+    nav = []
+    if bot_type:
+        nav.append(InlineKeyboardButton(text="⬅️ Категории", callback_data="my_bots", style="primary"))
+    nav.append(InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main"))
+    if nav:
+        rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _types_kb(bot_types: list[str]) -> InlineKeyboardMarkup:
     rows = []
-    for t in bot_types:
-        rows.append([InlineKeyboardButton(
-            text=TYPE_LABELS.get(t, t), callback_data=f"my_bots_type_{t}"
-        )])
-    rows.append([InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")])
+    if len(bot_types) > 1:
+        rows.append([
+            InlineKeyboardButton(text=TYPE_LABELS.get(t, t), callback_data=f"my_bots_type_{t}")
+            for t in bot_types
+        ])
+    else:
+        for t in bot_types:
+            rows.append([InlineKeyboardButton(
+                text=TYPE_LABELS.get(t, t), callback_data=f"my_bots_type_{t}"
+            )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot", style="success")])
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -67,7 +79,7 @@ def my_bots_kb(user_id: int, child_manager: ChildManager) -> InlineKeyboardMarku
     all_bots = get_user_bots(user_id)
     if not all_bots:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")]
+            [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot", style="success")]
         ])
     bot_type = _norm(all_types[0]) if all_types else "standard"
     type_bots = _filter_bots(all_bots, bot_type)
@@ -88,7 +100,7 @@ async def show_my_bots(message: Message, child_manager: ChildManager) -> None:
         await message.answer(
             "🤖 <b>Боты</b>\n\nУ тебя пока нет подключённых ботов.\nНажми «➕ Добавить бота».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")]
+                [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot", style="success")]
             ]),
         )
         return
@@ -118,7 +130,7 @@ async def cb_my_bots(callback: CallbackQuery, state: FSMContext,
     if not all_bots:
         await render_callback(callback, "🤖 <b>Боты</b>\n\nУ тебя пока нет подключённых ботов.",
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot")]
+                                  [InlineKeyboardButton(text="➕ Добавить бота", callback_data="add_bot", style="success")]
                               ]))
         return
 

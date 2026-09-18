@@ -1,9 +1,12 @@
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -85,6 +88,21 @@ def _migrate_bot_anonymous(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_bot_welcome_media(conn: sqlite3.Connection) -> None:
+    """Добавляет колонки медиа-приветствия (фото/rich-«статья») в таблицу bots.
+
+    Нужно для поддержки красивых приветствий: фото и rich-сообщений (статей,
+    которые Telegram отдаёт как ``message.rich_message``). У уже существующих
+    ботов колонки создаются пустыми — поведение остаётся прежним.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+    if "welcome_photo" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN welcome_photo TEXT DEFAULT ''")
+    if "welcome_rich" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN welcome_rich TEXT DEFAULT ''")
+    conn.commit()
+
+
 def _migrate_registry_chats(conn: sqlite3.Connection) -> None:
     """Добавляет колонки привязанных чатов в users_registry."""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(users_registry)").fetchall()]
@@ -121,6 +139,35 @@ def _migrate_admin_invites(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_antiraid_del_links_default(conn: sqlite3.Connection) -> None:
+    """Одноразово включает отзыв ссылок в антирейде у существующих владельцев.
+
+    Раньше «Удаление ссылок» (del_links) по умолчанию было выключено, из-за чего
+    даже при срабатывании антирейда ссылка-приглашение оставалась активной и
+    рейдеры могли вернуться по ней же. Миграция включается ОДИН раз (флаг в _meta),
+    чтобы потом не перетирать осознанный выбор владельца в профиле.
+    """
+    try:
+        done = conn.execute(
+            "SELECT 1 FROM _meta WHERE key = 'antiraid_del_links_default'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # _meta мог не существовать на самом старом наборе БД — пересоздадим.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT DEFAULT '')"
+        )
+        done = conn.execute(
+            "SELECT 1 FROM _meta WHERE key = 'antiraid_del_links_default'"
+        ).fetchone()
+    if done:
+        return
+    conn.execute("UPDATE antiraid_settings SET del_links = 1 WHERE del_links = 0")
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('antiraid_del_links_default', '1')"
+    )
+    conn.commit()
+
+
 
 def ensure_db() -> None:
     conn = _get_conn()
@@ -136,6 +183,8 @@ def ensure_db() -> None:
             stopped      INTEGER DEFAULT 0,
             antispam_mode TEXT DEFAULT 'off',
             bot_type     TEXT DEFAULT 'standard',
+            welcome_photo TEXT DEFAULT '',
+            welcome_rich TEXT DEFAULT '',
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -311,13 +360,106 @@ def ensure_db() -> None:
             added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (owner_id, user_id)
         );
+
+        -- Настройки антирейда для «чата админов» владельца.
+        CREATE TABLE IF NOT EXISTS antiraid_settings (
+            owner_id        INTEGER PRIMARY KEY,
+            enabled         INTEGER DEFAULT 0,
+            threshold       INTEGER DEFAULT 10,
+            del_links       INTEGER DEFAULT 1,
+            del_members     INTEGER DEFAULT 0,
+            triggered       INTEGER DEFAULT 0,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Служебные флаги миграций (одноразовые действия).
+        CREATE TABLE IF NOT EXISTS _meta (
+            key     TEXT PRIMARY KEY,
+            value   TEXT DEFAULT ''
+        );
+
+        -- Антинакрутка ПЗ: защита владельца от наплыва фейковых «новых ПЗ».
+        -- Настраивается в профиле владельца и действует на всех его ботов.
+        CREATE TABLE IF NOT EXISTS antinakrutka_settings (
+            owner_id        INTEGER PRIMARY KEY,
+            count           INTEGER DEFAULT 10,
+            window_minutes  INTEGER DEFAULT 5,
+            block_topics    INTEGER DEFAULT 1,
+            triggered       INTEGER DEFAULT 0,
+            snapshot        TEXT DEFAULT '',
+            triggered_at    TIMESTAMP,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Смещения статистики: сколько «накрученных» сообщений/юзеров вычесть
+        -- из статистики бота, если владелец подтвердил, что это была накрутка.
+        CREATE TABLE IF NOT EXISTS stats_offsets (
+            bot_id       INTEGER PRIMARY KEY,
+            messages_in  INTEGER DEFAULT 0,
+            messages_out INTEGER DEFAULT 0,
+            users_total  INTEGER DEFAULT 0
+        );
+
+        -- Тихие часы напоминалок: в этот интервал (МСК) напоминания в «чат
+        -- админов» не отправляются, чтобы не спамить, когда админы спят.
+        CREATE TABLE IF NOT EXISTS reminder_quiet (
+            owner_id   INTEGER PRIMARY KEY,
+            enabled    INTEGER DEFAULT 1,
+            from_time  TEXT DEFAULT '21:00',
+            to_time    TEXT DEFAULT '09:00',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Конфиги ботов: сохранённый «слепок» настроек (приветствие, инлайны,
+        -- тип бота, антиспам, анонимность и т.д.) под коротким кодом, чтобы
+        -- перенести настройки на другого бота или восстановить после сбоя.
+        CREATE TABLE IF NOT EXISTS bot_configs (
+            code       TEXT PRIMARY KEY,
+            owner_id   INTEGER NOT NULL,
+            bot_id     INTEGER NOT NULL,
+            bot_name   TEXT DEFAULT '',
+            data       TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Напоминалки: «авточек ответа админа» и «напоминание про ПЗ».
+        CREATE TABLE IF NOT EXISTS reminders (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id         INTEGER NOT NULL,
+            mode             TEXT NOT NULL,
+            duration_seconds INTEGER NOT NULL,
+            enabled          INTEGER DEFAULT 1,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Когда последний раз слали напоминание по конкретному топику
+        -- (защита от дублирования уведомлений при каждом сканировании).
+        CREATE TABLE IF NOT EXISTS reminder_ticks (
+            reminder_id  INTEGER NOT NULL,
+            topic_key    TEXT NOT NULL,
+            last_sent_at TIMESTAMP,
+            PRIMARY KEY (reminder_id, topic_key)
+        );
+
+        -- Словарь премиум-эмодзи: «обычный эмодзи» → его custom_emoji_id в Telegram.
+        -- Заполняется из сообщений владельцев (см. services/premium_emoji.py) и
+        -- используется, чтобы автоматически возвращать премиум-эмодзи в уже
+        -- сохранённых приветствиях без удаления и повторной привязки ботов.
+        CREATE TABLE IF NOT EXISTS emoji_map (
+            emoji           TEXT PRIMARY KEY,
+            custom_emoji_id TEXT NOT NULL,
+            uses            INTEGER DEFAULT 1,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
     _migrate_bot_anonymous(conn)
+    _migrate_bot_welcome_media(conn)
     _migrate_registry_chats(conn)
     _migrate_registry_pending_bind(conn)
     _migrate_admin_invites(conn)
+    _migrate_antiraid_del_links_default(conn)
     conn.commit()
 
 
@@ -348,10 +490,21 @@ def get_accessible_bots(user_id: int) -> list[dict]:
     return unique
 
 
-def add_user_bot(user_id: int, bot_info: dict) -> None:
+def add_user_bot(user_id: int, bot_info: dict) -> bool:
+    """Привязывает бота к владельцу. False — если бот занят другим владельцем."""
     conn = _get_conn()
+    existing = conn.execute("SELECT owner_id FROM bots WHERE id = ?", (bot_info["id"],)).fetchone()
+    if existing and existing["owner_id"] != user_id:
+        # Токен даёт полный доступ к боту, но привязка уже занята другим владельцем
+        # панели: не даём «увести» бота к себе. Передавать права нужно через
+        # «👑 Передать права» (или сначала удалить бота у текущего владельца).
+        logger.warning(
+            "Отклонена привязка бота %s к %s: бот уже привязан к %s",
+            bot_info["id"], user_id, existing["owner_id"],
+        )
+        return False
+
     with _lock:
-        existing = conn.execute("SELECT id FROM bots WHERE id = ?", (bot_info["id"],)).fetchone()
         if existing:
             conn.execute(
                 "UPDATE bots SET token=?, username=?, first_name=?, owner_id=? WHERE id=?",
@@ -367,9 +520,11 @@ def add_user_bot(user_id: int, bot_info: dict) -> None:
                  bot_info.get("welcome_text", ""), json.dumps(bot_info.get("links", [])), 0)
             )
         conn.commit()
+    return True
 
 
 def remove_user_bot(user_id: int, bot_id: int) -> bool:
+    """Удаляет бота владельца вместе со всеми данными по нему."""
     conn = _get_conn()
     with _lock:
         cur = conn.execute("DELETE FROM bots WHERE id = ? AND owner_id = ?", (bot_id, user_id))
@@ -406,6 +561,7 @@ def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
 _BOT_FIELDS_WHITELIST = {
     "token", "username", "first_name", "welcome_text",
     "links", "stopped", "antispam_mode", "bot_type", "anonymous_mode",
+    "welcome_photo", "welcome_rich",
 }
 
 
@@ -539,16 +695,87 @@ def get_stats(bot_id: int) -> dict:
         (bot_id,),
     ).fetchone()[0]
 
+    # Смещения антинакрутки: если владелец подтвердил, что наплыв ПЗ был спамом,
+    # «накрученные» сообщения/юзеры вычитаются из статистики — цифры снова
+    # показывают только реальную работу.
+    offsets = get_stats_offsets(bot_id)
+
+    users_total = max(0, users["total"] - offsets["users_total"])
+    users_blocked = min(max(0, users["blocked"]), users_total)
     return {
-        "users_total": users["total"],
-        "users_blocked": users["blocked"],
-        "users_active": users["active"],
-        "messages_in": messages_in,
-        "messages_out": messages_out,
+        "users_total": users_total,
+        "users_blocked": users_blocked,
+        "users_active": max(0, users_total - users_blocked),
+        "messages_in": max(0, messages_in - offsets["messages_in"]),
+        "messages_out": max(0, messages_out - offsets["messages_out"]),
         "mailings_count": mailings_count,
         "mailings_sent": mailings_sent,
         "mailings_failed": mailings_failed,
     }
+
+
+def get_raw_counts(bot_id: int) -> dict:
+    """«Сырые» счётчики статистики бота (без смещений антинакрутки).
+
+    Используется защитой от накрутки: при срабатывании запоминаются актуальные
+    цифры, чтобы владелец мог решить, засчитывать их или нет.
+    """
+    conn = _get_conn()
+    users = get_child_users_count(bot_id)
+    messages_in = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND direction = 'in'",
+        (bot_id,),
+    ).fetchone()[0]
+    messages_out = conn.execute(
+        "SELECT COUNT(*) FROM feedback_messages WHERE bot_id = ? AND direction = 'out'",
+        (bot_id,),
+    ).fetchone()[0]
+    return {
+        "users_total": users["total"],
+        "users_blocked": users["blocked"],
+        "messages_in": messages_in,
+        "messages_out": messages_out,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  Смещения статистики (антинакрутка)
+# ══════════════════════════════════════════════════════════
+
+def get_stats_offsets(bot_id: int) -> dict:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM stats_offsets WHERE bot_id = ?", (bot_id,)
+    ).fetchone()
+    if not row:
+        return {"messages_in": 0, "messages_out": 0, "users_total": 0}
+    return {
+        "messages_in": max(0, int(row["messages_in"] or 0)),
+        "messages_out": max(0, int(row["messages_out"] or 0)),
+        "users_total": max(0, int(row["users_total"] or 0)),
+    }
+
+
+def set_stats_offsets(bot_id: int, messages_in: int, messages_out: int,
+                      users_total: int = 0) -> None:
+    """Ставит абсолютные смещения статистики бота (см. get_stats)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO stats_offsets (bot_id, messages_in, messages_out, users_total) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(bot_id) DO UPDATE SET "
+            "messages_in=excluded.messages_in, messages_out=excluded.messages_out, "
+            "users_total=excluded.users_total",
+            (bot_id, max(0, int(messages_in)), max(0, int(messages_out)),
+             max(0, int(users_total))),
+        )
+        conn.commit()
+
+
+def clear_stats_offsets(bot_id: int) -> None:
+    """Сбрасывает смещения статистики (наплыв ПЗ признан реальным)."""
+    set_stats_offsets(bot_id, 0, 0, 0)
 
 
 def get_all_stats(bot_ids: list[int]) -> dict:
@@ -1102,6 +1329,38 @@ def consume_admin_invite(token: str) -> int | None:
         return row["max_uses"] - new_used
 
 
+def get_owner_admin_invites(owner_id: int) -> list[dict]:
+    """Все действующие ссылки-приглашения админов владельца (новые сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT token, max_uses, used, created_at FROM admin_invites "
+        "WHERE owner_id = ? ORDER BY created_at DESC",
+        (owner_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_admin_invite(token: str) -> bool:
+    """Аннулирует ссылку-приглашение (после этого она не действует)."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM admin_invites WHERE token = ?", (token,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def update_admin_invite_uses(token: str, max_uses: int) -> bool:
+    """Меняет лимит приглашения (для кнопки «Пересоздать»)."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE admin_invites SET max_uses = ?, used = 0 WHERE token = ?",
+            (max(1, int(max_uses)), token),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def set_bot_keyboard(owner_id: int, bot_id: int, buttons: list[dict]) -> bool:
     conn = _get_conn()
     with _lock:
@@ -1480,6 +1739,21 @@ def set_welcome_for_all(user_id: int, welcome_text: str) -> int:
         return cur.rowcount
 
 
+def set_welcome_bundle_for_all(user_id: int, welcome_text: str,
+                               welcome_photo: str = "",
+                               welcome_rich: str = "") -> int:
+    """Устанавливает текст + медиа-приветствие (фото/статью) всем ботам юзера."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE bots SET welcome_text = ?, welcome_photo = ?, welcome_rich = ? "
+            "WHERE owner_id = ?",
+            (welcome_text, welcome_photo or "", welcome_rich or "", user_id)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def set_links_for_all(user_id: int, links: list[dict]) -> int:
     """Устанавливает линки для всех ботов юзера."""
     conn = _get_conn()
@@ -1688,6 +1962,83 @@ def get_pending_bind(user_id: int) -> str | None:
     return val if val else None
 
 
+# ═══════════════════════════════════════════════════════════
+#  Антирейд «чата админов»
+# ═══════════════════════════════════════════════════════════
+
+_ANTIRAID_DEFAULTS = {
+    "enabled": 0,
+    "threshold": 10,
+    # «Удаление ссылок» включено по умолчанию: при рейде ссылку-приглашение
+    # надо отзывать, чтобы рейдеры не вернулись по ней же.
+    "del_links": 1,
+    "del_members": 0,
+    "triggered": 0,
+}
+
+
+def get_antiraid_settings(owner_id: int) -> dict:
+    """Настройки антирейда владельца (с значениями по умолчанию)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM antiraid_settings WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    settings = dict(_ANTIRAID_DEFAULTS)
+    if row:
+        for k in settings:
+            if k in row.keys():
+                settings[k] = row[k]
+    settings["enabled"] = int(settings.get("enabled") or 0)
+    settings["threshold"] = max(1, int(settings.get("threshold") or 10))
+    settings["del_links"] = int(settings.get("del_links") or 0)
+    settings["del_members"] = int(settings.get("del_members") or 0)
+    settings["triggered"] = int(settings.get("triggered") or 0)
+    return settings
+
+
+def set_antiraid_field(owner_id: int, field: str, value) -> bool:
+    """Обновляет одно поле настроек антирейда владельца."""
+    if field not in _ANTIRAID_DEFAULTS:
+        return False
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            f"INSERT INTO antiraid_settings (owner_id, {field}) VALUES (?, ?) "
+            f"ON CONFLICT(owner_id) DO UPDATE SET {field}=excluded.{field}, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (owner_id, int(value)),
+        )
+        conn.commit()
+    return True
+
+
+def set_antiraid_enabled(owner_id: int, enabled: bool) -> bool:
+    return set_antiraid_field(owner_id, "enabled", 1 if enabled else 0)
+
+
+def set_antiraid_threshold(owner_id: int, threshold: int) -> bool:
+    return set_antiraid_field(owner_id, "threshold", max(1, int(threshold)))
+
+
+def set_antiraid_del_links(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "del_links", 1 if value else 0)
+
+
+def set_antiraid_del_members(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "del_members", 1 if value else 0)
+
+
+def set_antiraid_triggered(owner_id: int, value: bool) -> bool:
+    return set_antiraid_field(owner_id, "triggered", 1 if value else 0)
+
+
+def reset_all_antiraid_triggered() -> None:
+    """Сбрасывает флаг сработавшего антирейда у всех владельцев (при старте бота)."""
+    conn = _get_conn()
+    conn.execute("UPDATE antiraid_settings SET triggered = 0")
+    conn.commit()
+
+
 def get_admin_active_topics_list(owner_id: int, admin_user_id: int) -> list[dict]:
     """Активные топики (ПЗ), закреплённые за конкретным админом."""
     bot_ids = _owner_bot_ids(owner_id)
@@ -1818,8 +2169,10 @@ def transfer_all_rights(
 ) -> int:
     """Полная передача всех прав владельца новому юзеру.
 
-    Мигрируют: боты, админы, совладельцы, привязанные чаты (работа/админов),
-    настройки предов (warn_settings) и модераторы «чата админов».
+    Мигрируют: боты (приветствие, линки/инлайн-кнопки, тип, анонимность,
+    антиспам, клавиатуры), админы, совладельцы, привязанные чаты
+    (работа/админов), настройки предов (warn_settings), модераторы «чата
+    админов», настройки антирейда, напоминалки.
     Возвращает количество переданных ботов.
     """
     register_user(to_id, to_username, to_first_name)
@@ -1841,7 +2194,10 @@ def transfer_all_rights(
         conn.execute("UPDATE coowners SET owner_id = ? WHERE owner_id = ?", (to_id, from_id))
         # Настройки предов
         conn.execute(
-            "UPDATE warn_settings SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+            "INSERT OR REPLACE INTO warn_settings (owner_id, max_warns, punish_type, punish_duration) "
+            "SELECT ?, max_warns, punish_type, punish_duration "
+            "FROM warn_settings WHERE owner_id = ?",
+            (to_id, from_id),
         )
         conn.execute(
             "DELETE FROM warn_settings WHERE owner_id = ?", (from_id,)
@@ -1855,6 +2211,24 @@ def transfer_all_rights(
             "UPDATE admin_chat_moderators SET owner_id = ? WHERE owner_id = ?",
             (to_id, from_id),
         )
+        # Напоминалки
+        conn.execute(
+            "UPDATE reminders SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+        )
+        # Клавиатуры дочерних ботов (кнопки) — переезжают к новому владельцу,
+        # чтобы «настройки редактора» не сбрасывались после передачи прав.
+        conn.execute(
+            "UPDATE bot_keyboards SET owner_id = ? WHERE owner_id = ?", (to_id, from_id)
+        )
+        # Настройки антирейда «чата админов» — полностью переезжают вместе с чатом.
+        conn.execute(
+            "INSERT OR REPLACE INTO antiraid_settings "
+            "(owner_id, enabled, threshold, del_links, del_members, triggered, updated_at) "
+            "SELECT ?, enabled, threshold, del_links, del_members, triggered, updated_at "
+            "FROM antiraid_settings WHERE owner_id = ?",
+            (to_id, from_id),
+        )
+        conn.execute("DELETE FROM antiraid_settings WHERE owner_id = ?", (from_id,))
         conn.commit()
 
     # Привязанные чаты передаём новому владельцу (только если у старого они были).
@@ -1889,6 +2263,13 @@ def transfer_bot(
             "UPDATE bots SET owner_id = ? WHERE id = ? AND owner_id = ?",
             (to_id, bot_id, from_id),
         )
+        # Клавиатура (кнопки) бота переезжает вместе с ним — иначе у нового
+        # владельца настройки бота «сбрасывались» бы в значения по умолчанию.
+        if cur.rowcount > 0:
+            conn.execute(
+                "UPDATE bot_keyboards SET owner_id = ? WHERE bot_id = ? AND owner_id = ?",
+                (to_id, bot_id, from_id),
+            )
         conn.commit()
         ok = cur.rowcount > 0
         if not ok:
@@ -1904,3 +2285,434 @@ def transfer_bot(
     # Новый владелец бота становится его админом со своим тегом.
     ensure_admin(to_id, to_id, to_username)
     return True
+
+
+# ═══════════════════════════════════════════════════════════
+#  Напоминалки (авточек ответа админа / напоминание про ПЗ)
+# ═══════════════════════════════════════════════════════════
+
+def get_reminders(owner_id: int) -> list[dict]:
+    """Все настройки напоминалок владельца (новые сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM reminders WHERE owner_id = ? ORDER BY id DESC",
+        (owner_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_reminder(owner_id: int, mode: str, duration_seconds: int) -> int:
+    """Создаёт напоминалку и возвращает её id."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT INTO reminders (owner_id, mode, duration_seconds) VALUES (?, ?, ?)",
+            (owner_id, mode, duration_seconds)
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def set_reminder_enabled(reminder_id: int, enabled: bool) -> bool:
+    """Включает/выключает напоминалку."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE reminders SET enabled = ? WHERE id = ?",
+            (1 if enabled else 0, reminder_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_reminder(reminder_id: int) -> bool:
+    """Удаляет напоминалку вместе с историей отправок."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        conn.execute("DELETE FROM reminder_ticks WHERE reminder_id = ?", (reminder_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_all_enabled_reminders() -> list[dict]:
+    """Все включённые напоминалки всех владельцев (для фонового сканера)."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT * FROM reminders WHERE enabled = 1").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_reminder_tick(reminder_id: int, topic_key: str) -> str | None:
+    """UTC-время последней отправки напоминания по топику (или None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT last_sent_at FROM reminder_ticks WHERE reminder_id = ? AND topic_key = ?",
+        (reminder_id, topic_key)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_reminder_tick(reminder_id: int, topic_key: str, last_sent_at: str) -> None:
+    """Записывает время последней отправки напоминания по топику."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO reminder_ticks (reminder_id, topic_key, last_sent_at) "
+            "VALUES (?, ?, ?)",
+            (reminder_id, topic_key, last_sent_at)
+        )
+        conn.commit()
+
+
+def get_last_admin_reply_at(bot_id: int, topic_id: int, group_chat_id: int) -> str | None:
+    """Время последнего ответа админа в топике (direction='out'), UTC-строка."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT created_at FROM feedback_messages "
+        "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ? AND direction = 'out' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (bot_id, topic_id, group_chat_id)
+    ).fetchone()
+    return row[0] if row else None
+
+
+# ══════════════════════════════════════════════════════════
+#  Словарь премиум-эмодзи (emoji → custom_emoji_id)
+# ══════════════════════════════════════════════════════════
+
+def remember_custom_emoji(emoji: str, custom_emoji_id: str) -> bool:
+    """Запоминает премиум-эмодзи по его обычному символу.
+
+    Возвращает True, если пара новая (или обновилась) — то есть словарь пополнился.
+    Если для этого символа уже сохранён ДРУГОЙ id, оставляем прежний: главное,
+    чтобы владелец получил премиум-эмодзи, а не «перескок» на чужой эмодзи.
+    """
+    emoji = (emoji or "").strip("\u200b")
+    custom_emoji_id = str(custom_emoji_id or "")
+    if not emoji or not custom_emoji_id:
+        return False
+
+    conn = _get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT custom_emoji_id FROM emoji_map WHERE emoji = ?", (emoji,)
+        ).fetchone()
+        if row is not None:
+            if row["custom_emoji_id"] == custom_emoji_id:
+                # Уже знаем — просто отмечаем использование (для статистики).
+                conn.execute(
+                    "UPDATE emoji_map SET uses = uses + 1, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE emoji = ?",
+                    (emoji,),
+                )
+                conn.commit()
+                return False
+            conn.commit()
+            return False
+        conn.execute(
+            "INSERT INTO emoji_map (emoji, custom_emoji_id, uses) VALUES (?, ?, 1)",
+            (emoji, custom_emoji_id),
+        )
+        conn.commit()
+        return True
+
+
+def get_emoji_map() -> dict[str, str]:
+    """Весь словарь премиум-эмодзи: «обычный эмодзи» → custom_emoji_id."""
+    conn = _get_conn()
+    rows = conn.execute("SELECT emoji, custom_emoji_id FROM emoji_map").fetchall()
+    return {r["emoji"]: r["custom_emoji_id"] for r in rows}
+
+
+# ═══════════════════════════════════════════════════════════
+#  Антинакрутка ПЗ (защита от наплыва фейковых «новых ПЗ»)
+# ═══════════════════════════════════════════════════════════
+
+_ANTINAKRUTKA_DEFAULTS = {
+    "count": 10,
+    "window_minutes": 5,
+    # «Пропускать ли топики ПЗ при защите»: 1 — да (топики создаются,
+    # уведомления приостанавливаются), 0 — нет (бот не создаёт топики и пишет
+    # пользователю, что временно не может принять обращение).
+    "block_topics": 1,
+    "triggered": 0,
+    "snapshot": "",
+    "triggered_at": None,
+}
+
+
+def get_antinakrutka_settings(owner_id: int) -> dict:
+    """Настройки антинакрутки владельца (со значениями по умолчанию)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM antinakrutka_settings WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    settings = dict(_ANTINAKRUTKA_DEFAULTS)
+    if row:
+        for k in settings:
+            if k in row.keys():
+                settings[k] = row[k]
+    settings["count"] = max(1, int(settings.get("count") or 10))
+    settings["window_minutes"] = max(1, int(settings.get("window_minutes") or 5))
+    settings["block_topics"] = int(settings.get("block_topics") or 0)
+    settings["triggered"] = int(settings.get("triggered") or 0)
+    settings["snapshot"] = settings.get("snapshot") or ""
+    return settings
+
+
+def set_antinakrutka_field(owner_id: int, field: str, value) -> bool:
+    """Обновляет одно поле настроек антинакрутки владельца."""
+    if field not in _ANTINAKRUTKA_DEFAULTS:
+        return False
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            f"INSERT INTO antinakrutka_settings (owner_id, {field}) VALUES (?, ?) "
+            f"ON CONFLICT(owner_id) DO UPDATE SET {field}=excluded.{field}, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (owner_id, value),
+        )
+        conn.commit()
+    return True
+
+
+def set_antinakrutka_triggered(owner_id: int, value: bool,
+                               snapshot: str | None = None) -> bool:
+    """Переключает состояние тревоги антинакрутки (с опциональным снимком статы)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO antinakrutka_settings (owner_id, triggered) VALUES (?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET triggered=excluded.triggered, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (owner_id, 1 if value else 0),
+        )
+        if value:
+            conn.execute(
+                "UPDATE antinakrutka_settings SET snapshot = ?, "
+                "triggered_at = CURRENT_TIMESTAMP WHERE owner_id = ?",
+                (snapshot or "", owner_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE antinakrutka_settings SET snapshot = '', triggered_at = NULL "
+                "WHERE owner_id = ?",
+                (owner_id,),
+            )
+        conn.commit()
+    return True
+
+
+def reset_all_antinakrutka_triggered() -> None:
+    """Сбрасывает тревогу антинакрутки у всех владельцев (при старте бота)."""
+    conn = _get_conn()
+    conn.execute("UPDATE antinakrutka_settings SET triggered = 0, snapshot = ''")
+    conn.commit()
+
+
+def clear_antinakrutka_snapshot(owner_id: int) -> None:
+    """Убирает снимок статистики (решение по наплыву уже принято).
+
+    Флаг ``triggered`` при этом НЕ трогаем: защита снимается отдельно —
+    кнопкой «Снять защиту»/«Сброс защиты».
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE antinakrutka_settings SET snapshot = '' WHERE owner_id = ?",
+            (owner_id,),
+        )
+        conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Резервация топика (защита от дубликатов ПЗ)
+# ═══════════════════════════════════════════════════════════
+
+def reserve_topic_slot(bot_id: int, user_chat_id: int, group_chat_id: int) -> bool:
+    """Атомарно «бронирует» ПЗ за пользователем ДО создания топика в Telegram.
+
+    Возвращает True, если слот свободен и забронирован этим вызовом, и False,
+    если ПЗ у пользователя уже есть (тогда новый топик создавать нельзя).
+
+    Это страховка от гонок: даже если два обработчика (или два процесса)
+    одновременно начнут создавать топик, топик будет создан ровно один —
+    в БД есть UNIQUE(bot_id, user_chat_id), а INSERT OR IGNORE атомарен.
+    """
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO feedback_topics "
+            "(bot_id, user_chat_id, group_chat_id, topic_id, admin_user_id, admin_tag, status) "
+            "VALUES (?, ?, ?, 0, 0, '', 'open')",
+            (bot_id, user_chat_id, group_chat_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def set_topic_id(bot_id: int, user_chat_id: int, group_chat_id: int,
+                 topic_id: int) -> None:
+    """Проставляет реальный topic_id у ранее забронированного ПЗ."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE feedback_topics SET topic_id = ?, group_chat_id = ? "
+            "WHERE bot_id = ? AND user_chat_id = ?",
+            (topic_id, group_chat_id, bot_id, user_chat_id),
+        )
+        conn.commit()
+
+
+def is_topic_reserved(bot_id: int, user_chat_id: int) -> bool:
+    """Есть ли запись ПЗ (в том числе «забронированная» без topic_id)."""
+    return get_topic_by_user(bot_id, user_chat_id) is not None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Тихие часы напоминалок (МСК)
+# ═══════════════════════════════════════════════════════════
+
+_REMINDER_QUIET_DEFAULTS = {"enabled": 1, "from_time": "21:00", "to_time": "09:00"}
+
+
+def get_reminder_quiet(owner_id: int) -> dict:
+    """Настройки тихих часов владельца: интервал, когда напоминания молчат.
+
+    По умолчанию: с 21:00 до 09:00 по МСК.
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM reminder_quiet WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    s = dict(_REMINDER_QUIET_DEFAULTS)
+    if row:
+        for k in s:
+            if k in row.keys() and row[k] not in (None, ""):
+                s[k] = row[k]
+    s["enabled"] = int(s.get("enabled") or 0)
+    s["from_time"] = str(s.get("from_time") or "21:00")
+    s["to_time"] = str(s.get("to_time") or "09:00")
+    return s
+
+
+def set_reminder_quiet(owner_id: int, from_time: str | None = None,
+                       to_time: str | None = None, enabled: bool | None = None) -> bool:
+    """Обновляет тихие часы (частично: что передали, то и меняем)."""
+    current = get_reminder_quiet(owner_id)
+    from_time = str(from_time or current["from_time"])
+    to_time = str(to_time or current["to_time"])
+    enabled = current["enabled"] if enabled is None else (1 if enabled else 0)
+
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO reminder_quiet (owner_id, enabled, from_time, to_time) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(owner_id) DO UPDATE SET "
+            "enabled=excluded.enabled, from_time=excluded.from_time, "
+            "to_time=excluded.to_time, updated_at=CURRENT_TIMESTAMP",
+            (owner_id, enabled, from_time, to_time),
+        )
+        conn.commit()
+    return True
+
+
+# ═══════════════════════════════════════════════════════════
+#  Конфиги ботов (сохранение/перенос настроек под кодом)
+# ═══════════════════════════════════════════════════════════
+
+def _make_config_code() -> str:
+    """Короткий код конфига вида ``YM-7F3A-91C2``."""
+    raw = secrets.token_hex(4).upper()
+    return f"YM-{raw[:4]}-{raw[4:]}"
+
+
+def normalize_config_code(raw: str) -> str:
+    """Приводит введённый код к каноническому виду ``YM-XXXX-XXXX``."""
+    text = "".join(ch for ch in (raw or "").upper() if ch.isalnum())
+    if text.startswith("YM"):
+        text = text[2:]
+    if len(text) == 8:
+        return f"YM-{text[:4]}-{text[4:]}"
+    return (raw or "").strip().upper()
+
+
+def create_bot_config(owner_id: int, bot_id: int, bot_name: str,
+                      data: dict) -> str:
+    """Сохраняет конфиг бота и возвращает его код."""
+    conn = _get_conn()
+    payload = json.dumps(data, ensure_ascii=False)
+    for _ in range(10):
+        code = _make_config_code()
+        try:
+            with _lock:
+                conn.execute(
+                    "INSERT INTO bot_configs (code, owner_id, bot_id, bot_name, data) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (code, owner_id, bot_id, bot_name, payload),
+                )
+                conn.commit()
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError("Не удалось создать уникальный код конфига")
+
+
+def get_bot_config(code: str) -> dict | None:
+    """Конфиг по коду (или None). Код можно писать без дефисов/в нижнем регистре."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM bot_configs WHERE code = ?", (normalize_config_code(code),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_bot_configs(owner_id: int) -> list[dict]:
+    """Все конфиги владельца (новые сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bot_configs WHERE owner_id = ? ORDER BY created_at DESC",
+        (owner_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_bot_config_by_bot(bot_id: int) -> dict | None:
+    """Последний конфиг, сохранённый именно для этого бота."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM bot_configs WHERE bot_id = ? ORDER BY created_at DESC LIMIT 1",
+        (bot_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_bot_config(code: str, owner_id: int, bot_id: int, bot_name: str,
+                      data: dict) -> bool:
+    """Перезаписывает сохранённый конфиг (кнопка «Сохранить» повторно)."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE bot_configs SET owner_id = ?, bot_id = ?, bot_name = ?, data = ? "
+            "WHERE code = ?",
+            (owner_id, bot_id, bot_name, json.dumps(data, ensure_ascii=False),
+             normalize_config_code(code)),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_bot_config(code: str, owner_id: int | None = None) -> bool:
+    """Удаляет конфиг («очистить конфиг»)."""
+    conn = _get_conn()
+    with _lock:
+        if owner_id is None:
+            cur = conn.execute("DELETE FROM bot_configs WHERE code = ?",
+                               (normalize_config_code(code),))
+        else:
+            cur = conn.execute(
+                "DELETE FROM bot_configs WHERE code = ? AND owner_id = ?",
+                (normalize_config_code(code), owner_id),
+            )
+        conn.commit()
+        return cur.rowcount > 0

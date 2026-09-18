@@ -97,7 +97,7 @@ async def cb_global_stats(callback: CallbackQuery, child_manager: ChildManager) 
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstats")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="gstats", style="primary")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
     ])
 

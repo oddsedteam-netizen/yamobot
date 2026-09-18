@@ -22,8 +22,8 @@ class CoownerFSM(StatesGroup):
 def coowners_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить совладельца", callback_data="co_add")],
-            [InlineKeyboardButton(text="🗑 Удалить совладельца", callback_data="co_remove")],
+            [InlineKeyboardButton(text="➕ Добавить совладельца", callback_data="co_add", style="success")],
+            [InlineKeyboardButton(text="🗑 Удалить совладельца", callback_data="co_remove", style="danger")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
         ]
     )

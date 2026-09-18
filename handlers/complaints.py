@@ -44,7 +44,7 @@ def complaints_admin_kb(complaints: list[dict]) -> InlineKeyboardMarkup:
             text=f"#{c['id']} — {label} ({st})",
             callback_data=f"comp_view_{c['id']}",
         )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profile_admin")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="profile_admin", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -159,9 +159,9 @@ async def cb_complaint_view(callback: CallbackQuery) -> None:
            f"📂 Категория: {c['category'] or '—'}\n"
            f"💬 Комментарий: {c['comment'] or '—'}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", callback_data=f"comp_acc_{cid}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"comp_rej_{cid}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="complaints_admin")],
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"comp_acc_{cid}", style="success")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"comp_rej_{cid}", style="danger")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="complaints_admin", style="primary")],
     ])
     if c.get("screenshot_id"):
         msg = callback.message

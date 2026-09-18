@@ -35,8 +35,8 @@ PZ_PER_PAGE = 10
 def pz_menu_kb(bot_id: int, anon_mode: bool = False) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if not anon_mode:
-        rows.append([InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0")])
-        rows.append([InlineKeyboardButton(text="🔍 Найти по ID юзера", callback_data=f"pzsearch_{bot_id}")])
+        rows.append([InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0", style="primary")])
+        rows.append([InlineKeyboardButton(text="🔍 Найти по ID юзера", callback_data=f"pzsearch_{bot_id}", style="primary")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -156,8 +156,8 @@ async def cb_pz_list(callback: CallbackQuery, state: FSMContext) -> None:
     kb_rows = []
     if nav_row:
         kb_rows.append(nav_row)
-    kb_rows.append([InlineKeyboardButton(text="🔍 Найти по ID", callback_data=f"pzsearch_{bot_id}")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pz_{bot_id}")])
+    kb_rows.append([InlineKeyboardButton(text="🔍 Найти по ID", callback_data=f"pzsearch_{bot_id}", style="primary")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"pz_{bot_id}", style="primary")])
 
     await render_callback(callback, text, InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
@@ -196,7 +196,7 @@ async def cb_pz_search(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"pz_{bot_id}")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"pz_{bot_id}", style="primary")]
                               ]))
     await callback.answer()
 
@@ -230,7 +230,7 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
             f"Возможно, он ещё не писал этому боту."
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ К меню ПЗ", callback_data=f"pz_{bot_id}")]
+            [InlineKeyboardButton(text="⬅️ К меню ПЗ", callback_data=f"pz_{bot_id}", style="primary")]
         ])
     else:
         # Инфа о юзере
@@ -277,9 +277,9 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
         )
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"pzview_{bot_id}_{user_chat_id}")],
-            [InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0")],
-            [InlineKeyboardButton(text="⬅️ К меню ПЗ", callback_data=f"pz_{bot_id}")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"pzview_{bot_id}_{user_chat_id}", style="primary")],
+            [InlineKeyboardButton(text="📋 Список ПЗ", callback_data=f"pzlist_{bot_id}_0", style="primary")],
+            [InlineKeyboardButton(text="⬅️ К меню ПЗ", callback_data=f"pz_{bot_id}", style="primary")],
         ])
 
     if hasattr(msg_or_cb, "answer") and not hasattr(msg_or_cb, "message"):

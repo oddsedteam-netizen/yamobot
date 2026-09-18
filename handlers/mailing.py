@@ -128,7 +128,7 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
             "⚠️ Нет запущенных ботов категории «стандарт» для рассылки.\n"
             "Остановленные и боты-анкетницы не участвуют в рассылке.",
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all", style="primary")]
             ]),
         )
         await callback.answer()
@@ -147,7 +147,7 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
             "📨 <b>Рассылка — только стандарт-боты</b>\n\n"
             "❌ Ни у одного стандарт-бота нет активных пользователей.",
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all")]
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="select_all", style="primary")]
             ]),
         )
         await callback.answer()
@@ -173,7 +173,7 @@ async def cb_all_mailing_start(callback: CallbackQuery, state: FSMContext) -> No
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="select_all", style="primary")]
                               ]))
     await callback.answer()
 
@@ -248,7 +248,7 @@ async def fsm_mailing_message(message: Message, state: FSMContext) -> None:
         f"💬 Текст:\n{preview}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Отправить", callback_data="mailing_confirm")],
+                [InlineKeyboardButton(text="✅ Отправить", callback_data="mailing_confirm", style="success")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_data)],
             ]
         )

@@ -12,7 +12,11 @@ from handlers import register_all_handlers
 from services.child_manager import ChildManager
 from services.config import BOT_TOKEN, OWNER_ID
 from services.constants import BOT_VERSION
-from services.storage import ensure_db
+from services.reminder_service import ReminderService
+from services.storage import (
+    ensure_db,
+    reset_all_antiraid_triggered,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -47,6 +51,13 @@ def load_token() -> str:
 
 async def main() -> None:
     ensure_db()
+    # После рестарта бота сбрасываем флаг сработавшего антирейда: если чат
+    # остался заблокированным, владелец сам выключит защиту через /выкланти.
+    reset_all_antiraid_triggered()
+    # Защиту от накрутки (антинакрутку) НЕ сбрасываем: если она сработала,
+    # то остаётся включённой до решения владельца — иначе после рестарта
+    # спам-наплыв снова открыл бы шлюз. Снять защиту владелец может кнопкой
+    # «🚨 Антинакрутка» → «🔄 Сбросить защиту» в профиле.
     token = load_token()
 
     bot = Bot(
@@ -58,6 +69,8 @@ async def main() -> None:
     dp["owner_id"] = OWNER_ID
     child_manager = ChildManager()
     dp["child_manager"] = child_manager
+    reminder_service = ReminderService()
+    dp["reminder_service"] = reminder_service
 
     # Даём менеджеру ссылку на основной бот — для уведомлений в «чат админов».
     from services.child_manager import set_main_bot
@@ -70,8 +83,11 @@ async def main() -> None:
         logging.info("YamoBot запущен: @%s (%s) | версия %s", me.username, me.id, BOT_VERSION)
         await bot.delete_webhook(drop_pending_updates=True)
         await child_manager.start_all_children()
+        # Фоновый сканер напоминалок (авточек ответа админа / напоминание про ПЗ).
+        reminder_service.start()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await reminder_service.stop()
         await child_manager.stop_all_children()
         await bot.session.close()
 

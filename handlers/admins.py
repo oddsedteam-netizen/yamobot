@@ -44,13 +44,19 @@ class AdminFSM(StatesGroup):
 def admins_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list")],
-            [InlineKeyboardButton(text="📊 Статистика админов", callback_data="gadmins_stats")],
-            [InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")],
-            [InlineKeyboardButton(text="🔗 Добавить админа ссылкой", callback_data="gadmins_addlink")],
-            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del")],
-            [InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit")],
-            [InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search")],
+            [
+                InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list", style="primary"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats", style="primary"),
+            ],
+            [
+                InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add", style="success"),
+                InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del", style="danger"),
+            ],
+            [InlineKeyboardButton(text="🔗 Добавить админа ссылкой", callback_data="gadmins_addlink", style="success")],
+            [
+                InlineKeyboardButton(text="✏️ Редактировать теги", callback_data="gadmins_edit", style="primary"),
+                InlineKeyboardButton(text="🔍 Найти по тегу", callback_data="gadmins_search", style="primary"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_main")],
         ]
     )
@@ -60,18 +66,22 @@ def admins_list_kb(extra_rows: list[list[InlineKeyboardButton]] | None = None) -
     rows: list[list[InlineKeyboardButton]] = []
     if extra_rows:
         rows.extend(extra_rows)
-    rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add")])
-    rows.append([InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")])
-    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add", style="success")])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary"),
+        InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Изменить тег", callback_data=f"gadmins_editone_{admin_user_id}")],
-            [InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"gadmins_delone_{admin_user_id}")],
-            [InlineKeyboardButton(text="⬅️ К списку", callback_data="gadmins_list")],
+            [
+                InlineKeyboardButton(text="✏️ Изменить тег", callback_data=f"gadmins_editone_{admin_user_id}", style="primary"),
+                InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"gadmins_delone_{admin_user_id}", style="danger"),
+            ],
+            [InlineKeyboardButton(text="⬅️ К списку", callback_data="gadmins_list", style="primary")],
         ]
     )
 
@@ -212,7 +222,7 @@ async def cb_edit_one_admin(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}", style="primary")]
                               ]))
     await callback.answer()
 
@@ -234,8 +244,8 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
         f"🏷 #{admin['tag']}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"gadmins_delconfirm_{admin_user_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}")],
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"gadmins_delconfirm_{admin_user_id}", style="danger")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"gadmins_view_{admin_user_id}", style="primary")],
     ])
 
     await render_callback(callback, text, kb)
@@ -268,10 +278,10 @@ async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
         f"Хотите сделать рассылку по ПЗ админа с оповещением об уходе?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, разослать", callback_data=f"gadmins_delmail_yes_{admin_user_id}")],
+        [InlineKeyboardButton(text="✅ Да, разослать", callback_data=f"gadmins_delmail_yes_{admin_user_id}", style="success")],
         [InlineKeyboardButton(text="❌ Нет", callback_data=f"gadmins_delmail_no_{admin_user_id}")],
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
     ])
     await render_callback(callback, text, kb)
 
@@ -280,8 +290,8 @@ async def _finish_admin_deleted(callback: CallbackQuery, uname: str, tag: str) -
     """Финальный экран после удаления админа (когда рассылка не нужна)."""
     text = f"✅ <b>Админ удалён!</b>\n\n👤 {uname}\n🏷 #{tag}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
     ])
     await render_callback(callback, text, kb)
 
@@ -290,7 +300,7 @@ async def _finish_admin_deleted(callback: CallbackQuery, uname: str, tag: str) -
 async def cb_delmail_no(callback: CallbackQuery) -> None:
     await callback.answer()
     await render_callback(callback, "👌 Ок", InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")]
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")]
     ]))
 
 
@@ -333,8 +343,8 @@ async def cb_delmail_yes(callback: CallbackQuery,
         f"❌ Ошибок: <b>{failed}</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
     ])
     await render_callback(callback, text, kb)
 
@@ -368,8 +378,8 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data="gadmins_stats")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="gadmins_stats", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
         ]
     )
 
@@ -387,7 +397,7 @@ async def cb_add_admin_by_link(callback: CallbackQuery, state: FSMContext) -> No
         f"Как только нужное количество админов вступит, ссылка станет неактуальной."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins", style="primary")],
     ])
     await render_callback(callback, text, kb)
 
@@ -432,7 +442,7 @@ async def _invite_link_payload(bot, token: str, max_uses: int) -> tuple[str, Inl
             "⚠️ <b>Не удалось создать ссылку.</b>\n\n"
             "Не удалось получить username бота. Попробуй ещё раз.",
             InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")]
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")]
             ]),
         )
 
@@ -446,8 +456,8 @@ async def _invite_link_payload(bot, token: str, max_uses: int) -> tuple[str, Inl
         "Как только все места займут, ссылка автоматически перестанет действовать."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+        [InlineKeyboardButton(text="🔄 Новая ссылка", callback_data="gadmins_addlink", style="success")],
+        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
     ])
     return text, kb
 
@@ -467,7 +477,7 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list", style="primary")]
                               ]))
     await callback.answer()
 
@@ -509,15 +519,15 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
             f"🏷 #{tag}\n\n"
             f"Админ привязан ко всем ботам.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
             ])
         )
     else:
         await message.answer(
             "⚠️ Этот пользователь уже добавлен как админ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")]
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")]
             ])
         )
 
@@ -550,7 +560,7 @@ async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list", style="primary")]
                               ]))
     await callback.answer()
 
@@ -574,8 +584,8 @@ async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ <b>Админ удалён!</b>\n\n👤 {uname} #{tag}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
         ])
     )
 # ═══════════════ Редактор тегов ═══════════════
@@ -593,7 +603,7 @@ async def cb_edit_tag(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list", style="primary")]
                               ]))
     await callback.answer()
 
@@ -620,8 +630,8 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
             f"👤 {uname}\n"
             f"🏷 #{old_tag} → #{new_tag}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+                [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
             ])
         )
         return
@@ -651,8 +661,8 @@ async def fsm_edit_tag(message: Message, state: FSMContext) -> None:
         f"👤 {uname}\n"
         f"🏷 #{old_tag} → #{new_tag}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
         ])
     )
 
@@ -668,7 +678,7 @@ async def cb_search_tag(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await try_edit_answer(callback.message, text,
                               InlineKeyboardMarkup(inline_keyboard=[
-                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list")]
+                                  [InlineKeyboardButton(text="❌ Отмена", callback_data="gadmins_list", style="primary")]
                               ]))
     await callback.answer()
 
@@ -687,7 +697,7 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"⚠️ Админ с тегом <b>#{tag}</b> не найден.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")]
+                [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")]
             ])
         )
         return
@@ -726,8 +736,8 @@ async def fsm_search_tag(message: Message, state: FSMContext) -> None:
     await message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins")],
+            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
         ])
     )
