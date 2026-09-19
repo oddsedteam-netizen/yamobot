@@ -53,7 +53,16 @@ class AntiNakrutkaFSM(StatesGroup):
 
 def antinakrutka_kb(owner_id: int, settings: dict) -> InlineKeyboardMarkup:
     """Клавиатура настроек антинакрутки."""
+    enabled = bool(int(settings.get("enabled", 1)))
+    toggle = (
+        InlineKeyboardButton(text="🔴 Выключить защиту", callback_data="an_disable",
+                             style="danger")
+        if enabled else
+        InlineKeyboardButton(text="🟢 Включить защиту", callback_data="an_enable",
+                             style="success")
+    )
     rows = [
+        [toggle],
         [InlineKeyboardButton(text="🔢 Сколько ПЗ для срабатывания",
                               callback_data="an_count", style="primary")],
         [InlineKeyboardButton(text="⏱ За сколько минут",
@@ -70,7 +79,11 @@ def antinakrutka_kb(owner_id: int, settings: dict) -> InlineKeyboardMarkup:
 def antinakrutka_text(owner_id: int) -> str:
     """Текст экрана настроек антинакрутки."""
     s = get_antinakrutka_settings(owner_id)
-    if s["triggered"]:
+    enabled = bool(int(s.get("enabled", 1)))
+
+    if not enabled:
+        status = "🔴 <b>защита выключена</b> — бот не следит за наплывом ПЗ"
+    elif s["triggered"]:
         status = (
             "🚨 <b>ЗАЩИТА АКТИВНА</b>\n"
             "  • новые ПЗ не создаются;\n"
@@ -86,11 +99,33 @@ def antinakrutka_text(owner_id: int) -> str:
         "приходит слишком много ПЗ, бот запоминает статистику, спрашивает, "
         "засчитывать ли наплыв, и включает режим защиты — новые ПЗ не "
         "создаются, уведомления в «чат админов» не приходят.\n\n"
+        "🔌 Включить или выключить защиту можно кнопкой ниже — при выключенной "
+        "защите бот просто не следит за наплывом.\n\n"
         "📊 <u>Настройки:</u>\n"
         f"  • Срабатывание: <b>{s['count']}</b> ПЗ за <b>{s['window_minutes']}</b> мин\n"
         f"  • Статус: {status}\n\n"
         "Что настроить?"
     )
+
+
+# ═══════════════ Включение и выключение защиты ═══════════════
+
+@router.callback_query(F.data == "an_enable")
+async def cb_an_enable(callback: CallbackQuery) -> None:
+    owner_id = cb_uid(callback)
+    set_antinakrutka_field(owner_id, "enabled", 1)
+    await callback.answer("🟢 Защита включена")
+    await render_callback(callback, antinakrutka_text(owner_id),
+                          antinakrutka_kb(owner_id, get_antinakrutka_settings(owner_id)))
+
+
+@router.callback_query(F.data == "an_disable")
+async def cb_an_disable(callback: CallbackQuery) -> None:
+    owner_id = cb_uid(callback)
+    set_antinakrutka_field(owner_id, "enabled", 0)
+    await callback.answer("🔴 Защита выключена")
+    await render_callback(callback, antinakrutka_text(owner_id),
+                          antinakrutka_kb(owner_id, get_antinakrutka_settings(owner_id)))
 
 
 # ═══════════════ Открытие настроек из профиля ═══════════════

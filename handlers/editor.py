@@ -11,7 +11,8 @@ from aiogram.types import (
 )
 
 from handlers._common import (render_callback, safe_edit, cb_data, cb_uid,
-                              msg_uid, try_edit_answer, try_edit)
+                              msg_uid, try_edit_answer, try_edit,
+                              normalize_link)
 from services.storage import (
     get_bot_by_id,
     update_bot_field,
@@ -326,10 +327,17 @@ async def fsm_link_name(message: Message, state: FSMContext) -> None:
 
 @router.message(EditorFSM.waiting_link_url)
 async def fsm_link_url(message: Message, state: FSMContext) -> None:
-    link_url = (message.text or "").strip()
+    # Ссылку принимаем в любом виде (@username, t.me/..., example.com) и сами
+    # приводим к формату, который понимает Telegram в инлайн-кнопке.
+    link_url = normalize_link(message.text or "")
 
-    if not link_url.startswith(("http://", "https://", "tg://")):
-        await message.answer("❌ Ссылка должна начинаться с http:// https:// или tg://")
+    if not link_url:
+        await message.answer(
+            "❌ Не похоже на ссылку.\n\n"
+            "Отправь её в любом виде: <code>@username</code>, "
+            "<code>t.me/канал</code> или полную <code>https://…</code> — "
+            "бот сам приведёт её к нужному формату."
+        )
         return
 
     data = await state.get_data()
@@ -577,10 +585,17 @@ async def fsm_global_link_name(message: Message, state: FSMContext) -> None:
 
 @router.message(EditorFSM.waiting_global_link_url)
 async def fsm_global_link_url(message: Message, state: FSMContext) -> None:
-    link_url = (message.text or "").strip()
+    # Ссылку принимаем в любом виде (@username, t.me/..., example.com) и сами
+    # приводим к формату, который понимает Telegram в инлайн-кнопке.
+    link_url = normalize_link(message.text or "")
 
-    if not link_url.startswith(("http://", "https://", "tg://")):
-        await message.answer("❌ Ссылка должна начинаться с http:// https:// или tg://")
+    if not link_url:
+        await message.answer(
+            "❌ Не похоже на ссылку.\n\n"
+            "Отправь её в любом виде: <code>@username</code>, "
+            "<code>t.me/канал</code> или полную <code>https://…</code> — "
+            "бот сам приведёт её к нужному формату."
+        )
         return
 
     data = await state.get_data()

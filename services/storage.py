@@ -103,6 +103,22 @@ def _migrate_bot_welcome_media(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_bot_category_ask(conn: sqlite3.Connection) -> None:
+    """Добавляет колонки «уточнения категории ПЗ» в таблицу bots.
+
+    ``cat_ask_enabled`` — включена ли функция у бота,
+    ``cat_ask_categories`` — какие категории предлагать ПЗ (пустая строка =
+    набор по умолчанию). У уже существующих ботов значения пустые — поведение
+    остаётся прежним, функция просто выключена.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+    if "cat_ask_enabled" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN cat_ask_enabled INTEGER DEFAULT 0")
+    if "cat_ask_categories" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN cat_ask_categories TEXT DEFAULT ''")
+    conn.commit()
+
+
 def _migrate_registry_chats(conn: sqlite3.Connection) -> None:
     """Добавляет колонки привязанных чатов в users_registry."""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(users_registry)").fetchall()]
@@ -123,6 +139,40 @@ def _migrate_registry_pending_bind(conn: sqlite3.Connection) -> None:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(users_registry)").fetchall()]
     if "pending_bind_kind" not in cols:
         conn.execute("ALTER TABLE users_registry ADD COLUMN pending_bind_kind TEXT DEFAULT ''")
+    conn.commit()
+
+
+def _migrate_antinakrutka_enabled(conn: sqlite3.Connection) -> None:
+    """Добавляет колонку enabled в antinakrutka_settings.
+
+    Раньше антинакрутку нельзя было выключить — она всегда следила за наплывом.
+    Теперь у защиты есть переключатель «🟢 Включить / 🔴 Выключить», поэтому
+    существующим владельцам ставим enabled = 1 (поведение не меняется).
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(antinakrutka_settings)").fetchall()]
+    if "enabled" not in cols:
+        conn.execute("ALTER TABLE antinakrutka_settings ADD COLUMN enabled INTEGER DEFAULT 1")
+    conn.commit()
+
+
+def _migrate_admin_norms(conn: sqlite3.Connection) -> None:
+    """Создаёт таблицу недельных норм админов (раздел «📊 Норма» в профиле).
+
+    Хранит по владельцу: саму норму, первый/последний день подсчёта (0=Пн … 6=Вс),
+    включены ли уведомления и метку последнего отправленного периода — чтобы
+    уведомление о недоборе приходило ровно один раз за период.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_norms (
+            owner_id        INTEGER PRIMARY KEY,
+            norm            INTEGER DEFAULT 0,
+            start_day       INTEGER DEFAULT 0,
+            end_day         INTEGER DEFAULT 4,
+            notify_enabled  INTEGER DEFAULT 1,
+            last_notified   TEXT DEFAULT '',
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
 
 
@@ -185,6 +235,8 @@ def ensure_db() -> None:
             bot_type     TEXT DEFAULT 'standard',
             welcome_photo TEXT DEFAULT '',
             welcome_rich TEXT DEFAULT '',
+            cat_ask_enabled INTEGER DEFAULT 0,
+            cat_ask_categories TEXT DEFAULT '',
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -451,15 +503,70 @@ def ensure_db() -> None:
             uses            INTEGER DEFAULT 1,
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- Системные настройки (ссылки, параметры платформы)
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL DEFAULT '',
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- ТГК (Telegram-канал) пользователя: бот добавляется в канал админом
+        -- и публикует посты от лица канала. У пользователя один канал.
+        CREATE TABLE IF NOT EXISTS tg_channels (
+            owner_id   INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            title      TEXT DEFAULT '',
+            username   TEXT DEFAULT '',
+            bound_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Кто прямо сейчас просит привязать ТГК. Нужно на случай, когда
+        -- Telegram не сообщил инициатора добавления бота в канал (анонимный
+        -- админ): привязываем канал владельцу с самой свежей заявкой.
+        CREATE TABLE IF NOT EXISTS channel_bind_requests (
+            owner_id   INTEGER PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Посты ТГК: отложенные (status='scheduled') и опубликованные.
+        -- publish_at — UTC 'YYYY-MM-DD HH:MM:SS' (в интерфейсе показываем МСК).
+        CREATE TABLE IF NOT EXISTS channel_posts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id   INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            text       TEXT DEFAULT '',
+            photo      TEXT DEFAULT '',
+            buttons    TEXT DEFAULT '[]',
+            status     TEXT DEFAULT 'scheduled',
+            publish_at TEXT DEFAULT '',
+            message_id INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Розыгрыши ТГК: для сводки в разделе «📢 Мой ТГК»
+        -- (сколько проведено, какие победители).
+        CREATE TABLE IF NOT EXISTS channel_giveaways (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id   INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            title      TEXT DEFAULT '',
+            winners    TEXT DEFAULT '',
+            status     TEXT DEFAULT 'finished',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
     _migrate_bot_anonymous(conn)
     _migrate_bot_welcome_media(conn)
+    _migrate_bot_category_ask(conn)
     _migrate_registry_chats(conn)
     _migrate_registry_pending_bind(conn)
     _migrate_admin_invites(conn)
     _migrate_antiraid_del_links_default(conn)
+    _migrate_antinakrutka_enabled(conn)
+    _migrate_admin_norms(conn)
     conn.commit()
 
 
@@ -561,7 +668,7 @@ def get_bot_by_id_any_owner(bot_id: int) -> dict | None:
 _BOT_FIELDS_WHITELIST = {
     "token", "username", "first_name", "welcome_text",
     "links", "stopped", "antispam_mode", "bot_type", "anonymous_mode",
-    "welcome_photo", "welcome_rich",
+    "welcome_photo", "welcome_rich", "cat_ask_enabled", "cat_ask_categories",
 }
 
 
@@ -605,6 +712,52 @@ def is_bot_anonymous(bot_id: int) -> bool:
 def set_bot_anonymous(user_id: int, bot_id: int, enabled: bool) -> bool:
     """Включает/выключает анонимный режим бота."""
     return update_bot_field(user_id, bot_id, "anonymous_mode", 1 if enabled else 0)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Уточнение категории ПЗ (настройка бота)
+# ═══════════════════════════════════════════════════════════
+# Если функция включена, а ПЗ не указал категорию в первом сообщении, бот
+# спрашивает её инлайн-кнопками и только потом уведомляет «чат админов».
+
+# Категории, которые предлагаются по умолчанию (пока владелец не настроил свои).
+DEFAULT_PZ_CATEGORIES: tuple[str, ...] = ("поддержка", "универсал", "общение")
+
+
+def get_cat_ask_settings(bot_id: int) -> tuple[bool, list[str]]:
+    """Настройки «уточнения категории»: (включено, список категорий).
+
+    Категории хранятся одной строкой через запятую; пусто — набор по умолчанию.
+    Список никогда не бывает пустым: без категорий вопрос ПЗ не имеет смысла.
+    """
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        return False, list(DEFAULT_PZ_CATEGORIES)
+
+    enabled = bool(bot.get("cat_ask_enabled", 0))
+    raw = str(bot.get("cat_ask_categories") or "").strip()
+    if raw:
+        categories = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    else:
+        categories = []
+    return enabled, categories or list(DEFAULT_PZ_CATEGORIES)
+
+
+def set_cat_ask_enabled(user_id: int, bot_id: int, enabled: bool) -> bool:
+    """Включает/выключает «уточнение категории» у бота."""
+    return update_bot_field(user_id, bot_id, "cat_ask_enabled", 1 if enabled else 0)
+
+
+def set_cat_ask_categories(user_id: int, bot_id: int, categories: list[str]) -> bool:
+    """Сохраняет список категорий, которые предлагать ПЗ (не пустой)."""
+    clean: list[str] = []
+    for raw in categories:
+        name = str(raw or "").strip().lower().lstrip("#")
+        if name and name not in clean:
+            clean.append(name)
+    if not clean:
+        clean = list(DEFAULT_PZ_CATEGORIES)
+    return update_bot_field(user_id, bot_id, "cat_ask_categories", ",".join(clean))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2070,6 +2223,30 @@ def set_registry_user_blocked(user_id: int, blocked: bool) -> None:
         )
         conn.commit()
 
+# ═══════════════════════════════════════════════════════════
+#  Системные настройки (ссылки на ботов, донат и т.д.)
+# ═══════════════════════════════════════════════════════════
+
+def get_app_setting(key: str, default: str = "") -> str:
+    conn = _get_conn()
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    if row and row[0] is not None:
+        return str(row[0]).strip()
+    return default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            (key, str(value).strip()),
+        )
+        conn.commit()
+
+
+
 
 # ═══════════════════════════════════════════════════════════
 #  Жалобы
@@ -2429,6 +2606,9 @@ def get_emoji_map() -> dict[str, str]:
 # ═══════════════════════════════════════════════════════════
 
 _ANTINAKRUTKA_DEFAULTS = {
+    # Включена ли защита (переключатель «🟢 Включить» / «🔴 Выключить»).
+    # Когда выключена — бот не следит за наплывом и не присылает уведомлений.
+    "enabled": 1,
     "count": 10,
     "window_minutes": 5,
     # «Пропускать ли топики ПЗ при защите»: 1 — да (топики создаются,
@@ -2454,6 +2634,7 @@ def get_antinakrutka_settings(owner_id: int) -> dict:
                 settings[k] = row[k]
     settings["count"] = max(1, int(settings.get("count") or 10))
     settings["window_minutes"] = max(1, int(settings.get("window_minutes") or 5))
+    settings["enabled"] = 1 if settings.get("enabled") is None else int(settings["enabled"])
     settings["block_topics"] = int(settings.get("block_topics") or 0)
     settings["triggered"] = int(settings.get("triggered") or 0)
     settings["snapshot"] = settings.get("snapshot") or ""
@@ -2508,6 +2689,114 @@ def reset_all_antinakrutka_triggered() -> None:
     conn = _get_conn()
     conn.execute("UPDATE antinakrutka_settings SET triggered = 0, snapshot = ''")
     conn.commit()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Норма админов (раздел «📊 Норма» в профиле)
+# ═══════════════════════════════════════════════════════════
+
+# Дни недели: 0 — понедельник, 6 — воскресенье.
+# По умолчанию период подсчёта — с понедельника (0) по пятницу (4).
+_NORM_DEFAULTS = {
+    "norm": 0,             # 0 — норма выключена
+    "start_day": 0,
+    "end_day": 4,
+    "notify_enabled": 1,
+    "last_notified": "",
+}
+
+
+def get_norm_settings(owner_id: int) -> dict:
+    """Настройки нормы владельца (со значениями по умолчанию)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM admin_norms WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    settings = dict(_NORM_DEFAULTS)
+    if row:
+        for k in settings:
+            if k in row.keys():
+                settings[k] = row[k]
+    settings["norm"] = max(0, int(settings.get("norm") or 0))
+    settings["start_day"] = min(6, max(0, int(settings.get("start_day") or 0)))
+    settings["end_day"] = min(6, max(0, int(settings.get("end_day") or 0)))
+    settings["notify_enabled"] = 1 if settings.get("notify_enabled") is None \
+        else int(settings["notify_enabled"])
+    settings["last_notified"] = str(settings.get("last_notified") or "")
+    return settings
+
+
+def set_norm_field(owner_id: int, field: str, value) -> bool:
+    """Обновляет одно поле настроек нормы владельца."""
+    if field not in _NORM_DEFAULTS:
+        return False
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            f"INSERT INTO admin_norms (owner_id, {field}) VALUES (?, ?) "
+            f"ON CONFLICT(owner_id) DO UPDATE SET {field}=excluded.{field}, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (owner_id, value),
+        )
+        conn.commit()
+    return True
+
+
+def get_all_norm_settings() -> list[dict]:
+    """Настройки нормы всех владельцев (для фоновой проверки недобора).
+
+    В каждую запись добавляется ``owner_id`` — по нему отправляется уведомление.
+    """
+    conn = _get_conn()
+    rows = conn.execute("SELECT owner_id FROM admin_norms").fetchall()
+    result: list[dict] = []
+    for row in rows:
+        owner_id = int(row["owner_id"])
+        settings = get_norm_settings(owner_id)
+        settings["owner_id"] = owner_id
+        result.append(settings)
+    return result
+
+
+def get_admin_period_messages(owner_id: int, admin_user_id: int,
+                              since: str, until: str) -> int:
+    """Сколько сообщений админ отправил за период [since, until) (UTC).
+
+    Считаем все записи admin_messages: и ответы админа в топиках, и его
+    действия по кнопкам — это и есть «активность» админа за период.
+    """
+    bot_ids = _owner_bot_ids(owner_id)
+    if not bot_ids:
+        return 0
+    placeholders = ",".join("?" for _ in bot_ids)
+    conn = _get_conn()
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM admin_messages WHERE admin_user_id = ? "
+        f"AND created_at >= ? AND created_at < ? AND bot_id IN ({placeholders})",
+        (admin_user_id, since, until, *bot_ids),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_norm_period_stats(owner_id: int, since: str, until: str) -> list[dict]:
+    """Активность всех админов владельца за период, отсортированная по убыванию.
+
+    Возвращает список словарей: admin, period (сообщений за период),
+    stats (день/неделя/месяц/всего), active_topics, reached (набрана ли норма).
+    """
+    norm = get_norm_settings(owner_id)["norm"]
+    result: list[dict] = []
+    for a in get_admins_all(owner_id):
+        period = get_admin_period_messages(owner_id, a["user_id"], since, until)
+        result.append({
+            "admin": a,
+            "period": period,
+            "stats": get_admin_message_stats(owner_id, a["user_id"]),
+            "active_topics": get_admin_active_topics(owner_id, a["user_id"]),
+            "reached": bool(norm) and period >= norm,
+        })
+    result.sort(key=lambda item: (-item["period"], str(item["admin"].get("tag") or "")))
+    return result
 
 
 def clear_antinakrutka_snapshot(owner_id: int) -> None:
@@ -2602,7 +2891,10 @@ def set_reminder_quiet(owner_id: int, from_time: str | None = None,
     current = get_reminder_quiet(owner_id)
     from_time = str(from_time or current["from_time"])
     to_time = str(to_time or current["to_time"])
-    enabled = current["enabled"] if enabled is None else (1 if enabled else 0)
+    if enabled is None:
+        enabled_val = int(current["enabled"] or 0)
+    else:
+        enabled_val = 1 if enabled else 0
 
     conn = _get_conn()
     with _lock:
@@ -2611,7 +2903,7 @@ def set_reminder_quiet(owner_id: int, from_time: str | None = None,
             "VALUES (?, ?, ?, ?) ON CONFLICT(owner_id) DO UPDATE SET "
             "enabled=excluded.enabled, from_time=excluded.from_time, "
             "to_time=excluded.to_time, updated_at=CURRENT_TIMESTAMP",
-            (owner_id, enabled, from_time, to_time),
+            (owner_id, enabled_val, from_time, to_time),
         )
         conn.commit()
     return True
@@ -2716,3 +3008,226 @@ def delete_bot_config(code: str, owner_id: int | None = None) -> bool:
             )
         conn.commit()
         return cur.rowcount > 0
+# ═══════════════════════════════════════════════════════════
+#  ТГК (Telegram-каналы) и посты канала
+# ═══════════════════════════════════════════════════════════
+# Раздел «📢 Мой ТГК»: пользователь добавляет YamoBot
+# в свой канал админом, бот публикует посты от лица канала. Канал — один на
+# пользователя (owner_id — владелец в YamoBot).
+
+
+def bind_channel(owner_id: int, channel_id: int, title: str = "",
+                 username: str = "") -> None:
+    """Привязывает канал к пользователю (перезаписывает прежнюю привязку)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO tg_channels (owner_id, channel_id, title, username) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET channel_id=excluded.channel_id, "
+            "title=excluded.title, username=excluded.username",
+            (owner_id, channel_id, title or "", username or ""),
+        )
+        conn.commit()
+
+
+def get_bound_channel(owner_id: int) -> dict | None:
+    """Привязанный канал пользователя (или None)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM tg_channels WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_channel_owner(channel_id: int) -> int | None:
+    """Чей канал привязан (owner_id) — по ID канала."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT owner_id FROM tg_channels WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def update_channel_info(channel_id: int, title: str = "", username: str = "") -> None:
+    """Обновляет название/username канала (например, после переименования)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE tg_channels SET title = ?, username = ? WHERE channel_id = ?",
+            (title or "", username or "", channel_id),
+        )
+        conn.commit()
+
+
+def unbind_channel(owner_id: int) -> bool:
+    """Отвязывает канал пользователя (вместе с его отложенными постами)."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM tg_channels WHERE owner_id = ?", (owner_id,))
+        conn.execute(
+            "DELETE FROM channel_posts WHERE owner_id = ? AND status = 'scheduled'",
+            (owner_id,),
+        )
+        conn.execute(
+            "DELETE FROM channel_bind_requests WHERE owner_id = ?", (owner_id,)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def add_channel_post(owner_id: int, channel_id: int, text: str = "",
+                     photo: str = "", buttons: str = "[]",
+                     status: str = "scheduled", publish_at: str = "") -> int:
+    """Добавляет пост канала. Возвращает его id."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT INTO channel_posts "
+            "(owner_id, channel_id, text, photo, buttons, status, publish_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (owner_id, channel_id, text or "", photo or "", buttons or "[]",
+             status, publish_at or ""),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def get_channel_post(post_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM channel_posts WHERE id = ?", (post_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_channel_posts(owner_id: int, status: str | None = None) -> list[dict]:
+    """Посты канала пользователя (свежие сверху). status=None — все."""
+    conn = _get_conn()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM channel_posts WHERE owner_id = ? AND status = ? "
+            "ORDER BY id DESC",
+            (owner_id, status),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM channel_posts WHERE owner_id = ? ORDER BY id DESC",
+            (owner_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_channel_posts(owner_id: int, status: str) -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM channel_posts WHERE owner_id = ? AND status = ?",
+        (owner_id, status),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+_CHANNEL_POST_FIELDS = {"text", "photo", "buttons", "status", "publish_at", "message_id"}
+
+
+def update_channel_post(post_id: int, **fields) -> bool:
+    """Обновляет поля поста (только из белого списка)."""
+    data = {k: v for k, v in fields.items() if k in _CHANNEL_POST_FIELDS}
+    if not data:
+        return False
+    conn = _get_conn()
+    with _lock:
+        columns = ", ".join(f"{k} = ?" for k in data)
+        cur = conn.execute(
+            f"UPDATE channel_posts SET {columns} WHERE id = ?",
+            (*data.values(), post_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_channel_post(post_id: int) -> bool:
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM channel_posts WHERE id = ?", (post_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_due_channel_posts(now_utc: str) -> list[dict]:
+    """Отложенные посты, время которых уже наступило (UTC-строка)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM channel_posts "
+        "WHERE status = 'scheduled' AND publish_at != '' AND publish_at <= ? "
+        "ORDER BY publish_at ASC",
+        (now_utc,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_channel_giveaway(owner_id: int, channel_id: int, title: str = "",
+                         winners: str = "", status: str = "finished") -> int:
+    """Добавляет запись о розыгрыше канала (для сводки в «Мой ТГК»)."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "INSERT INTO channel_giveaways (owner_id, channel_id, title, winners, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (owner_id, channel_id, title or "", winners or "", status),
+        )
+        conn.commit()
+        return int(cur.lastrowid or 0)
+
+
+def get_channel_giveaways(owner_id: int) -> list[dict]:
+    """Розыгрыши канала пользователя (свежие сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM channel_giveaways WHERE owner_id = ? ORDER BY id DESC",
+        (owner_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_channel_bind_request(owner_id: int) -> None:
+    """Отмечает, что пользователь просит привязать ТГК.
+
+    Нужно, когда Telegram не сообщает инициатора добавления бота в канал
+    (анонимный админ): тогда привязываем канал владельцу со свежей заявкой.
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO channel_bind_requests (owner_id, created_at) "
+            "VALUES (?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(owner_id) DO UPDATE SET created_at=CURRENT_TIMESTAMP",
+            (owner_id,),
+        )
+        conn.commit()
+
+
+def clear_channel_bind_request(owner_id: int) -> None:
+    """Снимает заявку на привязку ТГК (привязали или отменили)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "DELETE FROM channel_bind_requests WHERE owner_id = ?", (owner_id,)
+        )
+        conn.commit()
+
+
+def get_channel_bind_request(max_age_seconds: int = 900) -> int | None:
+    """Владелец со свежей заявкой «привяжи ТГК» (или None).
+
+    Берём только заявки не старше ``max_age_seconds`` (по умолчанию 15 минут):
+    так старые ожидания не перехватят чужой канал.
+    """
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT owner_id FROM channel_bind_requests "
+        "WHERE created_at >= datetime('now', ?) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (f"-{int(max_age_seconds)} seconds",),
+    ).fetchone()
+    return int(row[0]) if row else None

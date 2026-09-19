@@ -2,15 +2,20 @@ import asyncio
 import io
 import json
 import logging
+import random
+import re
 import time
 from collections import defaultdict
-from typing import Any
+from collections.abc import Awaitable, Callable
+from html import escape as _html_escape
+from typing import Any, TypeVar
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType, ChatType, ChatMemberStatus
 from aiogram.exceptions import (
-    TelegramBadRequest, TelegramConflictError, TelegramForbiddenError, TelegramRetryAfter,
+    TelegramBadRequest, TelegramConflictError, TelegramForbiddenError, TelegramNetworkError,
+    TelegramRetryAfter, TelegramServerError,
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -22,6 +27,9 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     MessageEntity,
+    MessageReactionUpdated,
+    ReactionTypeCustomEmoji,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
 )
 
@@ -30,6 +38,8 @@ from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               try_edit_answer, try_edit)
 from services import premium_emoji as premium
 from services.constants import BASE_WELCOME, BOT_CREDIT
+from services.polling import ResilientDispatcher, set_polling_problem_hook
+from services.promo import detect_promo_from_message
 from services.rich import rich_payload_from_json, send_rich
 
 from services.storage import (
@@ -47,6 +57,7 @@ from services.storage import (
     get_bot_by_id_any_owner,
     get_child_users,
     get_admin_by_user_id,
+    get_emoji_map,
     mark_user_blocked,
     save_mailing,
     get_antispam_mode,
@@ -77,6 +88,7 @@ from services.storage import (
     get_stats,
     reserve_topic_slot,
     set_topic_id,
+    get_cat_ask_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +144,10 @@ class _ChatGate:
 
 _chat_gates: dict[tuple[int, int], _ChatGate] = {}
 
+# Тип результата отправки: нужен, чтобы «шлюз» сохранял тип ответа Telegram
+# (Message, ForumTopic и т.д.) — иначе Pyright считает результат None.
+_T = TypeVar("_T")
+
 
 def _chat_gate(bot: Bot | None, chat_id: int) -> _ChatGate:
     """Шлюз отправок для пары (бот, чат)."""
@@ -143,16 +159,19 @@ def _chat_gate(bot: Bot | None, chat_id: int) -> _ChatGate:
     return gate
 
 
-async def _send_with_gate(bot: Bot | None, chat_id: int, call):
+async def _send_with_gate(bot: Bot | None, chat_id: int,
+                          call: Callable[[], Awaitable[_T]]) -> _T:
     """Отправка с учётом лимитов Telegram: очередь + выдержка flood-wait.
 
     ``call`` — корутина без аргументов, которая делает саму отправку.
     Если Telegram вернул 429 (``TelegramRetryAfter``), ждём указанное время
     и повторяем — сообщение не теряется.
+
+    Возвращает результат ``call`` (тип сохраняется: Message, ForumTopic и т.д.).
     """
     gate = _chat_gate(bot, chat_id)
     last_error: Exception | None = None
-    for _ in range(_SEND_ATTEMPTS):
+    for attempt in range(_SEND_ATTEMPTS):
         await gate.acquire()
         try:
             result = await call()
@@ -169,6 +188,18 @@ async def _send_with_gate(bot: Bot | None, chat_id: int, call):
             gate.hold(delay)
             gate.release()
             continue
+        except (TelegramServerError, TelegramNetworkError) as e:
+            # Telegram «икнул» или пропала сеть: сообщение НЕ теряем — небольшая
+            # пауза и повтор. Раньше такая ошибка сразу теряла сообщение.
+            last_error = e
+            pause = min(2.0 * (attempt + 1), 10.0)
+            logger.warning(
+                "Сбой связи при отправке в чат %s (%s) — повтор через %.0fс",
+                chat_id, type(e).__name__, pause,
+            )
+            gate.hold(pause)
+            gate.release()
+            continue
         except Exception:
             gate.release()
             raise
@@ -179,7 +210,9 @@ async def _send_with_gate(bot: Bot | None, chat_id: int, call):
         return result
     if last_error is not None:
         raise last_error
-    return None
+    # Сюда попадаем только если попытки кончились, а ошибки не было (не бывает
+    # на практике) — явное исключение лучше, чем «пустой» результат.
+    raise RuntimeError("Не удалось выполнить отправку: попытки исчерпаны")
 
 
 def set_main_bot(bot: Bot) -> None:
@@ -265,8 +298,12 @@ def check_premium_delivered(sent: Message | None, source_text: str,
     if sent is None or not expected:
         return False
 
+    # У постов с фото (и любого медиа) разметка живёт в подписи, а не в тексте.
+    entities = list(getattr(sent, "entities", None) or [])
+    if not entities:
+        entities = list(getattr(sent, "caption_entities", None) or [])
     delivered = sum(
-        1 for e in (sent.entities or []) if str(getattr(e, "type", "")) == "custom_emoji"
+        1 for e in entities if str(getattr(e, "type", "")) == "custom_emoji"
     )
     if delivered >= expected:
         if bot_id is not None:
@@ -293,6 +330,65 @@ def check_premium_delivered(sent: Message | None, source_text: str,
 def get_main_bot() -> Bot | None:
     """Возвращает основной бот YamoBot (используется фоновыми сервисами)."""
     return _MAIN_BOT
+
+
+async def send_with_gate(bot: Bot, chat_id: int,
+                         call: Callable[[], Awaitable[_T]]) -> _T:
+    """Публичная обёртка над «шлюзом» отправок (для фоновых сервисов).
+
+    Учитывает лимиты Telegram: очередь на чат + выдержка flood-wait (429).
+    ``call`` — корутина без аргументов, делающая саму отправку.
+    """
+    return await _send_with_gate(bot, chat_id, call)
+
+
+def _bot_name_of(bot_id: int) -> str:
+    """Человекочитаемое имя бота по его id (``bot_<id>``, если данных нет)."""
+    info = get_bot_by_id_any_owner(bot_id)
+    return bot_display_name(info) if info else f"bot_{bot_id}"
+
+
+async def _main_send(chat_id: int, **kwargs: Any):
+    """Отправка от основного бота YamoBot (через «шлюз», с учётом flood-wait).
+
+    Хелпер существует ради типов: у модульной переменной ``_MAIN_BOT``
+    (``Bot | None``) Pyright не сохраняет сужение типа внутри лямбд, а у
+    локальной переменной — сохраняет.
+    """
+    bot = _MAIN_BOT
+    if bot is None:
+        raise RuntimeError("Основной бот YamoBot ещё не инициализирован")
+    return await _send_with_gate(
+        bot, chat_id, lambda: bot.send_message(chat_id=chat_id, **kwargs)
+    )
+
+
+def _is_message_in_topic(message: Message, topic_id: int) -> bool:
+    """True, если сообщение реально легло в топик ``topic_id``.
+
+    Telegram может принять ``message_thread_id`` уже удалённого топика и
+    опубликовать сообщение в «General» (message_thread_id = None). Такой
+    ответ считается ошибкой доставки: топик надо пересоздать, иначе все
+    сообщения ПЗ будут улетать в общий топик.
+    """
+    thread_id = getattr(message, "message_thread_id", None)
+    if thread_id is None:
+        return False
+    try:
+        return int(thread_id) == int(topic_id)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _delete_stray_message(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Убирает «залётное» сообщение, попавшее не в тот топик."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        logger.warning(
+            "Не удалось удалить сообщение %s в чате %s (топик удалён): %s",
+            message_id, chat_id, e,
+        )
 
 
 # Кэш скачанных байт медиа по file_id: file_id -> bytes.
@@ -345,6 +441,207 @@ def _is_thread_not_found(err: Exception) -> bool:
             or "topic not found" in msg)
 
 
+# ── Категория ПЗ (хэштег в первом сообщении) ───────────────────
+# ПЗ обычно помечает обращение категорией в первом сообщении после /start:
+# «#общение», «#поддержка», «#универсал» и т.п. Категорию показываем в
+# уведомлении и в шапке топика; если ПЗ её не написал — строки просто нет.
+# \w в Python понимает кириллицу, поэтому регулярка не зависит от языка.
+_PZ_TAG_RE = re.compile(r"#(\w{2,32})", re.UNICODE)
+# Больше трёх категорий не показываем: это уже не категория, а мусор.
+PZ_CATEGORIES_LIMIT = 3
+
+
+def extract_pz_categories(message: Message) -> str:
+    """Хэштеги-категории из первого сообщения ПЗ (или пустая строка).
+
+    Сначала берём хэштеги из ``entities`` — Telegram сам их размечает и знает,
+    где хэштег начинается и заканчивается. Если сущностей нет (старый апдейт),
+    ищем регуляркой по тексту. Дубликаты и регистр приводим к виду «как написал
+    ПЗ», лишние отбрасываем. Пустая строка означает «ПЗ категорию не указал» —
+    тогда в уведомлении строки с категорией нет.
+    """
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return ""
+
+    tags: list[str] = []
+    for entity in list(message.entities or message.caption_entities or []):
+        if str(getattr(entity, "type", "")) != "hashtag":
+            continue
+        offset = int(getattr(entity, "offset", 0) or 0)
+        length = int(getattr(entity, "length", 0) or 0)
+        tag = text[offset:offset + length].strip()
+        if tag:
+            tags.append(tag)
+    if not tags:
+        tags = [f"#{found}" for found in _PZ_TAG_RE.findall(text)]
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        key = tag.lower().lstrip("#")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(tag if tag.startswith("#") else f"#{tag}")
+    return " ".join(unique[:PZ_CATEGORIES_LIMIT])
+
+
+# Слова сообщения — для поиска категории, написанной без хэштега
+# («поддержка», «нужна поддержка»).
+_PZ_WORD_RE = re.compile(r"\w{2,32}", re.UNICODE)
+
+
+def pick_pz_category(message: Message, categories: list[str],
+                     hashtags: str = "") -> str:
+    """Категория ПЗ по списку включённых категорий (или пустая строка).
+
+    Понимает и хэштег («#поддержка»), и обычное слово («поддержка»,
+    «нужна поддержка»). Возвращает категорию в виде ``#имя`` — в таком виде её
+    и показываем админам. Пустая строка значит «ПЗ категорию не назвал»: тогда
+    (при включённой настройке) бот уточняет её кнопками.
+    """
+    wanted = [str(c).strip().lower().lstrip("#") for c in categories if str(c).strip()]
+    if not wanted:
+        return ""
+
+    tags = hashtags or extract_pz_categories(message)
+    for tag in tags.split():
+        name = tag.lstrip("#").lower()
+        if name in wanted:
+            return f"#{name}"
+
+    text = (message.text or message.caption or "").lower()
+    if not text:
+        return ""
+    words = set(_PZ_WORD_RE.findall(text))
+    # Порядок как в настройках: первая включённая категория «побеждает».
+    for name in wanted:
+        if name in words:
+            return f"#{name}"
+    return ""
+
+
+# ── Уточнение категории у ПЗ ───────────────────────────────────
+# Пока ПЗ не выбрал категорию, уведомление в «чат админов» откладывается:
+# ключ — (id бота, чат ПЗ). Одновременно ждём ответ максимум
+# PZ_CATEGORY_TIMEOUT секунд, потом уведомляем БЕЗ категории — иначе ПЗ
+# потерялся бы совсем.
+PZ_ASK_TEXT = (
+    "🏷 <b>Какая категория админов тебе нужна?</b>\n\n"
+    "Выбери кнопкой ниже — я передам обращение нужным админам."
+)
+PZ_CATEGORY_TIMEOUT = 180.0
+
+_pz_category_pending: dict[tuple[int, int], dict[str, Any]] = {}
+_pz_category_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+
+def _pop_pz_category(bot_id: int, user_chat_id: int,
+                     cancel_task: bool = True) -> dict[str, Any] | None:
+    """Забирает ожидание категории у ПЗ (и отменяет таймер-страховку)."""
+    key = (bot_id, user_chat_id)
+    task = _pz_category_tasks.pop(key, None)
+    if cancel_task and task is not None and not task.done():
+        task.cancel()
+    return _pz_category_pending.pop(key, None)
+
+
+async def apply_pz_category(bot_obj: Bot, bot_id: int, user_chat_id: int,
+                            index: int) -> tuple[bool, str]:
+    """Применяет выбранную ПЗ категорию: уведомляет «чат админов».
+
+    Возвращает ``(приняли, название)``. ``False`` — уточнение уже неактуально
+    (истёк таймер) либо категория не найдена; в этом случае уведомление уходит
+    без категории, чтобы ПЗ не потерялся.
+    """
+    pending = _pop_pz_category(bot_id, user_chat_id)
+    if not pending:
+        return False, ""
+
+    categories = pending["categories"]
+    group_chat_id = pending["group_chat_id"]
+    topic_id = pending["topic_id"]
+
+    if index < 0 or index >= len(categories):
+        await _notify_new_pz(bot_id, group_chat_id, topic_id)
+        return False, ""
+
+    name = categories[index]
+    try:
+        await _notify_new_pz(bot_id, group_chat_id, topic_id, None, f"#{name}")
+    except Exception as e:
+        logger.warning("Не удалось уведомить о ПЗ с категорией: %s", e)
+
+    # Заодно отмечаем категорию прямо в топике — админам так виднее.
+    try:
+        await _send_with_gate(
+            bot_obj, group_chat_id,
+            lambda: bot_obj.send_message(
+                chat_id=group_chat_id, message_thread_id=topic_id,
+                text=f"🏷 Категория: <b>#{_html_escape(name)}</b>"),
+        )
+    except Exception as e:
+        logger.debug("Не удалось отметить категорию в топике: %s", e)
+    return True, name
+
+
+async def _ask_pz_category(bot_obj: Bot, bot_id: int, user_chat_id: int,
+                           topic_id: int, group_chat_id: int,
+                           categories: list[str]) -> bool:
+    """Спрашивает у ПЗ категорию инлайн-кнопками (без покраски).
+
+    False — вопрос отправить не удалось (тогда вызывающий код уведомит админов
+    как раньше, без категории).
+    """
+    rows = [
+        [InlineKeyboardButton(text=name, callback_data=f"pzcat_{index}")]
+        for index, name in enumerate(categories)
+    ]
+    try:
+        await _send_with_gate(
+            bot_obj, user_chat_id,
+            lambda: bot_obj.send_message(chat_id=user_chat_id, text=PZ_ASK_TEXT,
+                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)),
+        )
+    except Exception as e:
+        logger.warning("Не удалось спросить категорию у ПЗ %s: %s", user_chat_id, e)
+        return False
+
+    key = (bot_id, user_chat_id)
+    _pz_category_pending[key] = {
+        "topic_id": topic_id,
+        "group_chat_id": group_chat_id,
+        "categories": list(categories),
+    }
+    old = _pz_category_tasks.pop(key, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _pz_category_tasks[key] = asyncio.create_task(
+        _pz_category_timeout(bot_id, user_chat_id),
+        name=f"pzcat_{bot_id}_{user_chat_id}",
+    )
+    return True
+
+
+async def _pz_category_timeout(bot_id: int, user_chat_id: int) -> None:
+    """Страховка: ПЗ не выбрал категорию — уведомляем админов без неё."""
+    try:
+        await asyncio.sleep(PZ_CATEGORY_TIMEOUT)
+    except asyncio.CancelledError:
+        return
+
+    pending = _pop_pz_category(bot_id, user_chat_id, cancel_task=False)
+    if not pending:
+        return
+    logger.info("ПЗ %s (бот %s) не выбрал категорию за %.0fс — уведомляю без неё",
+                user_chat_id, bot_id, PZ_CATEGORY_TIMEOUT)
+    try:
+        await _notify_new_pz(bot_id, pending["group_chat_id"], pending["topic_id"])
+    except Exception as e:
+        logger.warning("Не удалось отправить отложенное уведомление о ПЗ: %s", e)
+
+
 async def notify_owner(bot_id: int, text: str) -> None:
     """Шлёт владельцу бота сообщение от основного бота (если это возможно).
 
@@ -363,11 +660,78 @@ async def notify_owner(bot_id: int, text: str) -> None:
         logger.warning("Не удалось уведомить владельца %s: %s", owner_id, e)
 
 
-async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None:
+def _find_bot_id_by_telegram_id(telegram_id: int) -> int | None:
+    """Проверяет, есть ли такой бот в нашей БД (id записи = Telegram id бота).
+
+    Нужно для уведомлений из ``services.polling``: там есть только сам ``Bot``,
+    а чтобы написать владельцу, нужен id записи бота в БД.
+    """
+    try:
+        if any(int(info.get("id") or 0) == telegram_id for info in get_all_bots_flat()):
+            return telegram_id
+    except Exception as e:
+        logger.debug("Не удалось найти бота %s в БД: %s", telegram_id, e)
+    return None
+
+
+async def _on_polling_problem(bot: Bot, kind: str) -> None:
+    """Реакция на проблемы polling у дочернего бота (см. ``services.polling``).
+
+    «conflict» — апдейты бота забирает вебхук или второй экземпляр бота:
+    предупреждаем владельца один раз за серию.
+    «unauthorized» — токен отозван/недействителен: polling остановлен, сообщаем
+    владельцу, что нужно переподключить бота с рабочим токеном.
+    """
+    bot_id = _find_bot_id_by_telegram_id(bot.id)
+    if bot_id is None:
+        return
+
+    if kind == "conflict":
+        if bot_id in _token_used_warned:
+            return
+        _token_used_warned.add(bot_id)
+        await notify_owner(
+            bot_id,
+            "⚠️ <b>Бот не может получать сообщения: токен занят</b>\n\n"
+            f"🤖 Бот: <b>{_bot_name_of(bot_id)}</b>\n\n"
+            "У бота стоит вебхук или второй экземпляр бота, который тоже забирает "
+            "апдейты (например, копия бота на другом сервере или подключение к "
+            "другому конструктору). Я сбрасываю вебхук сам и повторяю попытки — "
+            "сообщения приходят, но часть их может уходить «на ту сторону».\n\n"
+            "Останови второго «слушателя» — и бот заработает нормально, "
+            "перезапускать вручную не нужно.",
+        )
+        return
+
+    await notify_owner(
+        bot_id,
+        "⛔ <b>Токен бота больше не работает</b>\n\n"
+        f"🤖 Бот: <b>{_bot_name_of(bot_id)}</b>\n\n"
+        "Telegram ответил «Unauthorized»: токен отозван или недействителен. "
+        "Бот не может получать сообщения, и повторять попытки бессмысленно — "
+        "я остановил его опрос.\n\n"
+        "Проверь бота в @BotFather (он мог быть удалён или пересоздан) и добавь "
+        "его в панель заново с рабочим токеном.",
+    )
+
+
+# Проблемы polling (конфликт токена / мёртвый токен) показываем владельцу.
+set_polling_problem_hook(_on_polling_problem)
+
+
+async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int,
+                         promo_hint: str | None = None,
+                         categories: str = "") -> None:
     """Шлёт в привязанный «чат админов» владельца уведомление о новом ПЗ.
 
     Ссылка на топик отправляется всегда; имя/ID пользователя — только вне
-    анонимного режима (в анонимном личность скрыта).
+    анонимного режима (в анонимном личность скрыта). Если первое сообщение ПЗ
+    похоже на предложение пиара/ВП — добавляем пометку «возможно пиар»/«возможно ВП».
+    Если ПЗ указал категорию хэштегом в первом сообщении (#общение, #поддержка,
+    #универсал) — показываем её; не указал — строки с категорией нет.
+
+    Строки разделяем пустыми строками: так уведомление читается легче, а по
+    ссылке-топику проще попасть пальцем.
     """
     if _MAIN_BOT is None:
         return
@@ -389,16 +753,21 @@ async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int) -> None
     link = _topic_web_link(group_chat_id, topic_id)
 
     text = (
-        f"🆕 <b>Новый ПЗ</b>\n"
-        f"🤖 Бот: <b>{bot_name}</b>\n"
+        f"🆕 <b>Новый ПЗ</b>\n\n"
+        f"🤖 Бот: <b>{bot_name}</b>\n\n"
         f"🔗 Топик: {link}"
     )
+    if categories:
+        # Категорию пишет сам ПЗ хэштегом в первом сообщении (#общение,
+        # #поддержка, #универсал). Не написал — строки нет.
+        text += f"\n\n🏷 Категория: <b>{_html_escape(categories)}</b>"
+
+    if promo_hint:
+        # Подсказка админам: обращение, скорее всего, про рекламу/взаимный пиар.
+        text += f"\n\n🔎 <b>{promo_hint}</b>"
 
     try:
-        await _send_with_gate(
-            _MAIN_BOT, admin_chat,
-            lambda: _MAIN_BOT.send_message(chat_id=admin_chat, text=text),
-        )
+        await _main_send(admin_chat, text=text)
     except Exception as e:
         logger.warning("Не удалось отправить уведомление о новом ПЗ в чат админов: %s", e)
 
@@ -423,16 +792,13 @@ async def _notify_admin_change(bot_id: int, group_chat_id: int, topic_id: int) -
     link = _topic_web_link(group_chat_id, topic_id)
 
     text = (
-        f"🔄 <b>ПЗ просит смену админа!</b>\n"
-        f"🤖 Бот: <b>{bot_name}</b>\n"
+        f"🔄 <b>ПЗ просит смену админа!</b>\n\n"
+        f"🤖 Бот: <b>{bot_name}</b>\n\n"
         f"🔗 Топик: {link}"
     )
 
     try:
-        await _send_with_gate(
-            _MAIN_BOT, admin_chat,
-            lambda: _MAIN_BOT.send_message(chat_id=admin_chat, text=text),
-        )
+        await _main_send(admin_chat, text=text)
     except Exception as e:
         logger.warning("Не удалось отправить уведомление о смене админа: %s", e)
 
@@ -451,7 +817,12 @@ def is_antinakrutka_active(owner_id: int) -> bool:
     """True, если у владельца сейчас активна защита от накрутки ПЗ."""
     if not owner_id:
         return False
-    return bool(get_antinakrutka_settings(owner_id)["triggered"])
+    settings = get_antinakrutka_settings(owner_id)
+    # Защита может быть выключена переключателем «🔴 Выключить» — тогда даже
+    # «сработавшее» состояние не считается активным.
+    if not int(settings.get("enabled", 1)):
+        return False
+    return bool(settings["triggered"])
 
 
 # ── Режим защиты: сообщения не доставляются, но и не теряются ──
@@ -537,11 +908,7 @@ async def _notify_antinakrutka(owner_id: int, settings: dict) -> None:
                               style="danger")],
     ])
     try:
-        await _send_with_gate(
-            _MAIN_BOT, owner_id,
-            lambda: _MAIN_BOT.send_message(chat_id=owner_id, text=owner_text,
-                                           reply_markup=kb),
-        )
+        await _main_send(owner_id, text=owner_text, reply_markup=kb)
     except Exception as e:
         logger.warning("Не удалось уведомить владельца о накрутке ПЗ: %s", e)
 
@@ -549,16 +916,13 @@ async def _notify_antinakrutka(owner_id: int, settings: dict) -> None:
     if not admin_chat:
         return
     try:
-        await _send_with_gate(
-            _MAIN_BOT, admin_chat,
-            lambda: _MAIN_BOT.send_message(
-                chat_id=admin_chat,
-                text=(
-                    "⚠️ <b>Возможная накрутка ПЗ!</b>\n\n"
-                    f"За <b>{window}</b> мин пришло <b>{count}+</b> новых ПЗ.\n"
-                    "🔕 Уведомления о новых ПЗ <b>временно приостановлены</b>, "
-                    "пока владелец не подтвердит, что это реальные обращения."
-                ),
+        await _main_send(
+            admin_chat,
+            text=(
+                "⚠️ <b>Возможная накрутка ПЗ!</b>\n\n"
+                f"За <b>{window}</b> мин пришло <b>{count}+</b> новых ПЗ.\n"
+                "🔕 Уведомления о новых ПЗ <b>временно приостановлены</b>, "
+                "пока владелец не подтвердит, что это реальные обращения."
             ),
         )
     except Exception as e:
@@ -586,11 +950,7 @@ async def _notify_antinakrutka_release(owner_id: int) -> None:
                               style="danger")],
     ])
     try:
-        await _send_with_gate(
-            _MAIN_BOT, owner_id,
-            lambda: _MAIN_BOT.send_message(chat_id=owner_id, text=text,
-                                           reply_markup=kb),
-        )
+        await _main_send(owner_id, text=text, reply_markup=kb)
     except Exception as e:
         logger.warning("Не удалось спросить про снятие защиты: %s", e)
 
@@ -608,6 +968,9 @@ async def register_new_pz(owner_id: int) -> bool:
     if not owner_id:
         return False
     settings = get_antinakrutka_settings(owner_id)
+    # Выключенная защита не следит за наплывом вообще.
+    if not int(settings.get("enabled", 1)):
+        return False
     if settings["triggered"]:
         return False
 
@@ -695,22 +1058,18 @@ async def lift_antinakrutka(owner_id: int) -> dict:
     logger.info("Антинакрутка выключена у владельца %s — уведомления возобновлены",
                 owner_id)
 
-    if _MAIN_BOT is not None:
-        admin_chat = get_bound_chat(owner_id, "admin")
-        if admin_chat:
-            try:
-                await _send_with_gate(
-                    _MAIN_BOT, admin_chat,
-                    lambda: _MAIN_BOT.send_message(
-                        chat_id=admin_chat,
-                        text=(
-                            "✅ <b>Защита от накрутки снята.</b>\n"
-                            "Новые ПЗ снова создаются, уведомления включены."
-                        ),
-                    ),
-                )
-            except Exception as e:
-                logger.warning("Не удалось уведомить чат админов о снятии защиты: %s", e)
+    admin_chat = get_bound_chat(owner_id, "admin")
+    if admin_chat:
+        try:
+            await _main_send(
+                admin_chat,
+                text=(
+                    "✅ <b>Защита от накрутки снята.</b>\n"
+                    "Новые ПЗ снова создаются, уведомления включены."
+                ),
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить чат админов о снятии защиты: %s", e)
 
     return {"bots": len(get_user_bots(owner_id))}
 
@@ -894,6 +1253,150 @@ def _text_kwargs(source_msg: Message, native: bool) -> dict[str, Any]:
     return {"text": source_msg.html_text or source_msg.text or ""}
 
 
+# Лимит Telegram на длину подписи к медиа. Сообщение с более длинной подписью
+# Telegram не принимал ЦЕЛИКОМ (ошибка «message caption is too long»), из-за чего
+# у части чатов пропадали сообщения с фото. Теперь длинная подпись уходит
+# отдельным сообщением, а медиа — без неё.
+CAPTION_LIMIT = 1024
+
+# Признаки того, что Telegram отказал именно в МЕДИА, а не в чате: запрет медиа
+# в этом чате, нечитаемое/битое фото, слишком большой файл. В таких случаях
+# текст сообщения всё равно можно доставить, поэтому шлём его отдельной копией.
+_MEDIA_ERROR_MARKERS = (
+    "not enough rights to send",
+    "no rights to send",
+    "chat_send_photos_forbidden",
+    "chat_send_videos_forbidden",
+    "photo_invalid_dimensions",
+    "image_process_failed",
+    "wrong file identifier",
+    "file is too big",
+    "unsupported",
+)
+
+
+def _error_text(err: Exception) -> str:
+    """Текст ошибки Telegram в нижнем регистре (для поиска по подстроке)."""
+    return str(getattr(err, "message", "") or err).lower()
+
+
+def _is_media_error(err: Exception) -> bool:
+    """True, если Telegram отказал именно в отправке медиа."""
+    text = _error_text(err)
+    return any(marker in text for marker in _MEDIA_ERROR_MARKERS)
+
+
+def _is_reply_error(err: Exception) -> bool:
+    """True, если ошибка из-за ответа (reply) на недоступное сообщение."""
+    text = _error_text(err)
+    return ("replied message not found" in text
+            or "reply message not found" in text
+            or "message to be replied not found" in text)
+
+
+def _drop_reply(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Копия аргументов отправки без reply (сообщение дойдёт без цитаты)."""
+    return {key: value for key, value in kwargs.items() if key != "reply_to_message_id"}
+
+
+def _source_media(source_msg: Message) -> tuple[str, str] | None:
+    """Тип и file_id самого крупного медиа сообщения (или None)."""
+    if source_msg.photo:
+        return "photo", source_msg.photo[-1].file_id
+    if source_msg.video:
+        return "video", source_msg.video.file_id
+    if source_msg.animation:
+        return "animation", source_msg.animation.file_id
+    if source_msg.document:
+        return "document", source_msg.document.file_id
+    if source_msg.audio:
+        return "audio", source_msg.audio.file_id
+    if source_msg.voice:
+        return "voice", source_msg.voice.file_id
+    return None
+
+
+async def _send_media_call(bot: Bot, kwargs: dict[str, Any], kind: str, file_id: str,
+                           cap: dict[str, Any], extra: dict[str, Any]) -> Message | None:
+    """Отправляет одно медиа указанным способом (по типу медиа)."""
+    if kind == "photo":
+        return await bot.send_photo(**kwargs, photo=file_id, **cap, **extra)
+    if kind == "video":
+        return await bot.send_video(**kwargs, video=file_id, **cap, **extra)
+    if kind == "animation":
+        return await bot.send_animation(**kwargs, animation=file_id, **cap, **extra)
+    if kind == "document":
+        return await bot.send_document(**kwargs, document=file_id, **cap, **extra)
+    if kind == "audio":
+        return await bot.send_audio(**kwargs, audio=file_id, **cap, **extra)
+    if kind == "voice":
+        return await bot.send_voice(**kwargs, voice=file_id, **cap, **extra)
+    return None
+
+
+async def _send_caption_separately(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
+                                   caption: str, extra: dict[str, Any]) -> None:
+    """Доставляет текст медиа-сообщения отдельным сообщением (с разметкой).
+
+    Нужно, когда подпись не влезает в лимит Telegram: медиа уходит без неё, а
+    текст — следом. Ошибку глотаем: медиа уже доставлено, а потеря текста не
+    должна ломать всю отправку.
+    """
+    text_kwargs: dict[str, Any] = {"text": caption}
+    if extra.get("parse_mode", "html") is None:
+        # Родной режим: текст обычный, разметка — в сущностях.
+        text_kwargs["entities"] = source_msg.caption_entities
+    try:
+        await bot.send_message(**kwargs, **text_kwargs, **extra)
+    except Exception as e:
+        logger.warning("Не удалось отправить текст медиа-сообщения отдельно: %s", e)
+
+
+async def _send_media_copy(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
+                           cap: dict[str, Any], extra: dict[str, Any],
+                           kind: str, file_id: str) -> Message | None:
+    """Отправляет медиа-копию, не теряя длинную подпись."""
+    caption = cap.get("caption") or ""
+    if len(caption) > CAPTION_LIMIT:
+        logger.info(
+            "Подпись медиа-сообщения длиннее лимита Telegram (%d симв.) — "
+            "отправляю медиа без подписи, а текст отдельным сообщением", len(caption),
+        )
+        sent = await _send_media_call(bot, kwargs, kind, file_id, {}, extra)
+        await _send_caption_separately(source_msg, bot, kwargs, caption, extra)
+        return sent
+    return await _send_media_call(bot, kwargs, kind, file_id, cap, extra)
+
+
+async def _copy_as_document(bot: Bot, kwargs: dict[str, Any], cap: dict[str, Any],
+                            extra: dict[str, Any], file_id: str) -> Message | None:
+    """Отправляет медиа документом (фолбэк для «нечитаемых» фото/анимаций)."""
+    return await bot.send_document(**kwargs, document=file_id, **cap, **extra)
+
+
+async def _copy_as_text_only(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
+                             cap: dict[str, Any], extra: dict[str, Any],
+                             original: Exception) -> Message | None:
+    """Последний шанс: доставляет текст медиа-сообщения, когда медиа запрещено.
+
+    Если текста нет (например, фото без подписи) — пробрасывает исходную ошибку,
+    чтобы вызывающий код обработал её как раньше (например, пересоздал топик).
+    """
+    caption = (cap.get("caption") or "").strip()
+    if not caption:
+        raise original
+    logger.warning("Медиа отправить не удалось (%s) — доставляю текст сообщения",
+                   original)
+    if len(caption) > CAPTION_LIMIT:
+        # Обрезанный HTML может оказаться невалидным — шлём простым текстом.
+        return await bot.send_message(**kwargs, text=caption[:CAPTION_LIMIT],
+                                      parse_mode=None)
+    text_kwargs: dict[str, Any] = {"text": caption}
+    if extra.get("parse_mode", "html") is None:
+        text_kwargs["entities"] = source_msg.caption_entities
+    return await bot.send_message(**kwargs, **text_kwargs, **extra)
+
+
 async def _copy_message(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
                         native: bool = False) -> Message | None:
     """Копирует сообщение юзера/админа в другой чат.
@@ -902,37 +1405,53 @@ async def _copy_message(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
     это страховка на случай, если HTML-разметку не удалось распарсить:
     сообщение дойдёт с премиум-эмодзи и форматированием вместо того,
     чтобы потеряться целиком.
+
+    Медиа-копия защищена каскадом фолбэков: длинная подпись уходит отдельным
+    сообщением, «нечитаемое» фото пробуем отправить документом, а при запрете
+    медиа в чате текст всё равно доходит. Без этого сообщения с фото терялись
+    у части чатов, хотя обычный текст доставлялся нормально.
     """
     extra: dict[str, Any] = {"parse_mode": None} if native else {}
     cap = _caption_kwargs(source_msg, native)
+    media = _source_media(source_msg)
 
-    if source_msg.photo:
-        return await bot.send_photo(**kwargs, photo=source_msg.photo[-1].file_id,
-                                     **cap, **extra)
-    if source_msg.video:
-        return await bot.send_video(**kwargs, video=source_msg.video.file_id,
-                                     **cap, **extra)
-    if source_msg.animation:
-        return await bot.send_animation(**kwargs, animation=source_msg.animation.file_id,
-                                         **cap, **extra)
-    if source_msg.document:
-        return await bot.send_document(**kwargs, document=source_msg.document.file_id,
-                                        **cap, **extra)
+    if media is not None:
+        kind, file_id = media
+        try:
+            return await _send_media_copy(source_msg, bot, kwargs, cap, extra,
+                                          kind, file_id)
+        except TelegramBadRequest as e:
+            if _is_reply_error(e) and "reply_to_message_id" in kwargs:
+                # Сообщение, на которое отвечали, удалено: шлём без цитаты.
+                logger.warning("Копия: ответ на недоступное сообщение — шлю без reply")
+                return await _send_media_copy(source_msg, bot, _drop_reply(kwargs),
+                                              cap, extra, kind, file_id)
+            if kind in ("photo", "animation") and _is_media_error(e):
+                # Фото, которое Telegram не смог обработать: доходит документом.
+                try:
+                    return await _copy_as_document(bot, kwargs, cap, extra, file_id)
+                except TelegramBadRequest as doc_error:
+                    logger.warning("Копия: не ушло ни фото, ни документом (%s)",
+                                   doc_error)
+            if _is_media_error(e):
+                return await _copy_as_text_only(source_msg, bot, kwargs, cap, extra, e)
+            raise
+
     if source_msg.sticker:
         return await bot.send_sticker(**kwargs, sticker=source_msg.sticker.file_id)
-    if source_msg.voice:
-        return await bot.send_voice(**kwargs, voice=source_msg.voice.file_id,
-                                     **cap, **extra)
     if source_msg.video_note:
         return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
-    if source_msg.audio:
-        return await bot.send_audio(**kwargs, audio=source_msg.audio.file_id,
-                                     **cap, **extra)
 
     text_kw = _text_kwargs(source_msg, native)
     if not text_kw["text"]:
         return None
-    return await bot.send_message(**kwargs, **text_kw, **extra)
+    try:
+        return await bot.send_message(**kwargs, **text_kw, **extra)
+    except TelegramBadRequest as e:
+        if _is_reply_error(e) and "reply_to_message_id" in kwargs:
+            logger.warning("Копия: ответ на недоступное сообщение — шлю без reply")
+            return await bot.send_message(**_drop_reply(kwargs), **text_kw, **extra)
+        raise
 
 
 async def _copy_message_smart(source_msg: Message, bot: Bot,
@@ -986,6 +1505,18 @@ async def _send_to_topic_retry(source_msg: Message, bot: Bot,
             bot, group_chat_id,
             lambda: _send_to_topic(source_msg, bot, group_chat_id, topic_id, reply_to),
         )
+        if sent is not None and not _is_message_in_topic(sent, topic_id):
+            # Топик удалили вручную, но Telegram принял его message_thread_id и
+            # опубликовал сообщение НЕ в нём (обычно — в «General»). Считаем это
+            # «топик не найден»: убираем залётное сообщение, а вызывающий код
+            # сотрёт старую запись и создаст свежий топик, как новому ПЗ.
+            logger.warning(
+                "Сообщение для топика %s ушло вне топика (message_thread_id=%s) — "
+                "топик удалён, пересоздаю ПЗ.",
+                topic_id, getattr(sent, "message_thread_id", None),
+            )
+            await _delete_stray_message(bot, group_chat_id, sent.message_id)
+            return None, True
         return sent, False
     except TelegramBadRequest as e:
         if _is_thread_not_found(e):
@@ -1057,8 +1588,77 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
         pass
 
 
+# ═══════════════════════════════════════════════════════════════
+#  Иконки тем ПЗ и реакции (обычные + премиум)
+# ═══════════════════════════════════════════════════════════════
+
+# Иконки-эмодзи для новых топиков: список отдаёт Telegram
+# (getForumTopicIconStickers). Раздаём их по кругу, чтобы соседние ПЗ
+# получали РАЗНЫЕ иконки, а не одну и ту же.
+_TOPIC_ICONS: list[str] = []
+_TOPIC_ICON_INDEX = 0
+
+# Разрешённые цвета иконки темы (если эмодзи получить не удалось).
+_TOPIC_COLORS = [0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F]
+
+
+async def _next_topic_icon(bot_obj: Bot) -> tuple[str | None, int | None]:
+    """Иконка для новой темы ПЗ: (custom_emoji_id, icon_color).
+
+    Эмодзи-иконки спрашиваем у Telegram один раз и кэшируем. Если получить
+    не удалось — отдаём случайный цвет из разрешённого набора, чтобы темы
+    всё равно отличались друг от друга.
+    """
+    global _TOPIC_ICONS, _TOPIC_ICON_INDEX
+    if not _TOPIC_ICONS:
+        try:
+            stickers = await bot_obj.get_forum_topic_icon_stickers()
+            _TOPIC_ICONS = [s.custom_emoji_id for s in stickers if s.custom_emoji_id]
+        except Exception as e:
+            logger.debug("Не удалось получить иконки тем: %s", e)
+            _TOPIC_ICONS = []
+    if _TOPIC_ICONS:
+        icon_id = _TOPIC_ICONS[_TOPIC_ICON_INDEX % len(_TOPIC_ICONS)]
+        _TOPIC_ICON_INDEX += 1
+        return icon_id, None
+    return None, random.choice(_TOPIC_COLORS)
+
+
+def _emoji_for_custom_id(custom_emoji_id: str) -> str | None:
+    """Обычный эмодзи для премиум-реакции (по словарю премиум-эмодзи)."""
+    if not custom_emoji_id:
+        return None
+    for emoji, cid in get_emoji_map().items():
+        if cid == custom_emoji_id:
+            return emoji
+    return None
+
+
+def _mirror_reactions(reactions: list) -> tuple[list | None, str | None]:
+    """Готовит реакцию для повторения на парном сообщении.
+
+    Возвращает пару (реакции для setMessageReaction, id премиум-эмодзи).
+
+    * пустой список — реакцию сняли, значит и на копии её надо снять;
+    * ``None`` — повторять нечего (например, платная реакция: боты их не ставят);
+    * бот без премиума может поставить только одну реакцию, поэтому берём первую.
+    """
+    if not reactions:
+        return [], None
+    for reaction in reactions:
+        if isinstance(reaction, ReactionTypeEmoji):
+            return [reaction], None
+        if isinstance(reaction, ReactionTypeCustomEmoji):
+            custom_id = str(getattr(reaction, "custom_emoji_id", "") or "")
+            return [reaction], (custom_id or None)
+    return None, None
+
+
 def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
-    child_dp = Dispatcher()
+    # Устойчивый диспетчер: конфликт токена (вебхук/второй экземпляр бота) и
+    # мёртвый токен больше не превращаются в бесконечные «tryings = 14000» в
+    # логе — см. services/polling.py.
+    child_dp = ResilientDispatcher()
     bot_id = bot_data["id"]
 
     sticker_counts: dict[int, list[float]] = defaultdict(list)
@@ -1198,6 +1798,63 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             f"Сообщения от пользователей будут создавать топики здесь."
         )
 
+    # ═══════════════ Реакции: обычные и премиум ═══════════════
+
+    @child_dp.message_reaction()
+    async def child_reaction(event: MessageReactionUpdated) -> None:
+        """Повторяет реакцию на парном сообщении, чтобы её было ВИДНО.
+
+        Реакция, поставленная в топике ПЗ, ставится на то же сообщение в личке
+        пользователя (и наоборот) через ``setMessageReaction`` — собеседник
+        видит реакцию прямо на сообщении, никаких отдельных сообщений-уведомлений
+        не приходит.
+
+        Премиум-реакцию пробуем повторить как есть; если Telegram её не
+        разрешает (нужна премиум-подписка владельца бота или разрешение админов
+        чата) — повторяем обычный эмодзи из словаря премиум-эмодзи, а если
+        эмодзи неизвестен — просто ничего не делаем.
+        """
+        try:
+            chat = event.chat
+            if chat.type == ChatType.PRIVATE:
+                # Реакция в личке → повторяем на сообщении в топике ПЗ.
+                pair = get_feedback_msg_by_user_msg(bot_id, chat.id, event.message_id)
+                if not pair:
+                    return
+                target_chat = int(pair["group_chat_id"])
+                target_msg = int(pair.get("group_msg_id") or 0)
+            else:
+                # Реакция в топике → повторяем на сообщении в личке пользователя.
+                pair = get_feedback_msg_by_group_msg(bot_id, chat.id, event.message_id)
+                if not pair:
+                    return
+                target_chat = int(pair["user_chat_id"])
+                target_msg = int(pair.get("user_msg_id") or 0)
+
+            if not target_msg:
+                return
+
+            reactions, custom_id = _mirror_reactions(list(event.new_reaction or []))
+            if reactions is None:
+                return
+
+            try:
+                await bot_obj.set_message_reaction(
+                    chat_id=target_chat, message_id=target_msg, reaction=reactions,
+                )
+            except TelegramBadRequest:
+                # Премиум-реакцию поставить не получилось — пробуем обычный
+                # эмодзи, который ей соответствует.
+                emoji = _emoji_for_custom_id(custom_id or "")
+                if not emoji:
+                    return
+                await bot_obj.set_message_reaction(
+                    chat_id=target_chat, message_id=target_msg,
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
+                )
+        except Exception as e:
+            logger.debug("Не удалось повторить реакцию бота %s: %s", bot_id, e)
+
     # ═══════════════ Автоподключение при добавлении в группу ═══════════════
 
     @child_dp.my_chat_member()
@@ -1254,7 +1911,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             await notify_owner(
                 bot_id,
                 "🚨 <b>Внимание: вашего бота пытались добавить в чужой чат!</b>\n\n"
-                f"🤖 Бот: <b>{bot_display_name(get_bot_by_id_any_owner(bot_id))}</b>\n"
+                f"🤖 Бот: <b>{_bot_name_of(bot_id)}</b>\n"
                 f"📎 Чужой чат: <b>{title}</b>\n"
                 f"🆔 ID чата: <code>{chat.id}</code>\n"
                 f"👤 Добавил: <code>{event.from_user.id if event.from_user else 'неизвестно'}</code>\n\n"
@@ -1678,6 +2335,27 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         await callback.answer()
 
+    # ═══════════════ Уточнение категории ПЗ (кнопки у ПЗ) ═══════════════
+
+    @child_dp.callback_query(F.data.startswith("pzcat_"))
+    async def cb_pz_category(callback: CallbackQuery) -> None:
+        """ПЗ выбрал категорию — уведомляем «чат админов» и отмечаем в топике."""
+        user_chat_id = cb_uid(callback)
+        try:
+            index = int(cb_data(callback).rsplit("_", 1)[-1])
+        except ValueError:
+            index = -1
+
+        accepted, name = await apply_pz_category(bot_obj, bot_id, user_chat_id, index)
+        if not accepted:
+            # Ответ пришёл после таймера: уведомление уже ушло без категории.
+            await callback.answer("⌛ Уточнение уже неактуально", show_alert=True)
+            return
+
+        await callback.answer(f"🏷 Категория: {name}")
+        await try_edit_answer(callback.message,
+                              f"✅ <b>Категория: #{_html_escape(name)}</b>")
+
     # ═══════════════ Сообщения из ЛС → топик ═══════════════
 
     @child_dp.message(F.chat.type == ChatType.PRIVATE)
@@ -1840,11 +2518,22 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 return get_topic_by_user(bot_id, user_chat_id)
 
             try:
+                # Каждой теме даём свою иконку: эмодзи по кругу из набора
+                # Telegram (или случайный цвет, если эмодзи недоступны) —
+                # иначе все ПЗ выглядели бы одинаково.
+                icon_id, icon_color = await _next_topic_icon(bot_obj)
+                topic_kwargs: dict[str, Any] = {
+                    "chat_id": group_chat_id,
+                    "name": "⏳ без админа",
+                }
+                if icon_id:
+                    topic_kwargs["icon_custom_emoji_id"] = icon_id
+                elif icon_color is not None:
+                    topic_kwargs["icon_color"] = icon_color
+
                 forum_topic = await _send_with_gate(
                     bot_obj, group_chat_id,
-                    lambda: bot_obj.create_forum_topic(
-                        chat_id=group_chat_id, name="⏳ без админа"
-                    ),
+                    lambda: bot_obj.create_forum_topic(**topic_kwargs),
                 )
                 new_topic_id = forum_topic.message_thread_id
             except Exception as e:
@@ -1865,7 +2554,29 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 header_text = "📩 <b>Новое сообщение</b> 🕶"
             else:
                 user_name = msg_firstname(message) or msg_username(message) or str(user_chat_id)
-                header_text = f"👤 Новый пользователь: <b>{user_name}</b>\n🆔 <code>{user_chat_id}</code>"
+                # Имя экранируем: ники с «<»/«&» ломали разметку, и шапка с
+                # кнопкой «✋ Я беру» вообще не отправлялась.
+                header_text = (f"👤 Новый пользователь: <b>{_html_escape(user_name)}</b>\n\n"
+                               f"🆔 <code>{user_chat_id}</code>")
+
+            # Категория ПЗ. Если у бота включено «уточнение категории» и ПЗ её не
+            # назвал — спросим кнопками, а уведомление пришлём после ответа.
+            # Спрашиваем только когда «чат админов» привязан: иначе уведомление
+            # всё равно некуда отправить и вопрос был бы бесполезным.
+            ask_enabled, ask_categories = get_cat_ask_settings(bot_id)
+            categories = extract_pz_categories(message)
+            if ask_enabled:
+                categories = pick_pz_category(message, ask_categories, categories)
+            need_ask = (ask_enabled and not categories
+                        and bool(owner_id and get_bound_chat(owner_id, "admin")))
+            if categories:
+                header_text += f"\n\n🏷 Категория: <b>{_html_escape(categories)}</b>"
+
+            # О предложении пиара/ВП обычно пишут в первом сообщении — помечаем
+            # новое ПЗ, чтобы админ сразу видел, о чём, скорее всего, речь.
+            promo_hint = detect_promo_from_message(message.text, message.caption)
+            if promo_hint:
+                header_text += f"\n\n🔎 <b>{promo_hint}</b>"
 
             try:
                 await _send_with_gate(
@@ -1888,7 +2599,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                                        "in", sent.message_id, message.message_id)
 
             try:
-                await _notify_new_pz(bot_id, group_chat_id, new_topic_id)
+                if need_ask:
+                    # Спрашиваем категорию у ПЗ; уведомление уйдёт после ответа
+                    # (или через PZ_CATEGORY_TIMEOUT, если ПЗ не ответит).
+                    asked = await _ask_pz_category(bot_obj, bot_id, user_chat_id,
+                                                   new_topic_id, group_chat_id,
+                                                   ask_categories)
+                    if not asked:
+                        await _notify_new_pz(bot_id, group_chat_id, new_topic_id,
+                                             promo_hint)
+                else:
+                    await _notify_new_pz(bot_id, group_chat_id, new_topic_id, promo_hint,
+                                         categories)
             except Exception as e:
                 logger.warning("Не удалось отправить уведомление о новом ПЗ: %s", e)
 
@@ -2087,7 +2809,16 @@ class ChildManager:
                 # обработает конфликт (409), а ретрай-цикл доведёт бота до старта.
                 logger.warning("Не удалось сбросить webhook бота %s: %s", bot_id, e)
 
-            task = asyncio.create_task(child_dp.start_polling(child_bot), name=f"child_{bot_id}")
+            # allowed_updates считаем по зарегистрированным обработчикам: так
+            # дочерний бот получает и реакции (message_reaction) — по умолчанию
+            # Telegram этот тип апдейтов НЕ присылает, из-за чего реакции
+            # «пропадали».
+            task = asyncio.create_task(
+                child_dp.start_polling(
+                    child_bot, allowed_updates=child_dp.resolve_used_update_types()
+                ),
+                name=f"child_{bot_id}",
+            )
             task.add_done_callback(self._make_task_done_callback(bot_id))
 
             self._tasks[bot_id] = task

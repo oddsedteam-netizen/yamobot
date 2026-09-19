@@ -1,6 +1,6 @@
 """Фоновый сервис напоминалок.
 
-Два режима (настраиваются владельцем в профиле → «Напоминалка»):
+Три задачи (первые две настраиваются владельцем в профиле → «Напоминалка»):
 
 1) «авточек ответа админа» (mode='check_admin'):
    следит за ПЗ, у которых есть админ. Если админ не ответил за заданное время —
@@ -15,6 +15,11 @@
        • бот — ссылка
        • бот — ссылка
 
+3) «норма админов» (раздел «📊 Норма» в профиле):
+   когда период подсчёта заканчивается, сообщает в «чат админов», кто не набрал
+   норму, и прикладывает кнопку «📋 ПЗ без админа». Уведомление приходит один раз
+   за период.
+
 Повторные напоминания по одному и тому же топику не чаще одного раза в заданный
 интервал (защита от «спама» при каждом сканировании).
 """
@@ -26,17 +31,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from services import norms
 from services.child_manager import get_main_bot, topic_web_link
 from services.storage import (
     bot_display_name,
     get_all_enabled_reminders,
+    get_all_norm_settings,
     get_all_topics_for_bot,
     get_bound_chat,
     get_last_admin_reply_at,
+    get_norm_period_stats,
     get_reminder_quiet,
     get_reminder_tick,
     get_user_bots,
+    set_norm_field,
     set_reminder_tick,
 )
 
@@ -180,9 +190,10 @@ def _should_send(reminder_id: int, topic_key: str, now: datetime, duration: int)
     return (now - last_dt).total_seconds() >= duration
 
 
-async def _safe_send(bot: Bot, chat_id: int, text: str) -> bool:
+async def _safe_send(bot: Bot, chat_id: int, text: str,
+                     reply_markup: InlineKeyboardMarkup | None = None) -> bool:
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         return True
     except Exception as e:
         logger.warning("Не удалось отправить напоминание в чат %s: %s", chat_id, e)
@@ -219,18 +230,84 @@ class ReminderService:
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _scan_once(self) -> None:
-        reminders = get_all_enabled_reminders()
-        if not reminders:
-            return
         bot = get_main_bot()
         if bot is None:
             return
         now = datetime.now(_UTC)
+
+        reminders = get_all_enabled_reminders()
         for r in reminders:
             try:
                 await self._process_reminder(bot, r, now)
             except Exception as e:
                 logger.exception("Ошибка обработки напоминалки %s: %s", r.get("id"), e)
+
+        # Норма админов: раз в период сообщаем в «чат админов», кто не набрал.
+        # Проверка не зависит от напоминалок, поэтому вызывается всегда.
+        try:
+            await self._check_norms(bot, now)
+        except Exception as e:
+            logger.exception("Ошибка проверки нормы админов: %s", e)
+
+    # ── Норма админов: уведомление о недоборе ─────────────────────────────
+    async def _check_norms(self, bot: Bot, now: datetime) -> None:
+        """Раз в период шлём в «чат админов» список админов, не набравших норму.
+
+        Повторов нет: метка отправленного периода хранится в настройках нормы
+        (``last_notified``), поэтому в следующий раз уведомление придёт только
+        за новый период.
+        """
+        for settings in get_all_norm_settings():
+            owner_id = int(settings["owner_id"])
+            due, label = norms.notification_due(settings, now)
+            if not due:
+                continue
+
+            admin_chat = get_bound_chat(owner_id, "admin")
+            if not admin_chat:
+                continue
+
+            start, end, _label = norms.period_bounds(
+                now, settings["start_day"], settings["end_day"]
+            )
+            rows = get_norm_period_stats(owner_id, norms.to_db(start), norms.to_db(end))
+            failed = [r for r in rows if not r["reached"]]
+
+            # Помечаем период отправленным до отправки: даже если Telegram
+            # недоступен, второй раз за этот период писать не будем.
+            set_norm_field(owner_id, "last_notified", label)
+
+            if not failed:
+                await _safe_send(
+                    bot, int(admin_chat),
+                    f"🎉 <b>Норма за период {label} выполнена!</b>\n\n"
+                    f"Все админы набрали норму <b>{settings['norm']}</b> сообщений. "
+                    "Так держать!",
+                )
+                continue
+
+            norm = int(settings["norm"])
+            lines: list[str] = []
+            for item in failed:
+                admin = item["admin"]
+                tag = str(admin.get("tag") or admin.get("user_id"))
+                if not tag.startswith("#"):
+                    tag = f"#{tag}"
+                lines.append(f"• {tag} — <b>{item['period']}</b> / {norm}")
+
+            text = (
+                "⚠️ <b>Норма не набрана!</b>\n\n"
+                f"📅 Период: <b>{label}</b>\n"
+                f"🎯 Норма: <b>{norm}</b> сообщений\n"
+                f"❌ Не набрали: <b>{len(failed)}</b> из <b>{len(rows)}</b>\n\n"
+                + "\n".join(lines)
+                + "\n\nСписок обращений без админа — по кнопке ниже."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 ПЗ без админа", callback_data="norm_noadmin",
+                                      style="primary")]
+            ])
+            await _safe_send(bot, int(admin_chat), text, kb)
 
     async def _process_reminder(self, bot: Bot, reminder: dict, now: datetime) -> None:
         owner_id = reminder["owner_id"]

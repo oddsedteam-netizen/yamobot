@@ -24,7 +24,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import cb_data, cb_uid, msg_uid, render_callback
+from handlers._common import cb_data, cb_uid, event_bot, msg_uid, render_callback
 from services.bot_config import apply_bot_config, config_preview, snapshot_bot
 from services.child_manager import ChildManager
 from services.storage import (
@@ -107,7 +107,7 @@ async def _show_config_saved(callback: CallbackQuery, bot_id: int, code: str,
     """Показывает код конфига и ссылку для его применения."""
     username = ""
     try:
-        me = await callback.bot.get_me()
+        me = await event_bot(callback).get_me()
         username = me.username or ""
     except Exception:
         username = ""
@@ -288,7 +288,7 @@ async def _my_links_payload(callback: CallbackQuery) -> tuple[str, InlineKeyboar
     invites = get_owner_admin_invites(user_id)
 
     try:
-        me = await callback.bot.get_me()
+        me = await event_bot(callback).get_me()
         username = me.username or ""
     except Exception:
         username = ""

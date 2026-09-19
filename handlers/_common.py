@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import re
+from typing import Any, cast
 
+from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     CallbackQuery,
@@ -12,6 +15,43 @@ from aiogram.types import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+# ═══════════════ Нормализация ссылок ═══════════════════════════════════
+# Единая точка «приведения ссылки к рабочему виду»: используется и в редакторе
+# кнопок дочерних ботов, и в настройках ссылок админ-панели. Пользователю
+# достаточно отправить @username или короткую ссылку — формат поправим сами.
+
+# Домен без схемы: example.com, t.me/x, sub.example.co.uk/page?x=1
+_DOMAIN_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(/[^\s]*)?$")
+_SHORT_HOSTS = ("t.me/", "telegram.me/", "telegram.dog/")
+
+
+def normalize_link(raw: str) -> str:
+    """Приводит ссылку к виду, который принимает Telegram в инлайн-кнопке.
+
+    Понимает:
+      • полные ссылки (``http://``, ``https://``, ``tg://``) — оставляет как есть;
+      • короткие (``t.me/…``, ``telegram.me/…``) — достраивает ``https://``;
+      • ``@username`` — превращает в ``https://t.me/username``;
+      • домен без схемы (``example.com/page``) — достраивает ``https://``.
+
+    Возвращает пустую строку, если на ссылку это не похоже.
+    """
+    link = (raw or "").strip().strip("<>").strip()
+    if not link:
+        return ""
+    # Если скопировали «ссылку + текст» — берём только первый фрагмент.
+    link = link.split()[0]
+    if link.startswith("@"):
+        link = "https://t.me/" + link[1:]
+    if link.startswith(_SHORT_HOSTS):
+        link = "https://" + link
+    if link.startswith(("http://", "https://", "tg://")):
+        return link
+    if _DOMAIN_RE.match(link):
+        return "https://" + link
+    return ""
 
 # Приветствие, которое бот шлёт в привязанный «чат админов» (и при перезапуске).
 ADMIN_CHAT_WELCOME = (
@@ -167,6 +207,16 @@ def cb_firstname(callback: CallbackQuery) -> str:
     """first_name отправителя колбэка (или пустая строка)."""
     user = callback.from_user
     return (user.first_name or "") if user else ""
+
+
+def event_bot(obj: Any) -> Bot:
+    """Бот апдейта: CallbackQuery / Message / ChatMemberUpdated.
+
+    aiogram объявляет поле ``bot`` как Optional, хотя в уже обработанных
+    апдейтах бот есть всегда — сужаем тип так же, как в хелперах выше
+    (без «тихания» ошибок Pyright/Pylance).
+    """
+    return cast(Bot, getattr(obj, "bot", None))
 
 
 async def try_edit(target: MaybeInaccessibleMessage | None, text: str,

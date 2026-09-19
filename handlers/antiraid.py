@@ -49,6 +49,7 @@ from handlers._common import render_callback, cb_data, cb_uid, try_edit_answer
 from services.config import is_super_admin
 from services.storage import (
     get_owner_by_admin_chat,
+    get_bound_chat,
     get_antiraid_settings,
     set_antiraid_enabled,
     set_antiraid_threshold,
@@ -105,14 +106,27 @@ class AntiraidFSM(StatesGroup):
     waiting_threshold = State()
 
 
-def antiraid_kb() -> InlineKeyboardMarkup:
-    """Клавиатура настроек антирейда из профиля."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+def antiraid_kb(owner_id: int | None = None) -> InlineKeyboardMarkup:
+    """Клавиатура настроек антирейда из профиля.
+
+    Первой строкой — переключатель «🟢 Включить» / «🔴 Выключить»: кнопки просто
+    меняются местами, команды в чате писать не нужно.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if owner_id:
+        enabled = bool(get_antiraid_settings(owner_id)["enabled"])
+        rows.append([InlineKeyboardButton(
+            text="🔴 Выключить антирейд" if enabled else "🟢 Включить антирейд",
+            callback_data="antiraid_off" if enabled else "antiraid_on",
+            style="danger" if enabled else "success",
+        )])
+    rows += [
         [InlineKeyboardButton(text="🔢 Количество заходов", callback_data="antiraid_threshold", style="primary")],
         [InlineKeyboardButton(text="🔗 Удаление ссылок", callback_data="antiraid_links_ask", style="primary")],
         [InlineKeyboardButton(text="👥 Удаление зашедших", callback_data="antiraid_members_ask", style="primary")],
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
-    ])
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def antiraid_text(owner_id: int) -> str:
@@ -132,20 +146,25 @@ def antiraid_text(owner_id: int) -> str:
         "📢 <b>зовёт владельца</b> и сообщает об атаке;\n"
         "🔗 <b>делает все ссылки на заход неактивными</b>;\n"
         "👥 по настройке <b>удаляет последних зашедших</b>.\n\n"
-        "🔹 Запуск: команда <code>/вкланти</code> в чате админов "
-        "(нужны <b>права администратора</b> у YamoBot).\n"
-        "🔹 После срабатывания вернуть чат: <code>/вклчат</code> "
-        "(защита останется включённой).\n"
-        "🔹 Полное выключение: <code>/выкланти</code>.\n\n"
+        "🔹 Включение и выключение — кнопкой ниже, писать команды в чате "
+        "не нужно: бот сам работает в привязанном «чате админов» "
+        "(ему нужны <b>права администратора</b>).\n"
+        "🔹 Если чат уже заблокирован после срабатывания — нажми "
+        "<b>«🟢 Включить антирейд»</b> ещё раз: права чата восстановятся, "
+        "а защита продолжит следить за чатом.\n"
+        "🔹 Команды <code>/вкланти</code>, <code>/вклчат</code> и "
+        "<code>/выкланти</code> тоже работают — как запасной вариант.\n\n"
         "📊 <u>Текущие настройки:</u>\n"
         f"  • Статус: {status}\n"
         f"  • Порог заходов: <b>{s['threshold']}</b>\n"
         f"  • Удаление ссылок: {links}\n"
         f"  • Удаление зашедших: {members}\n\n"
         "⚠️ Если статус «включён», но YamoBot <b>не администратор</b> "
-        "чата админов — защита не может работать. Выдай права и нажми "
-        "в чате <code>/вкланти</code> ещё раз."
+        "чата админов — защита не может работать. Выдай права и включи "
+        "антирейд ещё раз."
     )
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Открытие настроек антирейда из профиля
 # ═══════════════════════════════════════════════════════════════
@@ -153,7 +172,73 @@ def antiraid_text(owner_id: int) -> str:
 @router.callback_query(F.data == "antiraid")
 async def cb_antiraid(callback: CallbackQuery) -> None:
     user_id = cb_uid(callback)
-    await render_callback(callback, antiraid_text(user_id), antiraid_kb())
+    await render_callback(callback, antiraid_text(user_id), antiraid_kb(user_id))
+
+
+# ═══════════════ Включение и выключение антирейда ═══════════════
+
+async def _set_antiraid_from_profile(callback: CallbackQuery, enabled: bool) -> None:
+    """Включает/выключает антирейд кнопкой из профиля.
+
+    Раньше для этого нужно было писать команды в чате. Логика та же:
+    при включении проверяем права бота в «чате админов», снимаем прошлое
+    срабатывание и очищаем журналы; при выключении возвращаем чату права.
+    """
+    owner_id = cb_uid(callback)
+    admin_chat = get_bound_chat(owner_id, "admin")
+    bot = getattr(callback, "bot", None)
+
+    if enabled:
+        if not admin_chat:
+            await callback.answer("⚠️ Сначала привяжи «чат админов» в профиле.",
+                                  show_alert=True)
+            return
+        if bot is not None and not await _bot_admin_status(bot, int(admin_chat)):
+            await callback.answer(
+                "🚫 YamoBot не администратор чата админов — выдай права и попробуй снова.",
+                show_alert=True,
+            )
+            return
+
+        set_antiraid_enabled(owner_id, True)
+        set_antiraid_triggered(owner_id, False)
+        _ARMED.discard(int(admin_chat))
+        _JOINS.pop(int(admin_chat), None)
+        for key in [k for k in _SPAM_LOG if k[0] == int(admin_chat)]:
+            _SPAM_LOG.pop(key, None)
+        for key in [k for k in _SPAM_WARNED if k[0] == int(admin_chat)]:
+            _SPAM_WARNED.pop(key, None)
+        # Возвращаем чату права: после срабатывания он мог остаться закрытым.
+        if bot is not None:
+            try:
+                await _restore_chat(bot, int(admin_chat))
+            except Exception as e:
+                logger.warning("Не удалось восстановить права чата админов: %s", e)
+        await callback.answer("🛡 Антирейд включён")
+    else:
+        set_antiraid_enabled(owner_id, False)
+        set_antiraid_triggered(owner_id, False)
+        if admin_chat:
+            _ARMED.discard(int(admin_chat))
+            _JOINS.pop(int(admin_chat), None)
+            if bot is not None:
+                try:
+                    await _restore_chat(bot, int(admin_chat))
+                except Exception as e:
+                    logger.warning("Не удалось восстановить права чата админов: %s", e)
+        await callback.answer("🔻 Антирейд выключен")
+
+    await render_callback(callback, antiraid_text(owner_id), antiraid_kb(owner_id))
+
+
+@router.callback_query(F.data == "antiraid_on")
+async def cb_antiraid_on(callback: CallbackQuery) -> None:
+    await _set_antiraid_from_profile(callback, True)
+
+
+@router.callback_query(F.data == "antiraid_off")
+async def cb_antiraid_off(callback: CallbackQuery) -> None:
+    await _set_antiraid_from_profile(callback, False)
 
 
 # ═══════════════ Количество заходов (порог) ═══════════════════
@@ -227,7 +312,7 @@ async def cb_antiraid_links_set(callback: CallbackQuery) -> None:
     value = cb_data(callback) == "antiraid_links_set_1"
     set_antiraid_del_links(user_id, value)
     await callback.answer("✅ Включено" if value else "❌ Выключено")
-    await render_callback(callback, antiraid_text(user_id), antiraid_kb())
+    await render_callback(callback, antiraid_text(user_id), antiraid_kb(user_id))
 
 
 # ═══════════════ Удаление последних зашедших ══════════════════
@@ -256,7 +341,7 @@ async def cb_antiraid_members_set(callback: CallbackQuery) -> None:
     value = cb_data(callback) == "antiraid_members_set_1"
     set_antiraid_del_members(user_id, value)
     await callback.answer("✅ Включено" if value else "❌ Выключено")
-    await render_callback(callback, antiraid_text(user_id), antiraid_kb())
+    await render_callback(callback, antiraid_text(user_id), antiraid_kb(user_id))
 # ═══════════════════════════════════════════════════════════════
 #  /вкланти и /выкланти в «чате админов»
 # ═══════════════════════════════════════════════════════════════

@@ -3,15 +3,17 @@ import logging
 import os
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
 from handlers import register_all_handlers
+from services.channel_service import ChannelService
 from services.child_manager import ChildManager
 from services.config import BOT_TOKEN, OWNER_ID
 from services.constants import BOT_VERSION
+from services.polling import ResilientDispatcher
 from services.reminder_service import ReminderService
 from services.storage import (
     ensure_db,
@@ -65,12 +67,16 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    dp = Dispatcher()
+    # Устойчивый диспетчер: конфликт вебхука (409) и мёртвый токен больше не
+    # крутятся в логе бесконечно — см. services/polling.py.
+    dp = ResilientDispatcher()
     dp["owner_id"] = OWNER_ID
     child_manager = ChildManager()
     dp["child_manager"] = child_manager
     reminder_service = ReminderService()
     dp["reminder_service"] = reminder_service
+    channel_service = ChannelService()
+    dp["channel_service"] = channel_service
 
     # Даём менеджеру ссылку на основной бот — для уведомлений в «чат админов».
     from services.child_manager import set_main_bot
@@ -85,8 +91,11 @@ async def main() -> None:
         await child_manager.start_all_children()
         # Фоновый сканер напоминалок (авточек ответа админа / напоминание про ПЗ).
         reminder_service.start()
+        # Фоновый публикатор отложенных постов в ТГК (раздел «Мой ТГК»).
+        channel_service.start()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await channel_service.stop()
         await reminder_service.stop()
         await child_manager.stop_all_children()
         await bot.session.close()

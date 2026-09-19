@@ -67,13 +67,29 @@ def _welcome_text_with_version() -> str:
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
-    """Главное меню — reply-клавиатура."""
+    """Главное меню — reply-клавиатура.
+
+    Кнопки покрашены (Bot API: danger/primary/success): «Жалоба» — красная
+    (важное действие), «Прочее» — зелёная, остальные — синие.
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🤖 Боты")],
-            [KeyboardButton(text="📋 ПЗ"), KeyboardButton(text="👥 Админы")],
-            [KeyboardButton(text="⚠️ Жалоба"), KeyboardButton(text="❓ FAQ")],
-            [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🤖 Боты", style="primary")],
+            [
+                KeyboardButton(text="📋 ПЗ", style="primary"),
+                KeyboardButton(text="👥 Админы", style="primary"),
+            ],
+            [
+                KeyboardButton(text="⚠️ Жалоба", style="danger"),
+                KeyboardButton(text="❓ FAQ", style="primary"),
+            ],
+            [KeyboardButton(text="👤 Профиль", style="primary")],
+            # «Мой ТГК» — синяя reply-кнопка: привязка канала и посты от лица
+            # канала (весь раздел эксп-функций переехал сюда — handlers/channels.py).
+            [KeyboardButton(text="📢 Мой ТГК", style="primary")],
+            # «Прочее» — под «Мой ТГК», зелёная (о проекте, донат и обучение —
+            # см. handlers/other.py).
+            [KeyboardButton(text="✨ Прочее", style="success")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие",
@@ -82,11 +98,16 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 async def _show_main(message: Message) -> None:
     await message.answer(_welcome_text_with_version(), reply_markup=main_menu_kb())
-    # Инлайн-кнопка на FAQ — под приветствием при каждом новом запуске (/start, /menu).
+    # Инлайн-кнопки под приветствием при каждом новом запуске (/start, /menu):
+    # FAQ и обучение (обучение проходит внутри этого же бота).
     await message.answer(
-        "❓ <b>Есть вопросы?</b> Загляни в FAQ — там ответы на частые вопросы.",
+        "❓ <b>Есть вопросы?</b> Загляни в FAQ — там ответы на частые вопросы.\n\n"
+        "📚 А ещё можно пройти <b>обучение</b> — простым языком про весь путь "
+        "настройки бота.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❓ FAQ", callback_data="faq", style="success")]
+            [InlineKeyboardButton(text="❓ FAQ", callback_data="faq", style="success")],
+            [InlineKeyboardButton(text="📚 Обучение", callback_data="other_tutorial",
+                                  style="primary")],
         ]),
     )
 
@@ -94,6 +115,13 @@ async def _show_main(message: Message) -> None:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext,
                     child_manager: ChildManager) -> None:
+    await state.clear()
+    user_id = msg_uid(message)
+    register_user(user_id, msg_username(message) or "", msg_firstname(message) or "")
+    if is_registry_user_banned(user_id) and not is_super_admin(user_id):
+        await message.answer("🚫 Вы заблокированы администрацией.")
+        return
+
     # Анти-спам /start: повторные команды одного пользователя в течение интервала
     # игнорируются, чтобы бот не падал от наплыва /start (например, при долгом
     # нажатии на кнопку Start или автокликерах).
@@ -103,12 +131,6 @@ async def cmd_start(message: Message, state: FSMContext,
         return
     _LAST_START[_uid] = _now
 
-    await state.clear()
-    user_id = msg_uid(message)
-    register_user(user_id, msg_username(message) or "", msg_firstname(message) or "")
-    if is_registry_user_banned(user_id) and not is_super_admin(user_id):
-        await message.answer("🚫 Вы заблокированы администрацией.")
-        return
     if message.text and "addadmin_" in message.text:
         token = message.text.split("addadmin_", 1)[1].strip().split()[0]
         invite = get_admin_invite(token)
@@ -235,6 +257,18 @@ async def on_profile_button(message: Message, state: FSMContext) -> None:
     await show_profile(message)
 
 
+@router.message(F.text == "📢 Мой ТГК", F.chat.type == ChatType.PRIVATE)
+async def on_tgk_button(message: Message, state: FSMContext) -> None:
+    """Reply-кнопка «📢 Мой ТГК»: привязка канала и посты от лица канала.
+
+    Всё, что раньше лежало в «🧩 Эксп функции», теперь здесь. Если ТГК ещё не
+    привязан — бот честно пишет об этом и просит привязать канал.
+    """
+    await state.clear()
+    from handlers.channels import show_tgk_entry
+    await show_tgk_entry(message)
+
+
 @router.message(F.text == "👥 Админы")
 async def on_admins_button(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -351,8 +385,13 @@ FAQ_TEXT = (
     "🤖 <b>Боты</b> — как подключать ботов, чем стандарт отличается от "
     "анкетницы, как настраивать приветствие, антиспам и связывать бота с чатом.\n"
     "👤 <b>Профиль</b> — привязка бота к «чату админов» и «чату работы», "
-    "передача прав и антинакрутка ПЗ.\n"
-    "⌨️ <b>Команды</b> — все команды для дочерних ботов и «чата админов»."
+    "передача прав, антинакрутка ПЗ и раздел <b>«📊 Норма»</b> (недельная "
+    "норма админов и уведомления о тех, кто её не набрал).\n"
+    "⌨️ <b>Команды</b> — все команды для дочерних ботов и «чата админов».\n"
+    "✨ <b>Прочее</b> — проект YamoChan, поддержка команды, тестовый бот и "
+    "обучение (кнопка «✨ Прочее» в главном меню).\n"
+    "📢 <b>Мой ТГК</b> — привязка своего канала и публикация постов от его "
+    "лица (кнопка «📢 Мой ТГК» в главном меню)."
 )
 
 
@@ -367,6 +406,7 @@ def faq_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⌨️ Команды", callback_data="faq_commands", style="primary"),
         ],
         [InlineKeyboardButton(text="⚙️ Основные настройки бота", callback_data="faq_settings", style="primary")],
+        [InlineKeyboardButton(text="📊 Норма админов", callback_data="faq_norm", style="primary")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
     ])
 
@@ -375,6 +415,7 @@ def _faq_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ К разделам", callback_data="faq", style="success")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_main")],
+        [InlineKeyboardButton(text="📚 Обучение", callback_data="other_tutorial", style="primary")],
     ])
 
 
@@ -452,7 +493,9 @@ FAQ_BOTS = (
     "Можно отправить и <b>фото</b> с подписью, и готовую <b>статью</b> "
     "(пост с форматированием) — приветствие сохранит её оформление.\n"
     "3. <b>«🔗 Линки»</b> — добавь кнопки-ссылки к приветствию: название кнопки "
-    "и её ссылку (http/https/tg://). Кнопки появятся прямо под приветствием, "
+    "и её ссылку. Ссылку можно отправлять в любом виде — <code>@username</code>, "
+    "<code>t.me/канал</code> или полную <code>https://…</code>: бот сам приведёт "
+    "её к нужному формату. Кнопки появятся прямо под приветствием, "
     "их можно удалять по одной. При добавлении линка бот спросит, "
     "в какой цвет покрасить кнопку: 🔵 синий, 🟢 зелёный или 🔴 красный.\n"
     "4. Для всех ботов сразу есть отдельный редактор в «📌 Выбрать все».\n\n"
@@ -517,8 +560,10 @@ FAQ_SETTINGS = (
     "3. <b>«💬 Изменить приветствие»</b> — отправь новый текст приветствия. "
     "Поддерживаются HTML-разметка и премиум-эмодзи.\n"
     "4. <b>«🔗 Линки»</b> — добавь кнопки-ссылки к приветствию: укажи название "
-    "кнопки и её ссылку. Кнопки появятся прямо под приветствием у всех новых "
-    "пользователей, их можно удалять по одной.\n"
+    "кнопки и её ссылку (можно коротко — <code>@username</code> или "
+    "<code>t.me/канал</code>, бот сам приведёт её к нужному виду). Кнопки "
+    "появятся прямо под приветствием у всех новых пользователей, их можно "
+    "удалять по одной.\n"
     "5. Изменения применяются сразу — бот автоматически перезапускается "
     "и подхватывает новое приветствие и кнопки.\n"
     "6. В карточке бота также доступны: <b>«🛡 Антиспам»</b>, "
@@ -545,6 +590,39 @@ FAQ_SETTINGS = (
 @router.callback_query(F.data == "faq_settings")
 async def cb_faq_settings(callback: CallbackQuery) -> None:
     await render_callback(callback, FAQ_SETTINGS, _faq_back_kb(), force_answer=True)
+
+
+FAQ_NORM = (
+    "📊 <b>Норма админов</b>\n\n"
+    "Раздел <b>«📊 Норма»</b> в профиле показывает, кто из админов сколько "
+    "наработал за период, и помогает не потерять тех, кто отстаёт.\n\n"
+    "—— <b>Что настраивается</b> ——\n"
+    "1. <b>«✏️ Норма в неделю»</b> — сколько сообщений админ должен набрать "
+    "за период (например, <code>500</code>). Ноль выключает норму.\n"
+    "2. <b>«📅 Первый и последний день подсчёта»</b> — с какого по какой день "
+    "недели считается норма. По умолчанию с понедельника по пятницу. Можно "
+    "написать коротко: <code>пн-пт</code>, <code>с понедельника по пятницу</code> "
+    "или <code>1-5</code>.\n"
+    "3. <b>«🔔 Уведомления»</b> — включает и выключает оповещение о тех, "
+    "кто не набрал норму.\n\n"
+    "—— <b>Что показывает экран</b> ——\n"
+    "• 📊 саму норму и период подсчёта;\n"
+    "• ✅ сколько админов норму набрали и ❌ сколько не набрали;\n"
+    "• 🏆 рейтинг всех админов: место, тег, сколько сообщений за период "
+    "и общая статистика (день / неделя / месяц / всего).\n\n"
+    "—— <b>Уведомление в «чат админов»</b> ——\n"
+    "Когда период заканчивается (в последний день вечером), бот присылает "
+    "в «чат админов» список админов, которые не набрали норму, и кнопку "
+    "<b>«📋 ПЗ без админа»</b> — по ней открывается список обращений, "
+    "которые ещё никто не взял.\n"
+    "Уведомление приходит один раз за период — спамить не будет. "
+    "Выключить его можно кнопкой <b>«🔔 Уведомления»</b> в разделе «📊 Норма»."
+)
+
+
+@router.callback_query(F.data == "faq_norm")
+async def cb_faq_norm(callback: CallbackQuery) -> None:
+    await render_callback(callback, FAQ_NORM, _faq_back_kb(), force_answer=True)
 
 
 FAQ_PROFILE = (
@@ -584,7 +662,9 @@ FAQ_PROFILE = (
     "переходят новому владельцу.\n\n"
     "—— <b>🚨 Антинакрутка</b> ——\n"
     "Кнопка <b>«🚨 Антинакрутка»</b> в профиле — защита статистики и чата от "
-    "наплыва фейковых ПЗ:\n"
+    "наплыва фейковых ПЗ. Сверху есть переключатель "
+    "<b>«🟢 Включить» / «🔴 Выключить»</b>: когда защита выключена, бот просто "
+    "не следит за наплывом и никаких уведомлений не присылает.\n"
     "1. Задай, сколько ПЗ за сколько минут считать подозрительным наплывом.\n"
     "2. Когда порог превышен, бот сохраняет статистику и спрашивает: "
     "<b>засчитывать ли наплыв</b> («✅ Сохранить» — это реальные обращения, "
@@ -638,11 +718,15 @@ FAQ_COMMANDS = (
     "после передачи прав, чтобы все чаты перешли новому владельцу.\n"
     "• <code>/perestart</code> — простой перезапуск, если бот перестал отвечать "
     "или «завис». Привязки не меняет.\n"
-    "• <code>/вкланти</code> — включить <b>антирейд</b>: следит за заходами "
-    "в чат и при подозрении на рейд блокирует чат и зовёт владельца.\n"
-    "• <code>/вклчат</code> — после срабатывания антирейда вернуть чату "
-    "настройки (можно снова писать), защита остаётся включённой.\n"
-    "• <code>/выкланти</code> — выключить антирейд и вернуть чату права.\n\n"
+    "• <b>🛡 Антирейд</b> — включается и выключается кнопками "
+    "«🟢 Включить» / «🔴 Выключить» в <b>«👤 Профиль → 🛡 Антирейд»</b> "
+    "(писать команды в чате не нужно). Когда антирейд включён, бот следит "
+    "за заходами в чат и за спамом, а при подозрении на рейд блокирует чат "
+    "и зовёт владельца.\n"
+    "• Команды <code>/вкланти</code>, <code>/вклчат</code> и "
+    "<code>/выкланти</code> тоже работают — как запасной вариант из чата "
+    "(<code>/вклчат</code> возвращает чату права после срабатывания, "
+    "защита остаётся включённой).\n\n"
     "Команды работают и в другом виде: <code>.стата</code>, <code>/stata</code>."
 )
 
@@ -694,30 +778,41 @@ def _resolve_stats_owner(chat, fallback_user_id: int) -> int:
     return fallback_user_id
 
 
+def collect_noadmin_entries(owner_id: int) -> list[dict]:
+    """Список ПЗ без админа по всем ботам владельца (нумеруется в рендере).
+
+    Каждая запись: bot_id, user_chat_id и label (имя бота + ссылка на топик).
+    Используется и в сводке «⏳ ПЗ без админов», и в уведомлении раздела
+    «📊 Норма» — чтобы формат списка был одинаковым.
+    """
+    entries: list[dict] = []
+    for b in get_user_bots(owner_id):
+        for t in get_all_topics_for_bot(b["id"]):
+            if t.get("admin_user_id"):
+                continue
+            cid, tid = t["group_chat_id"], t["topic_id"]
+            if cid < 0 and str(cid).startswith("-100"):
+                chat_part = int(str(cid)[4:])
+            else:
+                chat_part = int(cid)
+            link = f"https://t.me/c/{chat_part}/{tid}"
+            entries.append({
+                "bot_id": b["id"],
+                "user_chat_id": t["user_chat_id"],
+                "label": f"{bot_display_name(b)}: {link}",
+            })
+    return entries
+
+
 @router.callback_query(F.data == "gstat_noadmin")
 async def cb_gstat_noadmin(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     chat = callback.message.chat if callback.message else None
     owner_id = _resolve_stats_owner(chat, cb_uid(callback))
-    bots = get_user_bots(owner_id)
 
     # Нумерованный список ПЗ без админа. Сохраняем маппинг «номер → топик»,
     # чтобы кнопка «удалить из списка» могла найти нужную запись.
-    entries: list[dict] = []
-    for b in bots:
-        for t in get_all_topics_for_bot(b["id"]):
-            if not t.get("admin_user_id"):
-                cid, tid = t["group_chat_id"], t["topic_id"]
-                if cid < 0 and str(cid).startswith("-100"):
-                    chat_part = int(str(cid)[4:])
-                else:
-                    chat_part = int(cid)
-                link = f"https://t.me/c/{chat_part}/{tid}"
-                entries.append({
-                    "bot_id": b["id"],
-                    "user_chat_id": t["user_chat_id"],
-                    "label": f"{bot_display_name(b)}: {link}",
-                })
+    entries = collect_noadmin_entries(owner_id)
 
     await state.update_data(stats_no_admin=entries)
     text, kb = _noadmin_payload(entries)
@@ -755,7 +850,13 @@ async def cb_gstat_del(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.set_state(StatsFSM.waiting_pz_delete)
-    await state.update_data(stats_no_admin=entries)
+    # Запоминаем сообщение-подсказку: после удаления мы отредактируем ИМЕННО
+    # его в обновлённый список, а не отправим новое сообщение.
+    await state.update_data(
+        stats_no_admin=entries,
+        stats_prompt_chat_id=callback.message.chat.id if callback.message else None,
+        stats_prompt_message_id=callback.message.message_id if callback.message else None,
+    )
 
     text = (
         "🗑 <b>Удаление из списка ПЗ</b>\n\n"
@@ -799,10 +900,35 @@ async def fsm_pz_delete(message: Message, state: FSMContext) -> None:
     target = entries.pop(n - 1)
     delete_topic_record(target["bot_id"], target["user_chat_id"])
 
-    # Перерисовываем обновлённый список.
+    # Перерисовываем обновлённый список в ТОМ ЖЕ сообщении, где была подсказка
+    # об удалении: раньше бот присылал новое сообщение, а старое «удаление»
+    # оставалось висеть. Новое сообщение отправляем только если отредактировать
+    # не удалось (например, сообщение уже удалили).
     await state.update_data(stats_no_admin=entries)
+    await state.set_state(None)
     text, kb = _noadmin_payload(entries)
-    await message.answer(text, reply_markup=kb)
+
+    edited = False
+    chat_id = data.get("stats_prompt_chat_id")
+    message_id = data.get("stats_prompt_message_id")
+    if chat_id and message_id and message.bot is not None:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=int(chat_id), message_id=int(message_id),
+                text=text, reply_markup=kb,
+            )
+            edited = True
+        except Exception:
+            edited = False
+
+    # Сообщение с номером тоже убираем, чтобы не засорять чат.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    if not edited:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "gstat_back")

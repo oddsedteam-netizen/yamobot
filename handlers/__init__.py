@@ -28,6 +28,9 @@ def register_all_handlers(dp: Dispatcher) -> None:
     from handlers.antinakrutka import router as antinakrutka_router
     from handlers.configs import router as configs_router
     from handlers.reminders import router as reminders_router
+    from handlers.other import router as other_router
+    from handlers.norms import router as norms_router
+    from handlers.channels import router as channels_router
 
     # Учим словарь премиум-эмодзи по ВСЕМ сообщениям (до фильтров): Telegram сам
     # присылает custom_emoji-сущности, а по ним бот потом возвращает премиум в
@@ -55,3 +58,8 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(antinakrutka_router)
     dp.include_router(configs_router)
     dp.include_router(reminders_router)
+    # Нормы админов: кнопка «📊 Норма» в профиле + уведомления о недоборе.
+    dp.include_router(norms_router)
+    dp.include_router(other_router)
+    # ТГК (кнопка «📢 Мой ТГК»): привязка канала, посты и отложенная публикация.
+    dp.include_router(channels_router)

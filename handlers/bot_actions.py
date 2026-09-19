@@ -16,6 +16,11 @@ from services.storage import (
     get_antispam_mode,
     set_antispam_mode,
     set_bot_anonymous,
+    get_bound_chat,
+    get_cat_ask_settings,
+    set_cat_ask_enabled,
+    set_cat_ask_categories,
+    DEFAULT_PZ_CATEGORIES,
 )
 from services.child_manager import ChildManager
 from handlers.my_bots import my_bots_kb
@@ -41,12 +46,15 @@ def _single_bot_text(bot_info: dict, is_running: bool) -> str:
     elif str(bot_info.get("welcome_photo") or "").strip():
         welcome = "🖼 [фото] " + welcome
     anon = "🟢 вкл" if bool(bot_info.get("anonymous_mode", 0)) else "⚪ выкл"
+    ask_on, _ask_cats = get_cat_ask_settings(bot_info["id"])
+    cat_ask = "🟢 вкл" if ask_on else "⚪ выкл"
 
     return (
         f"🤖 <b>{name}</b>\n"
         f"🆔 <code>{bot_info['id']}</code>\n"
         f"Статус: {status}\n"
-        f"🕶 Анонимный режим: {anon}\n\n"
+        f"🕶 Анонимный режим: {anon}\n"
+        f"🏷 Уточнение категории: {cat_ask}\n\n"
         f"💬 Приветствие:\n{welcome}\n\n"
         f"Выбери действие:"
     )
@@ -70,6 +78,8 @@ def single_bot_kb(bot_id: int, is_running: bool, anon_mode: bool = False) -> Inl
                 InlineKeyboardButton(text="📋 ПЗ", callback_data=f"pz_{bot_id}", style="primary"),
             ],
             [InlineKeyboardButton(text="⚙️ Конфиг", callback_data=f"cfg_menu_{bot_id}",
+                                  style="primary")],
+            [InlineKeyboardButton(text="🏷 Уточнение категории", callback_data=f"catask_{bot_id}",
                                   style="primary")],
             [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"action_delete_{bot_id}", style="danger")],
             [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots", style="primary")],
@@ -349,3 +359,204 @@ async def cb_delete_bot(callback: CallbackQuery,
         kb = main_inline_kb()
 
     await render_callback(callback, text, kb)
+
+
+# ═══════════════ Уточнение категории ПЗ ═══════════════
+
+CAT_ASK_TEXT = (
+    "🏷 <b>Уточнение категории</b>\n\n"
+    "Настройка помогает YamoBot понять, какая категория нужна юзеру.\n\n"
+    "<b>Как это работает:</b>\n"
+    "1️⃣ Юзер пишет боту первое сообщение (после приветствия).\n"
+    "2️⃣ Если категории в сообщении нет — например, он пишет просто «привет» — "
+    "бот присылает ему уточнение с кнопками: какая категория админов нужна "
+    "(поддержка, универсал или общение).\n"
+    "3️⃣ Как только юзер выбрал категорию, бот присылает в «чат админов» "
+    "уведомление о ПЗ вместе с категорией.\n\n"
+    "Если юзер назвал категорию сразу («привет, #поддержка» или просто "
+    "«поддержка») — уточнение не показывается, уведомление уходит сразу.\n\n"
+    "Категории можно настроить: отключи те, которые боту не нужны "
+    "(например, если бот только про общение — поддержку можно выключить)."
+)
+
+
+def cat_ask_text(enabled: bool, categories: list[str]) -> str:
+    """Текст экрана «Уточнение категории»: описание + статус и категории."""
+    status = "🟢 включено" if enabled else "⚪ выключено"
+    cats_line = ", ".join(f"#{c}" for c in categories) or "—"
+    return (
+        f"{CAT_ASK_TEXT}\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Категории: {cats_line}"
+    )
+
+
+def cat_ask_kb(bot_id: int, enabled: bool) -> InlineKeyboardMarkup:
+    """Кнопки экрана «Уточнение категории»: настроить / вкл-выкл / назад."""
+    if enabled:
+        toggle = InlineKeyboardButton(text="🔴 Выключить",
+                                      callback_data=f"catask_toggle_{bot_id}",
+                                      style="danger")
+    else:
+        toggle = InlineKeyboardButton(text="🟢 Включить",
+                                      callback_data=f"catask_toggle_{bot_id}",
+                                      style="success")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Настроить категории",
+                              callback_data=f"catask_cats_{bot_id}", style="primary")],
+        [toggle],
+        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}",
+                              style="primary")],
+    ])
+
+
+CAT_ASK_NO_CHAT_TEXT = (
+    "⚠️ <b>Чат админов не привязан</b>\n\n"
+    "Уточнение категории не сможет включиться: уведомления о ПЗ приходят именно "
+    "в <b>чат админов</b>, и без него категорию просто некуда отправлять.\n\n"
+    "Сначала привяжи чат админов, потом вернись сюда и включи функцию."
+)
+
+
+def _cat_ask_no_chat_kb(bot_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура, когда для включения нужно привязать «чат админов»."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Привязать чат админов", callback_data="bind_admin",
+                              style="primary")],
+        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}",
+                              style="primary")],
+    ])
+
+
+def cat_ask_catalog(categories: list[str]) -> list[str]:
+    """Список для экрана настройки: стандартные категории + сохранённые.
+
+    Стандартные показываем всегда — иначе выключенную категорию нельзя было бы
+    включить обратно.
+    """
+    catalog = list(DEFAULT_PZ_CATEGORIES)
+    for name in categories:
+        if name not in catalog:
+            catalog.append(name)
+    return catalog
+
+
+def cat_ask_list_kb(bot_id: int, catalog: list[str],
+                    categories: list[str]) -> InlineKeyboardMarkup:
+    """Кнопки выбора категорий: ✅ — предлагаем ПЗ, ⚪ — не предлагаем."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, name in enumerate(catalog):
+        mark = "✅" if name in categories else "⚪"
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} #{name}",
+                                 callback_data=f"catask_cat_{bot_id}_{index}"),
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"catask_{bot_id}",
+                                      style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+CAT_ASK_LIST_TEXT = (
+    "⚙️ <b>Категории для уточнения</b>\n\n"
+    "Нажми на категорию, чтобы включить или выключить её. "
+    "<b>✅</b> — бот предлагает её юзеру, <b>⚪</b> — не предлагает.\n\n"
+    "Например, если бот только про общение — выключи «поддержку», и её не будет "
+    "среди кнопок уточнения.\n\n"
+    "⚠️ Хотя бы одна категория должна остаться включённой."
+)
+
+
+@router.callback_query(F.data.regexp(r"^catask_\d+$"))
+async def cb_cat_ask(callback: CallbackQuery) -> None:
+    """Экран «🏷 Уточнение категории»."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    enabled, categories = get_cat_ask_settings(bot_id)
+    await render_callback(callback, cat_ask_text(enabled, categories),
+                          cat_ask_kb(bot_id, enabled))
+
+
+@router.callback_query(F.data.startswith("catask_toggle_"))
+async def cb_cat_ask_toggle(callback: CallbackQuery) -> None:
+    """Включает/выключает уточнение категории (включение требует чат админов)."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    enabled, categories = get_cat_ask_settings(bot_id)
+
+    if not enabled and not get_bound_chat(user_id, "admin"):
+        # Включать некуда: уведомления о ПЗ уходят в «чат админов».
+        await render_callback(callback, CAT_ASK_NO_CHAT_TEXT,
+                              _cat_ask_no_chat_kb(bot_id), force_answer=True)
+        return
+
+    set_cat_ask_enabled(user_id, bot_id, not enabled)
+    enabled, categories = get_cat_ask_settings(bot_id)
+    await callback.answer("🟢 Уточнение включено" if enabled else "🔴 Уточнение выключено")
+    await safe_edit(callback.message, cat_ask_text(enabled, categories),
+                    cat_ask_kb(bot_id, enabled))
+
+
+@router.callback_query(F.data.startswith("catask_cats_"))
+async def cb_cat_ask_cats(callback: CallbackQuery) -> None:
+    """Экран настройки категорий: какие предлагать ПЗ, а какие нет."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    _enabled, categories = get_cat_ask_settings(bot_id)
+    catalog = cat_ask_catalog(categories)
+    await render_callback(callback, CAT_ASK_LIST_TEXT,
+                          cat_ask_list_kb(bot_id, catalog, categories))
+
+
+@router.callback_query(F.data.regexp(r"^catask_cat_\d+_\d+$"))
+async def cb_cat_ask_cat_toggle(callback: CallbackQuery) -> None:
+    """Переключает одну категорию в настройке уточнения."""
+    parts = cb_data(callback).split("_")
+    bot_id = int(parts[2])
+    index = int(parts[3])
+    user_id = cb_uid(callback)
+
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    _enabled, categories = get_cat_ask_settings(bot_id)
+    catalog = cat_ask_catalog(categories)
+    if index >= len(catalog):
+        await callback.answer("⚠️ Категория не найдена", show_alert=True)
+        return
+
+    name = catalog[index]
+    if name in categories:
+        if len(categories) <= 1:
+            await callback.answer(
+                "⚠️ Нужна хотя бы одна категория — иначе спросить у ПЗ будет нечего.",
+                show_alert=True,
+            )
+            return
+        categories = [c for c in categories if c != name]
+        await callback.answer(f"⚪ #{name} выключена")
+    else:
+        # Храним в порядке справочника, чтобы список не «прыгал».
+        wanted = set(categories) | {name}
+        categories = [c for c in catalog if c in wanted]
+        await callback.answer(f"✅ #{name} включена")
+
+    set_cat_ask_categories(user_id, bot_id, categories)
+    _enabled, categories = get_cat_ask_settings(bot_id)
+    await safe_edit(callback.message, CAT_ASK_LIST_TEXT,
+                    cat_ask_list_kb(bot_id, catalog, categories))

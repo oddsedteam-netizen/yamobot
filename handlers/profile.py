@@ -14,7 +14,12 @@ from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
                               msg_username, msg_firstname, try_edit_answer)
 from services.child_manager import ChildManager
 from services.config import is_super_admin
-from services.constants import BOT_VERSION
+from services.constants import (
+    BOT_VERSION,
+    SETTING_DONATE_URL,
+    SETTING_TEST_BOT_URL,
+    SETTING_YAMOCHAN_URL,
+)
 from services.storage import (
     get_all_users_registry,
     get_user_bots,
@@ -39,6 +44,8 @@ from services.storage import (
     delete_transfer,
     transfer_all_rights,
     transfer_bot,
+    get_app_setting,
+    set_app_setting,
 )
 
 router = Router()
@@ -51,6 +58,11 @@ _LAST_ADDED: dict[int, int] = {}
 
 class BroadcastFSM(StatesGroup):
     waiting_text = State()
+
+
+class LinksFSM(StatesGroup):
+    # Ожидание новой ссылки для раздела «🟢 Прочее» (админ-панель).
+    waiting_link = State()
 
 
 
@@ -67,6 +79,7 @@ def admin_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list", style="primary"),
         ],
         [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="broadcast", style="primary")],
+        [InlineKeyboardButton(text="🔗 Настройки ссылок", callback_data="links_settings", style="primary")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
     ])
 
@@ -244,6 +257,7 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
         [
             InlineKeyboardButton(text="🚨 Антинакрутка", callback_data="antinakrutka",
                                  style="primary"),
+            InlineKeyboardButton(text="📊 Норма", callback_data="norm", style="primary"),
         ],
         [
             InlineKeyboardButton(text="👑 Передать права", callback_data="transfer", style="primary"),
@@ -560,6 +574,158 @@ async def cb_profile_admin(callback: CallbackQuery) -> None:
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     await render_callback(callback, "🛡 <b>Админ-панель</b>\n\nВыбери раздел:", admin_kb())
+
+
+# ═══════════════ Настройки ссылок для «🟢 Прочее» (только супер-админ) ═══════════════
+
+# Ключ параметра → (ключ в app_settings, заголовок, подсказка).
+_LINK_FIELDS: dict[str, tuple[str, str, str]] = {
+    "yamochan": (
+        SETTING_YAMOCHAN_URL,
+        "🤖 Проект YamoChan",
+        "Ссылка на проект YamoChan. Появится кнопкой на экране «Проект YamoChan» "
+        "в разделе «🟢 Прочее».",
+    ),
+    "donate": (
+        SETTING_DONATE_URL,
+        "💚 Поддержать проект (донат)",
+        "Ссылка на донат. По ней ведёт кнопка «💚 Задонатить» в разделе "
+        "«🟢 Прочее».",
+    ),
+    "testbot": (
+        SETTING_TEST_BOT_URL,
+        "🧪 Тестовый бот",
+        "Ссылка на тестового бота. Используется кнопкой «➡️ Перейти» "
+        "в разделе «✨ Прочее».",
+    ),
+}
+
+
+def _links_settings_text() -> str:
+    """Экран «Настройки ссылок»: текущие значения и подсказка."""
+    lines = [
+        "🔗 <b>Настройки ссылок</b>",
+        "",
+        "Здесь задаются ссылки для раздела «🟢 Прочее». Если ссылка не задана, "
+        "кнопки в разделе покажут подсказку вместо перехода.",
+        "",
+    ]
+    for key, (setting_key, title, _hint) in _LINK_FIELDS.items():
+        value = get_app_setting(setting_key)
+        shown = f"<code>{value}</code>" if value else "— не задана —"
+        lines.append(f"{title}: {shown}")
+    lines += ["", "Выбери, что изменить 👇"]
+    return "\n".join(lines)
+
+
+def links_settings_kb() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, (_setting_key, title, _hint) in _LINK_FIELDS.items():
+        rows.append([
+            InlineKeyboardButton(text=f"✏️ {title}", callback_data=f"links_set_{key}",
+                                 style="primary"),
+            InlineKeyboardButton(text="🗑", callback_data=f"links_clear_{key}",
+                                 style="danger"),
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin",
+                                      style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "links_settings")
+async def cb_links_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await state.clear()
+    await render_callback(callback, _links_settings_text(), links_settings_kb())
+
+
+@router.callback_query(F.data.startswith("links_set_"))
+async def cb_links_set(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    key = cb_data(callback).split("links_set_", 1)[1]
+    field = _LINK_FIELDS.get(key)
+    if field is None:
+        await callback.answer("⚠️ Неизвестный параметр", show_alert=True)
+        return
+
+    setting_key, title, hint = field
+    await state.set_state(LinksFSM.waiting_link)
+    await state.update_data(link_setting_key=setting_key, link_title=title)
+
+    current = get_app_setting(setting_key)
+    current_line = f"<code>{current}</code>" if current else "— не задана —"
+    text = (
+        f"✏️ <b>{title}</b>\n\n"
+        f"{hint}\n\n"
+        f"Сейчас: {current_line}\n\n"
+        "Отправь новую ссылку одним сообщением: полной (https://…), "
+        "короткой (t.me/…) или как @username."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="links_settings",
+                              style="primary")]
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data.startswith("links_clear_"))
+async def cb_links_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    key = cb_data(callback).split("links_clear_", 1)[1]
+    field = _LINK_FIELDS.get(key)
+    if field is None:
+        await callback.answer("⚠️ Неизвестный параметр", show_alert=True)
+        return
+
+    setting_key, title, _hint = field
+    set_app_setting(setting_key, "")
+    await state.clear()
+    await render_callback(callback, f"🗑 <b>{title}</b>: ссылка очищена.\n\n"
+                                    + _links_settings_text(),
+                           links_settings_kb())
+
+
+@router.message(LinksFSM.waiting_link)
+async def fsm_links_set(message: Message, state: FSMContext) -> None:
+    """Сохраняет ссылку, введённую супер-админом."""
+    user_id = msg_uid(message)
+    if not is_super_admin(user_id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    setting_key = str(data.get("link_setting_key") or "")
+    title = str(data.get("link_title") or "")
+    if not setting_key:
+        await state.clear()
+        await message.answer("⚠️ Не удалось определить параметр — открой настройки заново.")
+        return
+
+    from handlers.other import normalize_link
+
+    link = normalize_link(message.text or "")
+    if not link:
+        await message.answer(
+            "❌ Не похоже на ссылку.\n\n"
+            "Отправь её ещё раз: полной (https://…), короткой (t.me/…) "
+            "или как @username."
+        )
+        return
+
+    set_app_setting(setting_key, link)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{title}</b>: ссылка сохранена.\n\n{_links_settings_text()}",
+        reply_markup=links_settings_kb(),
+    )
 
 
 @router.callback_query(F.data == "profiles_list")
