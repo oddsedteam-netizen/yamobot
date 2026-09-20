@@ -8,6 +8,12 @@
   • привязка канала: пользователь добавляет YamoBot в свой канал админом
     (особенно с правом «Публикация сообщений»), бот видит это сам и присылает
     подтверждение, а кнопка «✅ Я привязал» проверяет привязку вручную;
+  • привязать канал бот даёт только тому, кто в этом канале владелец
+    (создатель) или админ — чужой ТГК не отдаём никому;
+  • ТГК привязывается только к одному человеку: если канал уже привязан,
+    второму пользователю бот откажет («ТГК уже используется другим»).
+    Исключение — владелец канала: он может забрать привязку у админа,
+    который привязал канал раньше (прежний владелец получает уведомление);
   • «📢 Мой ТГК» — статистика канала: подписчики, посты бота и отложенные посты;
   • «📝 Выложить пост» — текст (можно с фото, разметкой и премиум-эмодзи),
     при желании инлайн-кнопки-ссылки с выбором цвета, проверка поста в личке
@@ -64,6 +70,7 @@ from services.storage import (
     delete_channel_post,
     get_bound_channel,
     get_channel_bind_request,
+    get_channel_owner,
     get_channel_post,
     get_channel_posts,
     set_channel_bind_request,
@@ -173,6 +180,80 @@ async def _channel_admin_state(bot, channel_id: int) -> tuple[bool, bool]:
     return True, bool(getattr(member, "can_post_messages", False))
 
 
+async def _channel_role(bot, channel_id: int, user_id: int) -> tuple[str, bool]:
+    """Роль человека в канале: (статус, удалось ли проверить).
+
+    Возвращает ``("creator"|"administrator"|"", True)``, если Telegram ответил,
+    и ``("", False)``, если проверить не вышло (бот не админ канала, канал
+    недоступен, пользователь не найден). Решение по «неизвестно» принимает
+    вызывающий: ``from_user`` апдейта Telegram уже проверил как админа канала
+    (иначе он не смог бы добавить бота), а кандидату из заявки «привязать ТГК»
+    без проверки доверять нельзя.
+    """
+    if not user_id:
+        return "", False
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+    except Exception as e:
+        logger.warning("Не удалось проверить права %s в канале %s: %s",
+                       user_id, channel_id, e)
+        return "", False
+    status = str(getattr(member, "status", "") or "")
+    if status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR):
+        return status, True
+    return "", True
+
+
+def _not_staff_text(title: str, channel_id: int) -> str:
+    """Отказ: привязать можно только свой канал (владелец или админ)."""
+    return (
+        "🚫 <b>Привязать можно только свой канал.</b>\n\n"
+        f"📎 Канал: <b>{_esc(title or str(channel_id))}</b>\n"
+        f"🆔 <code>{channel_id}</code>\n\n"
+        "Ты не владелец и не администратор этого канала, поэтому привязку "
+        "не делаю: чужой ТГК забирать нельзя.\n\n"
+        "Если канал твой — проверь в Telegram: «Управление каналом» → "
+        "«Администраторы». Привязать ТГК может только владелец канала или "
+        "его админ."
+    )
+
+
+def _taken_text(title: str, channel_id: int) -> str:
+    """Отказ: ТГК уже привязан к другому пользователю YamoBot."""
+    return (
+        "🚫 <b>Этот ТГК уже используется другим человеком.</b>\n\n"
+        f"📎 Канал: <b>{_esc(title or str(channel_id))}</b>\n"
+        f"🆔 <code>{channel_id}</code>\n\n"
+        "К YamoBot можно привязать ТГК только к одному аккаунту, поэтому "
+        "второй раз его никто не получит.\n\n"
+        "Если это твой канал — попроси того, кто привязал канал, отвязать "
+        "его: <b>«📢 Мой ТГК» → «🔴 Отвязать ТГК»</b>. После этого привяжи "
+        "канал сам."
+    )
+
+
+async def _dm_user(bot, user_id: int, text: str) -> None:
+    """Пишет человеку в личку; ошибки (заблокировал бота) только логируем."""
+    try:
+        await bot.send_message(chat_id=user_id, text=text)
+    except Exception as e:
+        logger.warning("Не удалось написать %s: %s", user_id, e)
+
+
+async def _notify_binding_lost(bot, previous_owner: int, channel_id: int,
+                              title: str) -> None:
+    """Сообщает прежнему владельцу, что канал забрал владелец ТГК."""
+    await _dm_user(
+        bot, previous_owner,
+        "⚠️ <b>ТГК отвязан от тебя.</b>\n\n"
+        f"📎 Канал: <b>{_esc(title or str(channel_id))}</b>\n"
+        f"🆔 <code>{channel_id}</code>\n\n"
+        "Владелец канала привязал его к своему аккаунту — один ТГК "
+        "может быть привязан только к одному человеку. Отложенные "
+        "посты этого канала отменены.",
+    )
+
+
 async def _resolve_channel_ref(bot, message: Message) -> tuple[int, str, str] | None:
     """Определяет канал по пересланному посту или по @username/ссылке.
 
@@ -227,7 +308,10 @@ def _bind_instruction_text(bot_username: str) -> str:
         "Если подтверждение не пришло (например, бот уже был в канале) — нажми "
         "<b>«✅ Я привязал»</b> и просто <b>перешли мне любой пост из канала</b> "
         "или пришли <b>@username</b> канала: я найду его и привяжу.\n\n"
-        "⚠️ К боту можно привязать только один канал."
+        "🔒 Привязать можно только канал, где ты <b>владелец</b> или "
+        "<b>админ</b> — чужой ТГК бот не отдаст.\n"
+        "⚠️ К боту можно привязать только один канал: если он уже привязан "
+        "к другому человеку, привязка не пройдёт."
     )
 
 
@@ -499,7 +583,36 @@ async def fsm_channel_ref(message: Message, state: FSMContext) -> None:
         )
         return
 
-    bind_channel(owner_id, channel_id, title, username)
+    # Права человека в канале: привязать может только владелец канала или его
+    # админ. Бот уже админ канала (проверено выше), поэтому Telegram обязан
+    # ответить — но если проверить не вышло, чужой канал не отдаём (fail-closed).
+    role, checked = await _channel_role(bot, channel_id, owner_id)
+    if not checked or not role:
+        logger.info("Канал %s: %s не владелец/админ — привязку отклоняю",
+                    channel_id, owner_id)
+        await message.answer(_not_staff_text(title, channel_id),
+                             reply_markup=_cancel_kb())
+        return
+
+    # Канал уже привязан к другому человеку? Забрать его может только владелец
+    # канала (создатель): настоящий хозяин не должен остаться без доступа из-за
+    # чужой привязки. Всем остальным отказываем.
+    previous_owner = get_channel_owner(channel_id)
+    takeover = previous_owner is not None and previous_owner != owner_id
+    if takeover and role != ChatMemberStatus.CREATOR:
+        logger.info("Канал %s уже привязан к %s — привязку для %s отклоняю",
+                    channel_id, previous_owner, owner_id)
+        await message.answer(_taken_text(title, channel_id),
+                             reply_markup=_cancel_kb())
+        return
+
+    if not bind_channel(owner_id, channel_id, title, username, takeover=takeover):
+        await message.answer(_taken_text(title, channel_id),
+                             reply_markup=_cancel_kb())
+        return
+    if takeover and previous_owner is not None:
+        await _notify_binding_lost(bot, previous_owner, channel_id, title)
+
     clear_channel_bind_request(owner_id)
     await state.clear()
     logger.info("Пользователь %s привязал канал %s (%s) вручную",
@@ -539,17 +652,28 @@ async def on_channel_member_update(event: ChatMemberUpdated) -> None:
     Чужой канал «увести» привязку не может: пока привязан другой канал,
     новую привязку не подтверждаем.
 
+    Привязка возможна только тому, кто в канале владелец (создатель) или
+    админ; канал, уже привязанный к другому человеку, не отдаём — забрать
+    свою привязку может только владелец канала.
+
     Если Telegram не сообщил, кто добавил бота (анонимный админ канала),
-    привязываем канал владельцу со свежей заявкой «привязать ТГК».
+    берём владельца со свежей заявкой «привязать ТГК» — но только если он
+    действительно владелец или админ этого канала.
     """
     chat = event.chat
     bot = event_bot(event)
 
     adder = event.from_user
     adder_id = adder.id if adder is not None and not adder.is_bot else 0
+    # Заявка «привязать ТГК» — это не подтверждение прав, поэтому такого
+    # кандидата обязательно проверяем в канале. А вот from_user апдейта
+    # Telegram проверил сам: без прав админа канала человека с ботом в
+    # канал не пустят.
+    from_request = False
     if not adder_id:
         # Инициатор неизвестен — смотрим, кто просил привязать ТГК.
         adder_id = get_channel_bind_request() or 0
+        from_request = bool(adder_id)
     if not adder_id:
         logger.info("Канал %s: не понял, кто добавил бота — ничего не меняю", chat.id)
         return
@@ -558,24 +682,50 @@ async def on_channel_member_update(event: ChatMemberUpdated) -> None:
     is_member_now = new_status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 
     async def _dm(text: str) -> None:
-        try:
-            await bot.send_message(chat_id=adder_id, text=text)
-        except Exception as e:
-            logger.warning("Не удалось написать владельцу %s: %s", adder_id, e)
+        await _dm_user(bot, adder_id, text)
 
     if not is_member_now:
-        # Бота удалили из канала: если он был привязан — снимаем привязку.
-        bound = get_bound_channel(adder_id)
-        if bound and int(bound["channel_id"]) == int(chat.id):
-            unbind_channel(adder_id)
-            logger.info("Канал %s (%s) отвязан: бота убрали из канала",
-                        chat.id, chat.title)
-            await _dm(
+        # Бота убрали из канала: снимаем привязку этого канала — публиковать в
+        # него бот больше не может, а привязка мешала бы привязать канал заново.
+        # В YamoBot владельцем привязки может быть не тот, кто удалял бота
+        # (например, удалил анонимный админ), поэтому ищем владельца по каналу.
+        channel_owner = get_channel_owner(chat.id)
+        if channel_owner is not None:
+            unbind_channel(channel_owner)
+            logger.info("Канал %s (%s) отвязан: бота убрали из канала (владелец %s)",
+                        chat.id, chat.title, channel_owner)
+            await _dm_user(
+                bot, channel_owner,
                 "⚠️ <b>Бот удалён из твоего канала.</b>\n\n"
                 f"📎 Канал: <b>{_esc(chat.title or str(chat.id))}</b>\n"
                 "Привязка снята. Чтобы снова публиковать посты — добавь бота "
                 "админом и открой «📢 Мой ТГК» в главном меню."
             )
+        return
+
+    # Привязать канал может только владелец канала или его админ.
+    role, checked = await _channel_role(bot, chat.id, adder_id)
+    if not role and (checked or from_request):
+        # Либо Telegram точно сказал, что человек не админ канала, либо это
+        # кандидат из заявки, которого проверить не вышло: чужой ТГК не отдаём.
+        logger.info("Канал %s: %s не владелец/админ канала — привязку отклоняю",
+                    chat.id, adder_id)
+        await _dm(
+            _not_staff_text(chat.title or "", chat.id)
+            + "\n\nЕсли канал твой и бота добавил ты — открой «📢 Мой ТГК» → "
+            "«🔗 Привязать ТГК», нажми «✅ Я привязал» и перешли мне любой пост "
+            "из канала: права проверю по твоему аккаунту."
+        )
+        return
+
+    # Канал уже привязан к другому человеку? Привязку может забрать только
+    # владелец канала (создатель) — остальным отказываем.
+    previous_owner = get_channel_owner(chat.id)
+    takeover = previous_owner is not None and previous_owner != adder_id
+    if takeover and role != ChatMemberStatus.CREATOR:
+        logger.info("Канал %s уже привязан к %s — привязку для %s отклоняю",
+                    chat.id, previous_owner, adder_id)
+        await _dm(_taken_text(chat.title or "", chat.id))
         return
 
     bound = get_bound_channel(adder_id)
@@ -591,7 +741,13 @@ async def on_channel_member_update(event: ChatMemberUpdated) -> None:
         )
         return
 
-    bind_channel(adder_id, chat.id, chat.title or "", chat.username or "")
+    if not bind_channel(adder_id, chat.id, chat.title or "", chat.username or "",
+                        takeover=takeover):
+        # Канал успел «уехать» к другому владельцу между проверкой и привязкой.
+        await _dm(_taken_text(chat.title or "", chat.id))
+        return
+    if takeover and previous_owner is not None:
+        await _notify_binding_lost(bot, previous_owner, chat.id, chat.title or "")
     clear_channel_bind_request(adder_id)
     logger.info("Пользователь %s привязал канал %s (%s)", adder_id, chat.id, chat.title)
 

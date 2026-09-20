@@ -219,6 +219,46 @@ def _migrate_antiraid_del_links_default(conn: sqlite3.Connection) -> None:
 
 
 
+def _migrate_single_channel_owner(conn: sqlite3.Connection) -> None:
+    """Убирает «двойные» привязки одного ТГК разным людям.
+
+    Старые версии бота не проверяли, кому принадлежит канал: два пользователя
+    могли привязать один и тот же ТГК, и любой из них публиковал посты от лица
+    канала. Оставляем на канал одну (самую свежую) привязку, остальные снимаем
+    вместе с их отложенными постами: дальше ``bind_channel`` не даст появиться
+    дублям, а владелец канала может забрать привязку себе.
+    """
+    dupes = conn.execute(
+        "SELECT channel_id FROM tg_channels GROUP BY channel_id "
+        "HAVING COUNT(*) > 1"
+    ).fetchall()
+    for row in dupes:
+        channel_id = int(row[0])
+        keep = conn.execute(
+            "SELECT owner_id FROM tg_channels WHERE channel_id = ? "
+            "ORDER BY bound_at DESC, owner_id DESC LIMIT 1",
+            (channel_id,),
+        ).fetchone()
+        if keep is None:
+            continue
+        keep_owner = int(keep[0])
+        others = [
+            int(r[0]) for r in conn.execute(
+                "SELECT owner_id FROM tg_channels "
+                "WHERE channel_id = ? AND owner_id != ?",
+                (channel_id, keep_owner),
+            ).fetchall()
+        ]
+        for owner_id in others:
+            _drop_channel_binding(conn, owner_id)
+        logger.warning(
+            "ТГК %s был привязан к нескольким пользователям (%s) — оставляю "
+            "привязку %s, у остальных снимаю", channel_id,
+            ", ".join(str(o) for o in [keep_owner, *others]), keep_owner,
+        )
+    conn.commit()
+
+
 def ensure_db() -> None:
     conn = _get_conn()
     conn.executescript("""
@@ -512,7 +552,8 @@ def ensure_db() -> None:
         );
 
         -- ТГК (Telegram-канал) пользователя: бот добавляется в канал админом
-        -- и публикует посты от лица канала. У пользователя один канал.
+        -- и публикует посты от лица канала. У пользователя один канал, и один
+        -- канал — только у одного пользователя (проверяет bind_channel).
         CREATE TABLE IF NOT EXISTS tg_channels (
             owner_id   INTEGER PRIMARY KEY,
             channel_id INTEGER NOT NULL,
@@ -567,6 +608,9 @@ def ensure_db() -> None:
     _migrate_antiraid_del_links_default(conn)
     _migrate_antinakrutka_enabled(conn)
     _migrate_admin_norms(conn)
+    # Один ТГК — один владелец: снимаем дубли привязок, оставшиеся от старых
+    # версий (см. handlers/channels.py — там же проверка прав на привязку).
+    _migrate_single_channel_owner(conn)
     conn.commit()
 
 
@@ -3016,11 +3060,56 @@ def delete_bot_config(code: str, owner_id: int | None = None) -> bool:
 # пользователя (owner_id — владелец в YamoBot).
 
 
+def _drop_channel_binding(conn: sqlite3.Connection, owner_id: int) -> int:
+    """Удаляет привязку канала пользователя вместе с её «хвостами».
+
+    Вызывается только под ``_lock``. Возвращает число удалённых привязок
+    (0 — у пользователя канала не было). Отложенные посты канала снимаем:
+    публиковать их больше некому.
+    """
+    cur = conn.execute("DELETE FROM tg_channels WHERE owner_id = ?", (owner_id,))
+    conn.execute(
+        "DELETE FROM channel_posts WHERE owner_id = ? AND status = 'scheduled'",
+        (owner_id,),
+    )
+    conn.execute(
+        "DELETE FROM channel_bind_requests WHERE owner_id = ?", (owner_id,)
+    )
+    return cur.rowcount
+
+
 def bind_channel(owner_id: int, channel_id: int, title: str = "",
-                 username: str = "") -> None:
-    """Привязывает канал к пользователю (перезаписывает прежнюю привязку)."""
+                 username: str = "", *, takeover: bool = False) -> bool:
+    """Привязывает канал к пользователю. ``True`` — привязка сделана.
+
+    Права человека («владелец или админ канала») проверяются в обработчиках —
+    там есть доступ к Telegram. Здесь страхуем второе правило: у одного ТГК
+    не может быть двух хозяев.
+
+    * ``False`` — канал уже привязан к другому владельцу YamoBot: чужой ТГК
+      не отдаём (обработчик объясняет это пользователю);
+    * ``takeover=True`` — разрешено забрать канал у прежнего владельца. Так
+      делает только владелец (создатель) канала в Telegram: настоящий хозяин
+      канала не должен остаться без доступа из-за чужой привязки. Прежний
+      владелец теряет привязку и отложенные посты этого канала (как при
+      «🔴 Отвязать ТГК»), обработчик уведомляет его об этом.
+    """
     conn = _get_conn()
     with _lock:
+        others = [
+            int(r[0]) for r in conn.execute(
+                "SELECT owner_id FROM tg_channels WHERE channel_id = ? "
+                "AND owner_id != ?",
+                (channel_id, owner_id),
+            ).fetchall()
+        ]
+        if others:
+            # Канал уже чей-то: чужой ТГК не отдаём. Исключение — takeover:
+            # владелец канала в Telegram возвращает привязку себе.
+            if not takeover:
+                return False
+            for other_owner in others:
+                _drop_channel_binding(conn, other_owner)
         conn.execute(
             "INSERT INTO tg_channels (owner_id, channel_id, title, username) "
             "VALUES (?, ?, ?, ?) "
@@ -3029,6 +3118,7 @@ def bind_channel(owner_id: int, channel_id: int, title: str = "",
             (owner_id, channel_id, title or "", username or ""),
         )
         conn.commit()
+        return True
 
 
 def get_bound_channel(owner_id: int) -> dict | None:
@@ -3064,16 +3154,9 @@ def unbind_channel(owner_id: int) -> bool:
     """Отвязывает канал пользователя (вместе с его отложенными постами)."""
     conn = _get_conn()
     with _lock:
-        cur = conn.execute("DELETE FROM tg_channels WHERE owner_id = ?", (owner_id,))
-        conn.execute(
-            "DELETE FROM channel_posts WHERE owner_id = ? AND status = 'scheduled'",
-            (owner_id,),
-        )
-        conn.execute(
-            "DELETE FROM channel_bind_requests WHERE owner_id = ?", (owner_id,)
-        )
+        removed = _drop_channel_binding(conn, owner_id)
         conn.commit()
-        return cur.rowcount > 0
+        return removed > 0
 
 
 def add_channel_post(owner_id: int, channel_id: int, text: str = "",
