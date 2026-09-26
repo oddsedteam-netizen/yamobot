@@ -80,23 +80,33 @@ async def chat_human_count(bot: Bot, chat_id: int | None) -> int | None:
     return max(0, int(total) - bots_here)
 
 
-async def is_chat_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+# Статусы ChatMember, при которых человек находится ВНУТРИ чата. Всё остальное
+# (left, kicked) — человек в чате не состоит, даже если Telegram не бросил
+# ошибку, а спокойно вернул объект участника.
+_INSIDE_STATUSES = {"member", "administrator", "creator", "restricted"}
+
+
+async def is_chat_member(bot: Bot, chat_id: int, user_id: int) -> tuple[bool, str]:
     """Спрашивает у Telegram, состоит ли человек в чате.
 
-    Telegram отвечает ошибкой, если человека в чате нет — это и считаем
-    «не участник». Если бот не администратор в чате, он всё равно видит
-    участников (нужен лишь доступ к getChatMember).
+    ВАЖНО: нельзя судить только по тому, бросил ли Telegram ошибку. На человека,
+    которого в чате нет, Telegram часто НЕ бросает ошибку, а возвращает
+    участника со статусом 'left'/'kicked' (особенно в супергруппах и в чатах,
+    где бот состоит). Поэтому смотрим именно на статус.
     """
     try:
-        await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id)
     except TelegramBadRequest as e:
+        # «user not found» / «chat not found» — человека в чате нет.
         logger.info("getChatMember %s в чате %s: %s", user_id, chat_id, e)
-        return False
+        return False, ""
     except Exception as e:
         logger.warning("Не удалось проверить участника %s в чате %s: %s",
                        user_id, chat_id, e)
-        return False
-    return True
+        return False, ""
+
+    status = str(getattr(member, "status", "") or "")
+    return status in _INSIDE_STATUSES, status
 
 
 # Сколько кандидатов из реестра проверяем за одно нажатие: каждый — запрос
@@ -110,8 +120,9 @@ async def known_people(bot: Bot, owner_id: int, chat_id: int) -> tuple[list[dict
 
     Bot API не отдаёт список участников чата (есть только счётчик и
     администраторы), поэтому «Не в списке» строим так: берём людей, которые
-    писали ботам (реестр платформы), и каждого проверяем через getChatMember.
-    Показываем только тех, кто реально состоит в привязанном чате админов.
+    писали ботам (реестр платформы), и каждого проверяем через getChatMember —
+    с обязательной проверкой статуса, чтобы в список попали только те, кто
+    реально состоит в привязанном чате админов.
 
     Возвращает (люди, проверено кандидатов, всего кандидатов в реестре).
     """
@@ -134,8 +145,12 @@ async def known_people(bot: Bot, owner_id: int, chat_id: int) -> tuple[list[dict
 
     async def check(person: dict) -> dict | None:
         async with semaphore:
-            inside = await is_chat_member(bot, chat_id, person["id"])
-        return person if inside else None
+            inside, status = await is_chat_member(bot, chat_id, person["id"])
+        if not inside:
+            logger.info("Пользователь %s не в чате %s (статус %r)",
+                        person["id"], chat_id, status)
+            return None
+        return person
 
     results = await asyncio.gather(*(check(p) for p in to_check))
     people = [p for p in results if p is not None]
@@ -361,7 +376,9 @@ async def cb_ask_add_from_list(callback: CallbackQuery) -> None:
         return
 
     bot = event_bot(callback)
-    if not await is_chat_member(bot, chat_id, new_admin_id):
+    inside, status = await is_chat_member(bot, chat_id, new_admin_id)
+    if not inside:
+        logger.info("Отказ: %s не в чате %s (статус %r)", new_admin_id, chat_id, status)
         await callback.answer("❌ Он не состоит в чате админов", show_alert=True)
         return
 
