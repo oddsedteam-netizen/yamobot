@@ -7,9 +7,11 @@
 Тут же — список участников чата, которых нет в базе админов.
 """
 
+import asyncio
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -29,6 +31,7 @@ from services.storage import (
     get_all_users_registry,
     get_bound_chat,
     get_owner_by_admin_chat,
+    get_user_registry,
     remove_admin,
 )
 
@@ -77,26 +80,66 @@ async def chat_human_count(bot: Bot, chat_id: int | None) -> int | None:
     return max(0, int(total) - bots_here)
 
 
-def known_people(owner_id: int) -> list[dict]:
-    """Люди, известные платформе: пользователи, писавшие ботам.
+async def is_chat_member(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Спрашивает у Telegram, состоит ли человек в чате.
 
-    Bot API не отдаёт полный список участников чата (есть только счётчик и
-    администраторы), поэтому «Не в списке» строим по своим данным: все, кто
-    есть в реестре платформы, минус те, кто уже в списке админов.
+    Telegram отвечает ошибкой, если человека в чате нет — это и считаем
+    «не участник». Если бот не администратор в чате, он всё равно видит
+    участников (нужен лишь доступ к getChatMember).
     """
-    known = {int(a["user_id"]) for a in get_admins_all(owner_id)}
-    result: list[dict] = []
+    try:
+        await bot.get_chat_member(chat_id, user_id)
+    except TelegramBadRequest as e:
+        logger.info("getChatMember %s в чате %s: %s", user_id, chat_id, e)
+        return False
+    except Exception as e:
+        logger.warning("Не удалось проверить участника %s в чате %s: %s",
+                       user_id, chat_id, e)
+        return False
+    return True
+
+
+# Сколько кандидатов из реестра проверяем за одно нажатие: каждый — запрос
+# в Telegram, а чат может быть большим, и список ради этого не должен
+# подвисать на десятки секунд.
+_MEMBERS_CHECK_LIMIT = 200
+
+
+async def known_people(bot: Bot, owner_id: int, chat_id: int) -> tuple[list[dict], int, int]:
+    """Люди из реестра, которые состоят в чате админов, но не в списке админов.
+
+    Bot API не отдаёт список участников чата (есть только счётчик и
+    администраторы), поэтому «Не в списке» строим так: берём людей, которые
+    писали ботам (реестр платформы), и каждого проверяем через getChatMember.
+    Показываем только тех, кто реально состоит в привязанном чате админов.
+
+    Возвращает (люди, проверено кандидатов, всего кандидатов в реестре).
+    """
+    admins = {int(a["user_id"]) for a in get_admins_all(owner_id)}
+    candidates: list[dict] = []
     for row in get_all_users_registry():
         user_id = int(row.get("user_id") or 0)
-        if not user_id or user_id in known:
+        if not user_id or user_id in admins:
             continue
-        result.append({
+        candidates.append({
             "id": user_id,
             "username": row.get("username") or "",
             "name": row.get("first_name") or "",
-            "status": "",
         })
-    return result
+
+    total = len(candidates)
+    to_check = candidates[:_MEMBERS_CHECK_LIMIT]
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def check(person: dict) -> dict | None:
+        async with semaphore:
+            inside = await is_chat_member(bot, chat_id, person["id"])
+        return person if inside else None
+
+    results = await asyncio.gather(*(check(p) for p in to_check))
+    people = [p for p in results if p is not None]
+    return people, len(to_check), total
 
 
 async def chat_members(bot: Bot, chat_id: int) -> list[dict]:
@@ -139,25 +182,28 @@ async def cb_not_in_list(callback: CallbackQuery) -> None:
         await callback.answer("⚠️ Чат админов не привязан", show_alert=True)
         return
 
-    members = await chat_human_count(event_bot(callback), chat_id)
+    bot = event_bot(callback)
+    members = await chat_human_count(bot, chat_id)
     known = {a["user_id"] for a in get_admins_all(user_id)}
-    people = known_people(user_id)
+    people, checked, total = await known_people(bot, user_id, chat_id)
 
     text = (
         "🚫 <b>Не в списке админов</b>\n\n"
         f"👥 Участников в чате (без ботов): <b>{members if members is not None else '—'}</b>\n"
         f"📋 В списке админов: <b>{len(known)}</b>\n"
-        f"🆕 Известны боту, но не админы: <b>{len(people)}</b>\n\n"
+        f"🆕 В чате, но не админы: <b>{len(people)}</b>\n\n"
     )
     if members is None:
         text += ("⚠️ Telegram не отдал число участников: проверь, что чат "
                  "админов привязан и YamoBot — администратор в нём.\n\n")
     if people:
         text += ("Нажми на человека — бот спросит, добавлять ли его в админы.\n"
-                 "<i>Список собран по людям, которые писали ботам: Telegram не "
-                 "показывает боту всех участников чата.</i>")
+                 "<i>Показываем только тех, кто состоит в чате админов.</i>")
     else:
-        text += "✅ Никого, кто писал ботам, в списке админов нет."
+        text += "✅ В чате админов нет никого, кого ещё нет в списке."
+    if checked < total:
+        text += (f"\n\n<i>Проверено {checked} из {total} известных боту людей "
+                 f"— остальные не проверены, список может быть неполным.</i>")
 
     await render_callback(callback, text,
                           not_in_admins_kb(people, user_id) if people else
@@ -314,13 +360,19 @@ async def cb_ask_add_from_list(callback: CallbackQuery) -> None:
         await callback.answer("⚠️ Уже в списке")
         return
 
-    person = next((m for m in known_people(owner_id) if m["id"] == new_admin_id), None)
-    if person is None:
+    bot = event_bot(callback)
+    if not await is_chat_member(bot, chat_id, new_admin_id):
+        await callback.answer("❌ Он не состоит в чате админов", show_alert=True)
+        return
+
+    row = get_user_registry(new_admin_id)
+    if row is None:
         await callback.answer("❌ Человек не найден среди пользователей бота", show_alert=True)
         return
 
-    await _ask_add_admin(event_bot(callback), owner_id, new_admin_id,
-                         person["username"], person["name"], "чат админов")
+    await _ask_add_admin(bot, owner_id, new_admin_id,
+                         row.get("username") or "", row.get("first_name") or "",
+                         "чат админов")
     await callback.answer("Вопрос отправлен в личку")
 
 
