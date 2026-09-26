@@ -8,11 +8,13 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import (render_callback, cb_data, cb_uid, msg_uid,
+from handlers._common import (render_callback, cb_data, cb_uid, event_bot, msg_uid,
                               try_edit_answer)
+from handlers.admin_chat_watch import chat_human_count
 from services.child_manager import ChildManager
 from services.constants import MIN_ADMIN_INVITE_USES, MAX_ADMIN_INVITE_USES
 from services.storage import (
+    get_bound_chat,
     get_admins_all,
     add_admin,
     remove_admin,
@@ -46,8 +48,9 @@ def admins_menu_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list", style="primary"),
-                InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats", style="primary"),
+                InlineKeyboardButton(text="🚫 Не в списке", callback_data="adm_notlist", style="danger"),
             ],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats", style="primary")],
             [
                 InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add", style="success"),
                 InlineKeyboardButton(text="🗑 Удалить админа", callback_data="gadmins_del", style="danger"),
@@ -66,12 +69,49 @@ def admins_list_kb(extra_rows: list[list[InlineKeyboardButton]] | None = None) -
     rows: list[list[InlineKeyboardButton]] = []
     if extra_rows:
         rows.extend(extra_rows)
-    rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add", style="success")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить", callback_data="gadmins_add", style="success"),
+        InlineKeyboardButton(text="🚫 Не в списке", callback_data="adm_notlist", style="danger"),
+    ])
     rows.append([
         InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary"),
         InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── Постраничный вывод списка админов ─────────────────────────────────
+# Раньше список выводился целиком: и в тексте, и кнопками. На большом
+# количестве админов сообщение упиралось в лимиты Telegram (4096 символов и
+# размер клавиатуры) и вкладка не открывалась. Теперь — страницами.
+ADMINS_PAGE_SIZE = 8
+
+
+def _parse_page(data: str, prefix: str) -> int:
+    """Номер страницы из callback_data вида ``<prefix><N>`` (по умолчанию 1)."""
+    tail = data[len(prefix):]
+    return int(tail) if tail.isdigit() and int(tail) > 0 else 1
+
+
+def _pager_rows(prefix: str, page: int,
+                total_pages: int) -> list[list[InlineKeyboardButton]]:
+    """Строка перелистывания «◀️ · N/M · ▶️» (пусто, если страница одна)."""
+    if total_pages <= 1:
+        return []
+    prev_page = page - 1 if page > 1 else total_pages
+    next_page = page + 1 if page < total_pages else 1
+    return [[
+        InlineKeyboardButton(text="◀️", callback_data=f"{prefix}{prev_page}", style="primary"),
+        InlineKeyboardButton(text=f"📄 {page}/{total_pages}",
+                             callback_data=f"{prefix}{page}", style="primary"),
+        InlineKeyboardButton(text="▶️", callback_data=f"{prefix}{next_page}", style="primary"),
+    ]]
+
+
+def _fit(text: str, limit: int = 60) -> str:
+    """Обрезает подпись кнопки: Telegram режет текст длиннее 64 символов."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
@@ -86,17 +126,33 @@ def admin_detail_kb(admin_user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def admins_header_text(owner_id: int, members: int | None = None) -> str:
+    """Шапка меню админов: сколько людей в чате и сколько админов в базе.
+
+    Синхронная функция: счётчики берутся из БД, а участников в чате
+    (которых считает Telegram) передаёт вызывающий.
+    """
+    admins_count = len(get_admins_all(owner_id))
+    if members is None:
+        chat_line = ("👥 Участников в чате: <b>—</b> "
+                     "<i>(чат не привязан или нет прав)</i>\n")
+    else:
+        chat_line = f"👥 Участников в чате: <b>{members}</b>\n"
+    return (
+        "👥 <b>Админы</b>\n\n"
+        f"{chat_line}"
+        f"🛡 Записано в базе: <b>{admins_count}</b>\n\n"
+        "Админы привязаны ко всем твоим ботам. Новичка из чата админов бот "
+        "сам спросит, добавлять ли его."
+    )
+
+
 async def show_admins(message: Message) -> None:
     """Показывает меню админов из reply-кнопки (не редактируя сообщение)."""
     owner_id = msg_uid(message)
-    admins = get_admins_all(owner_id)
-    text = (
-        f"👤 <b>Управление админами</b>\n\n"
-        f"Всего админов: <b>{len(admins)}</b>\n\n"
-        f"Админы привязаны ко всем ботам.\n\n"
-        f"Выбери действие:"
-    )
-    await message.answer(text, reply_markup=admins_menu_kb())
+    members = await chat_human_count(event_bot(message), get_bound_chat(owner_id, "admin"))
+    await message.answer(admins_header_text(owner_id, members),
+                         reply_markup=admins_menu_kb())
 
 
 # ═══════════════ Главное меню админов ═══════════════
@@ -105,56 +161,59 @@ async def show_admins(message: Message) -> None:
 async def cb_admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     owner_id = cb_uid(callback)
-    admins = get_admins_all(owner_id)
-
-    text = (
-        f"👤 <b>Управление админами</b>\n\n"
-        f"Всего админов: <b>{len(admins)}</b>\n\n"
-        f"Админы привязаны ко всем ботам.\n\n"
-        f"Выбери действие:"
-    )
-
-    await render_callback(callback, text, admins_menu_kb())
+    members = await chat_human_count(event_bot(callback), get_bound_chat(owner_id, "admin"))
+    await render_callback(callback, admins_header_text(owner_id, members),
+                          admins_menu_kb())
 
 
 # ═══════════════ Список ═══════════════
 
-@router.callback_query(F.data == "gadmins_list")
+@router.callback_query(F.data.startswith("gadmins_list"))
 async def cb_admins_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
     owner_id = cb_uid(callback)
     admins = get_admins_all(owner_id)
 
-    if admins:
-        lines = []
-        extra_rows = []
-        for i, a in enumerate(admins, 1):
-            uname = f"@{a['username']}" if a['username'] else f"ID:{a['user_id']}"
-            status = "🟢 активен" if a["active"] else "🔴 неактивен"
-            topics = get_admin_active_topics(owner_id, a["user_id"])
-            lines.append(f"{i}. <b>#{a['tag']}</b>  {uname}")
-            lines.append(f"   {status} · ПЗ за ним: <b>{topics}</b>")
-            lines.append("")
-            extra_rows.append([
-                InlineKeyboardButton(
-                    text=f"{i}. #{a['tag']} — {uname}",
-                    callback_data=f"gadmins_view_{a['user_id']}"
-                )
-            ])
+    if not admins:
+        await render_callback(callback, "📋 <b>Список админов</b>\n\nПока нет ни одного админа.",
+                              admins_list_kb())
+        return
 
-        admin_list = "\n".join(lines).rstrip()
-        text = (
-            f"📋 <b>Список админов</b> ({len(admins)})\n\n"
-            f"{admin_list}\n"
-            f"Нажми на админа — откроется его карточка с действиями."
-        )
-        kb = admins_list_kb(extra_rows)
-    else:
-        text = "📋 <b>Список админов</b>\n\nПока нет ни одного админа."
-        kb = admins_list_kb()
+    page = _parse_page(cb_data(callback), "gadmins_list_p")
+    total_pages = max(1, (len(admins) + ADMINS_PAGE_SIZE - 1) // ADMINS_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * ADMINS_PAGE_SIZE
+    window = admins[start:start + ADMINS_PAGE_SIZE]
 
-    await render_callback(callback, text, kb)
+    # Детали — в подписях кнопок: текст сообщения держим коротким, чтобы на
+    # сотнях админов он не упирался в лимит Telegram. Кнопки ставим по 2–3
+    # в ряд — иначе сообщение вытягивается в длинную «простыню».
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for offset, a in enumerate(window):
+        i = start + offset + 1
+        status = "🟢" if a.get("active") else "🔴"
+        row.append(InlineKeyboardButton(
+            text=_fit(f"{i}. #{a['tag']} · {status}"),
+            callback_data=f"gadmins_view_{a['user_id']}",
+        ))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    extra_rows = rows
+    extra_rows.extend(_pager_rows("gadmins_list_p", page, total_pages))
+
+    text = (
+        f"📋 <b>Список админов</b> ({len(admins)})\n\n"
+        "🟢 — активен, 🔴 — отключён. Нажми на админа, чтобы открыть карточку."
+    )
+    if total_pages > 1:
+        text += f"\n\n📄 Страница <b>{page}</b> из <b>{total_pages}</b>"
+
+    await render_callback(callback, text, admins_list_kb(extra_rows))
 # ═══════════════ Карточка админа ═══════════════
 
 @router.callback_query(F.data.regexp(r"^gadmins_view_\d+$"))
@@ -360,7 +419,9 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
         text = "📊 <b>Статистика админов</b>\n\nНет админов."
     else:
         lines = []
-        for item in all_stats:
+        # Ограничиваем вывод: на сотнях админов сообщение упиралось в лимит
+        # Telegram и вкладка не открывалась.
+        for item in all_stats[:25]:
             a = item["admin"]
             s = item["stats"]
             t = item["active_topics"]
@@ -373,8 +434,10 @@ async def cb_admins_stats(callback: CallbackQuery, state: FSMContext) -> None:
                 f"    📊 Всего: <b>{s['total']}</b>  "
                 f"👥 ПЗ: <b>{t}</b>"
             )
+        if len(all_stats) > 25:
+            lines.append(f"  … и ещё <b>{len(all_stats) - 25}</b> — смотри «📋 Список»")
         stats_text = "\n\n".join(lines)
-        text = f"📊 <b>Статистика админов</b>\n\n{stats_text}"
+        text = (f"📊 <b>Статистика админов</b> ({len(all_stats)})\n\n{stats_text}")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -468,10 +531,11 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
     text = (
         "➕ <b>Добавить админа</b>\n\n"
-        "Отправь <b>user ID</b>, <b>username</b> и <b>тег</b>.\n\n"
-        "Формат:\n<code>123456789 @username тег</code>\n\n"
-        "Пример:\n<code>123456789 @ivan_admin продажи</code>\n\n"
-        "User ID можно узнать через @userinfobot"
+        "Напиши <b>user ID</b> и <b>тег</b> — этого достаточно.\n\n"
+        "Формат:\n<code>123456789 тег</code>\n\n"
+        "Username не нужен: если он есть, бот подставит его сам.\n"
+        "ID можно узнать через @userinfobot или посмотреть у человека в "
+        "боте — кнопка «➕ Добавить» есть и в списке «🚫 Не в списке»."
     )
 
     if callback.message:
@@ -484,29 +548,50 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminFSM.waiting_add_admin)
 async def fsm_add_admin(message: Message, state: FSMContext) -> None:
+    """Добавление админа. Достаточно user ID и тега — username необязателен."""
     raw = (message.text or "").strip()
-    parts = raw.split(maxsplit=2)
+    parts = raw.split()
 
-    if len(parts) < 3:
-        await message.answer(
-            "❌ Неверный формат.\n\n"
-            "Нужно: <code>user_id @username тег</code>\n"
-            "Пример: <code>123456789 @ivan продажи</code>"
-        )
+    if not parts:
+        await message.answer("❌ Напиши user ID и тег: <code>123456789 тег</code>")
         return
 
+    # Формат 1: «ID тег» — самый частый. Формат 2: «ID @username тег» —
+    # оставлен для совместимости, username берём из него, если он есть.
     try:
-        admin_user_id = int(parts[0])
+        admin_user_id = int(parts[0].lstrip("@"))
     except ValueError:
-        await message.answer("❌ Первый аргумент должен быть числовым user ID.")
+        await message.answer("❌ Первым должен идти числовой user ID.\n\n"
+                             "Формат: <code>123456789 тег</code>")
         return
 
-    username = parts[1].strip().lstrip("@")
-    tag = parts[2].strip().lstrip("#")
+    rest = parts[1:]
+    username = ""
+    # Username — только если он явно помечен «@»: иначе «тег» без собачки
+    # принимался бы за username и тег терялся.
+    if rest and rest[0].startswith("@"):
+        username = rest[0].lstrip("@")
+        rest = rest[1:]
 
+    if not rest:
+        await message.answer("❌ Нужен ещё <b>тег</b> — короткое имя админа.\n\n"
+                             "Формат: <code>123456789 тег</code>")
+        return
+
+    tag = " ".join(rest).strip().lstrip("#")[:16]
     if not tag:
         await message.answer("❌ Тег не может быть пустым.")
         return
+
+    # Username может отсутствовать — подставим из чата админов, если получится.
+    if not username:
+        chat_id = get_bound_chat(msg_uid(message), "admin")
+        if chat_id:
+            try:
+                member = await event_bot(message).get_chat_member(chat_id, admin_user_id)
+                username = getattr(member.user, "username", "") or ""
+            except Exception:
+                username = ""
 
     success = add_admin(msg_uid(message), admin_user_id, username, tag)
     await state.clear()
@@ -515,9 +600,9 @@ async def fsm_add_admin(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"✅ <b>Админ добавлен!</b>\n\n"
             f"🆔 <code>{admin_user_id}</code>\n"
-            f"👤 @{username}\n"
-            f"🏷 #{tag}\n\n"
-            f"Админ привязан ко всем ботам.",
+            + (f"👤 @{username}\n" if username else "")
+            + f"🏷 #{tag}\n\n"
+            "Админ привязан ко всем ботам.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
                 [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
@@ -543,10 +628,14 @@ async def cb_delete_admin(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.set_state(AdminFSM.waiting_delete_admin)
 
+    # Показываем первые 30 админов: у владельца с сотнями админов полный
+    # список не влезал в лимит сообщения Telegram.
     lines = []
-    for a in admins:
+    for a in admins[:30]:
         uname = f"@{a['username']}" if a['username'] else f"ID:{a['user_id']}"
         lines.append(f"  {uname} #{a['tag']}")
+    if len(admins) > 30:
+        lines.append(f"  … и ещё <b>{len(admins) - 30}</b> — смотри «📋 Список»")
 
     admin_list = "\n".join(lines)
 

@@ -116,6 +116,36 @@ def _migrate_bot_category_ask(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE bots ADD COLUMN cat_ask_enabled INTEGER DEFAULT 0")
     if "cat_ask_categories" not in cols:
         conn.execute("ALTER TABLE bots ADD COLUMN cat_ask_categories TEXT DEFAULT ''")
+    if "cat_ask_custom" not in cols:
+        # Свои категории ПЗ (до 3) с пометкой выключенных через префикс «-».
+        conn.execute("ALTER TABLE bots ADD COLUMN cat_ask_custom TEXT DEFAULT ''")
+    conn.commit()
+
+
+def _migrate_bot_admin_change(conn: sqlite3.Connection) -> None:
+    """Лимит смен админа для ПЗ (в сутки) + журнал смен.
+
+    ``admin_change_enabled`` — включено ли ограничение у бота,
+    ``admin_change_limit`` — сколько смен разрешено ПЗ за сутки (по умолчанию 3).
+    Сами смены пишем в ``admin_change_log``, чтобы считать их за текущие сутки.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)").fetchall()]
+    if "admin_change_enabled" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN admin_change_enabled INTEGER DEFAULT 0")
+    if "admin_change_limit" not in cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN admin_change_limit INTEGER DEFAULT 3")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_change_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id        INTEGER NOT NULL,
+            user_chat_id  INTEGER NOT NULL,
+            changed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_admin_change_log "
+        "ON admin_change_log (bot_id, user_chat_id, changed_at)"
+    )
     conn.commit()
 
 
@@ -277,6 +307,7 @@ def ensure_db() -> None:
             welcome_rich TEXT DEFAULT '',
             cat_ask_enabled INTEGER DEFAULT 0,
             cat_ask_categories TEXT DEFAULT '',
+            cat_ask_custom TEXT DEFAULT '',
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -596,12 +627,84 @@ def ensure_db() -> None:
             status     TEXT DEFAULT 'finished',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- Мёртвые боты (авто-детект): токен отозван, бот удалён в BotFather
+        -- или не запускается. Храним причину и время обнаружения, чтобы
+        -- админ-панель показала список и дала удалить их пачкой.
+        CREATE TABLE IF NOT EXISTS dead_bots (
+            bot_id      INTEGER PRIMARY KEY,
+            reason      TEXT DEFAULT '',
+            detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Время работы бота (раздел «🕐 Время работы» в профиле):
+        -- если ПЗ пишет в нерабочее время, бот отвечает ему сам.
+        -- Логи переписки: Telegram не отдаёт историю, поэтому пишем сами.
+        -- Ошибки дочерних ботов: пишем всё, что упало в обработчике,
+        -- чтобы пользователь мог прислать их в поддержку, а владелец платформы —
+        -- посмотреть по конкретному боту.
+        CREATE TABLE IF NOT EXISTS bot_errors (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id      INTEGER NOT NULL,
+            owner_id    INTEGER DEFAULT 0,
+            source      TEXT DEFAULT '',
+            message     TEXT DEFAULT '',
+            detail      TEXT DEFAULT '',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bot_errors_bot
+            ON bot_errors (bot_id, id);
+
+        CREATE TABLE IF NOT EXISTS user_logs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id        INTEGER DEFAULT 0,
+            user_chat_id  INTEGER NOT NULL,
+            direction     TEXT DEFAULT 'in',
+            username      TEXT DEFAULT '',
+            text          TEXT DEFAULT '',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_user_logs_user
+            ON user_logs (user_chat_id, id);
+
+        -- Тикеты поддержки (бывшие жалобы).
+        CREATE TABLE IF NOT EXISTS tickets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            first_name  TEXT DEFAULT '',
+            category    TEXT DEFAULT 'other',
+            text        TEXT DEFAULT '',
+            photos      TEXT DEFAULT '[]',
+            has_logs    INTEGER DEFAULT 0,
+            status      TEXT DEFAULT 'open',
+            answer      TEXT DEFAULT '',
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            closed_at   TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tickets_status
+            ON tickets (status, id);
+
+        CREATE TABLE IF NOT EXISTS work_hours (
+            owner_id     INTEGER PRIMARY KEY,
+            enabled      INTEGER DEFAULT 0,
+            start        TEXT DEFAULT '09:00',
+            end          TEXT DEFAULT '21:00',
+            msg_text     TEXT DEFAULT '',
+            msg_photo    TEXT DEFAULT '',
+            msg_entities TEXT DEFAULT '[]',
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     _migrate_bot_type(conn)
     _migrate_admin_scope(conn)
     _migrate_bot_anonymous(conn)
     _migrate_bot_welcome_media(conn)
     _migrate_bot_category_ask(conn)
+    _migrate_bot_admin_change(conn)
     _migrate_registry_chats(conn)
     _migrate_registry_pending_bind(conn)
     _migrate_admin_invites(conn)
@@ -686,6 +789,8 @@ def remove_user_bot(user_id: int, bot_id: int) -> bool:
         conn.execute("DELETE FROM feedback_chats WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM feedback_topics WHERE bot_id = ?", (bot_id,))
         conn.execute("DELETE FROM feedback_messages WHERE bot_id = ?", (bot_id,))
+        # Удалённый бот не должен «висеть» в списке мёртвых.
+        conn.execute("DELETE FROM dead_bots WHERE bot_id = ?", (bot_id,))
         conn.commit()
         return cur.rowcount > 0
 
@@ -713,6 +818,7 @@ _BOT_FIELDS_WHITELIST = {
     "token", "username", "first_name", "welcome_text",
     "links", "stopped", "antispam_mode", "bot_type", "anonymous_mode",
     "welcome_photo", "welcome_rich", "cat_ask_enabled", "cat_ask_categories",
+    "cat_ask_custom", "admin_change_enabled", "admin_change_limit",
 }
 
 
@@ -802,6 +908,171 @@ def set_cat_ask_categories(user_id: int, bot_id: int, categories: list[str]) -> 
     if not clean:
         clean = list(DEFAULT_PZ_CATEGORIES)
     return update_bot_field(user_id, bot_id, "cat_ask_categories", ",".join(clean))
+
+
+# ═══════════════════════════════════════════════════════════
+#  Свои категории ПЗ (до 3): добавление, вкл/выкл, удаление
+# ═══════════════════════════════════════════════════════════
+
+# Больше трёх своих категорий не добавляем: иначе сообщение ПЗ с кнопками
+# растягивается и выглядит «простынёй».
+MAX_CUSTOM_CATEGORIES = 3
+
+
+def get_cat_custom(user_id: int, bot_id: int) -> list[dict]:
+    """Свои категории ПЗ: ``[{"name": ..., "active": bool}, ...]``.
+
+    Храним в колонке ``cat_ask_custom`` списком через запятую; выключенные
+    помечаем префиксом ``-`` (например ``-реклама, жалоба``).
+    """
+    bot = get_bot_by_id(user_id, bot_id)
+    if not bot:
+        return []
+    raw = str(bot.get("cat_ask_custom") or "").strip()
+    result: list[dict] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name:
+            continue
+        active = True
+        if name.startswith("-"):
+            active, name = False, name[1:].strip()
+        if name:
+            result.append({"name": name.lower(), "active": active})
+    return result
+
+
+def set_cat_custom(user_id: int, bot_id: int, items: list[dict]) -> bool:
+    """Сохраняет список своих категорий с их состоянием (вкл/выкл)."""
+    parts: list[str] = []
+    for item in items:
+        name = str(item.get("name") or "").strip().lower().lstrip("#")
+        if not name:
+            continue
+        parts.append(name if item.get("active", True) else f"-{name}")
+    return update_bot_field(
+        user_id, bot_id, "cat_ask_custom", ",".join(parts[:MAX_CUSTOM_CATEGORIES])
+    )
+
+
+def add_custom_category(user_id: int, bot_id: int, name: str) -> tuple[bool, str]:
+    """Добавляет свою категорию. Возвращает ``(получилось, текст ответа)``."""
+    clean = str(name or "").strip().lstrip("#").lower()
+    if not clean:
+        return False, "❌ Название не может быть пустым."
+    if len(clean) > 24:
+        clean = clean[:24]
+
+    current = get_cat_custom(user_id, bot_id)
+    if any(item["name"] == clean for item in current):
+        return False, f"⚠️ Категория «{clean}» уже есть."
+    if len(current) >= MAX_CUSTOM_CATEGORIES:
+        return False, (
+            f"⚠️ Больше {MAX_CUSTOM_CATEGORIES} своих категорий добавить нельзя.\n"
+            "Удали или переименуй одну из текущих."
+        )
+
+    current.append({"name": clean, "active": True})
+    set_cat_custom(user_id, bot_id, current)
+    return True, f"✅ Категория «{clean}» добавлена."
+
+
+def remove_custom_category(user_id: int, bot_id: int, name: str) -> bool:
+    """Удаляет свою категорию по имени."""
+    target = str(name or "").strip().lstrip("#").lower()
+    current = get_cat_custom(user_id, bot_id)
+    left = [item for item in current if item["name"] != target]
+    if len(left) == len(current):
+        return False
+    set_cat_custom(user_id, bot_id, left)
+    return True
+
+
+def toggle_custom_category(user_id: int, bot_id: int, name: str) -> tuple[bool, bool]:
+    """Включает/выключает свою категорию. Возвращает ``(нашлась, активна)``."""
+    target = str(name or "").strip().lstrip("#").lower()
+    current = get_cat_custom(user_id, bot_id)
+    if not any(item["name"] == target for item in current):
+        return False, False
+    for item in current:
+        if item["name"] == target:
+            item["active"] = not item["active"]
+            break
+    set_cat_custom(user_id, bot_id, current)
+    return True, bool(next(i["active"] for i in current if i["name"] == target))
+
+
+def get_categories_for_pz(user_id: int, bot_id: int) -> list[str]:
+    """Итоговый список категорий, которые бот предложит ПЗ."""
+    _enabled, base = get_cat_ask_settings(bot_id)
+    result = list(base)
+    for item in get_cat_custom(user_id, bot_id):
+        if item["active"] and item["name"] not in result:
+            result.append(item["name"])
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+#  Лимит смен админа для ПЗ (в сутки)
+# ═══════════════════════════════════════════════════════════
+
+DEFAULT_ADMIN_CHANGE_LIMIT = 3
+MAX_ADMIN_CHANGE_LIMIT = 20
+
+
+def get_admin_change_settings(bot_id: int) -> tuple[bool, int]:
+    """Настройки лимита смен админа: ``(включено, сколько смен в сутки)``."""
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        return False, DEFAULT_ADMIN_CHANGE_LIMIT
+    enabled = bool(bot.get("admin_change_enabled", 0))
+    try:
+        limit = int(bot.get("admin_change_limit") or DEFAULT_ADMIN_CHANGE_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEFAULT_ADMIN_CHANGE_LIMIT
+    return enabled, max(1, min(limit, MAX_ADMIN_CHANGE_LIMIT))
+
+
+def set_admin_change_enabled(user_id: int, bot_id: int, enabled: bool) -> bool:
+    return update_bot_field(user_id, bot_id, "admin_change_enabled", 1 if enabled else 0)
+
+
+def set_admin_change_limit(user_id: int, bot_id: int, limit: int) -> bool:
+    value = max(1, min(int(limit), MAX_ADMIN_CHANGE_LIMIT))
+    return update_bot_field(user_id, bot_id, "admin_change_limit", value)
+
+
+def count_admin_changes_today(bot_id: int, user_chat_id: int) -> int:
+    """Сколько раз ПЗ менял админа за последние сутки."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM admin_change_log "
+        "WHERE bot_id = ? AND user_chat_id = ? "
+        "AND changed_at >= datetime('now', '-1 day')",
+        (bot_id, user_chat_id),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def log_admin_change(bot_id: int, user_chat_id: int) -> None:
+    """Записывает смену админа (для подсчёта суточного лимита)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO admin_change_log (bot_id, user_chat_id) VALUES (?, ?)",
+            (bot_id, user_chat_id),
+        )
+        # Подчищаем старые записи, чтобы таблица не росла бесконечно.
+        conn.execute("DELETE FROM admin_change_log WHERE changed_at < datetime('now', '-7 day')")
+        conn.commit()
+
+
+def admin_changes_left(bot_id: int, user_chat_id: int) -> int:
+    """Сколько смен осталось ПЗ сегодня; -1 — ограничение выключено."""
+    enabled, limit = get_admin_change_settings(bot_id)
+    if not enabled:
+        return -1
+    return max(0, limit - count_admin_changes_today(bot_id, user_chat_id))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1290,6 +1561,19 @@ def get_feedback_chat(bot_id: int) -> int | None:
     return row[0] if row else None
 
 
+def clear_feedback_chat(bot_id: int) -> bool:
+    """Отвязывает бота от рабочего чата (кнопка «🔗 Перепривязка»).
+
+    Возвращает True, если привязка была и теперь снята. История ПЗ и сами
+    топики не трогаем — бот просто сможет подключиться к новому чату.
+    """
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute("DELETE FROM feedback_chats WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def get_topic_by_user(bot_id: int, user_chat_id: int) -> dict | None:
     conn = _get_conn()
     row = conn.execute(
@@ -1425,6 +1709,102 @@ def get_feedback_msg_by_user_msg(bot_id: int, user_chat_id: int, user_msg_id: in
         (bot_id, user_chat_id, user_msg_id)
     ).fetchone()
     return dict(row) if row else None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Время работы бота (профиль владельца)
+# ═══════════════════════════════════════════════════════════
+# Если ПЗ пишет в нерабочее время, бот сам отвечает ему: «бот работает с …,
+# если кто-то из админов свободен — обязательно ответит». Настройка общая
+# для всех ботов владельца, как и остальные разделы профиля.
+
+DEFAULT_WORK_START = "09:00"
+DEFAULT_WORK_END = "21:00"
+DEFAULT_WORK_MESSAGE = (
+    "Извините, наш бот работает с {start} до {end}! "
+    "Многие админы заняты или уже спят, но если кто-то будет свободен — "
+    "обязательно вам напишет 🤍"
+)
+
+
+def get_work_hours(owner_id: int) -> dict:
+    """Настройки времени работы: включено, начало, конец, текст/фото ответа."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM work_hours WHERE owner_id = ?", (owner_id,)
+    ).fetchone()
+    if not row:
+        return {
+            "enabled": 0,
+            "start": DEFAULT_WORK_START,
+            "end": DEFAULT_WORK_END,
+            "msg_text": DEFAULT_WORK_MESSAGE,
+            "msg_photo": "",
+            "msg_entities": "[]",
+        }
+    return dict(row)
+
+
+def set_work_hours_enabled(owner_id: int, enabled: bool) -> None:
+    _save_work_hours(owner_id, {"enabled": 1 if enabled else 0})
+
+
+def set_work_hours_time(owner_id: int, start: str, end: str) -> None:
+    _save_work_hours(owner_id, {"start": start, "end": end})
+
+
+def set_work_hours_message(owner_id: int, text: str, photo: str = "",
+                            entities: str = "[]") -> None:
+    _save_work_hours(owner_id, {"msg_text": text, "msg_photo": photo, "msg_entities": entities})
+
+
+def _save_work_hours(owner_id: int, values: dict) -> None:
+    """Обновляет только переданные поля записи времени работы."""
+    if not values:
+        return
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO work_hours (owner_id) VALUES (?) "
+            "ON CONFLICT(owner_id) DO NOTHING",
+            (owner_id,),
+        )
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        conn.execute(
+            f"UPDATE work_hours SET {assignments} WHERE owner_id = ?",
+            (*values.values(), owner_id),
+        )
+        conn.commit()
+
+
+def is_within_work_hours(owner_id: int, now: datetime | None = None) -> bool:
+    """Сейчас «рабочее» время бота? Поддерживается интервал через полночь."""
+    settings = get_work_hours(owner_id)
+    if not settings.get("enabled"):
+        return True
+
+    def _parse(value: str) -> tuple[int, int] | None:
+        try:
+            hh, mm = str(value or "").strip().split(":")
+            return int(hh), int(mm)
+        except (ValueError, AttributeError):
+            return None
+
+    start = _parse(settings.get("start", ""))
+    end = _parse(settings.get("end", ""))
+    if start is None or end is None:
+        return True  # кривые настройки — работаем всегда
+
+    current = (now or datetime.now()).hour * 60 + (now or datetime.now()).minute
+    start_min = start[0] * 60 + start[1]
+    end_min = end[0] * 60 + end[1]
+
+    if start_min == end_min:
+        return True  # круглосуточно
+    if start_min < end_min:
+        return start_min <= current < end_min
+    # Интервал через полночь, например 22:00–08:00.
+    return current >= start_min or current < end_min
 
 # ═══════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════
@@ -3314,3 +3694,288 @@ def get_channel_bind_request(max_age_seconds: int = 900) -> int | None:
         (f"-{int(max_age_seconds)} seconds",),
     ).fetchone()
     return int(row[0]) if row else None
+
+
+# ═══════════════════════════════════════════════════════════
+#  Мёртвые боты (авто-детект + удаление пачкой)
+# ═══════════════════════════════════════════════════════════
+
+def mark_bot_dead(bot_id: int, reason: str = "unauthorized") -> None:
+    """Помечает бота «мёртвым»: токен не работает / бот удалён.
+
+    Повторный вызов обновляет причину и время обнаружения (бот «ожил» —
+    см. :func:`clear_bot_dead`).
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO dead_bots (bot_id, reason, detected_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(bot_id) DO UPDATE SET reason=excluded.reason, "
+            "detected_at=CURRENT_TIMESTAMP",
+            (bot_id, reason or "unauthorized"),
+        )
+        conn.commit()
+
+
+def clear_bot_dead(bot_id: int) -> None:
+    """Снимает пометку «мёртвый» (бот снова отвечает)."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute("DELETE FROM dead_bots WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+
+
+def is_bot_dead(bot_id: int) -> bool:
+    conn = _get_conn()
+    row = conn.execute("SELECT 1 FROM dead_bots WHERE bot_id = ?", (bot_id,)).fetchone()
+    return bool(row)
+
+
+def get_dead_bots() -> list[dict]:
+    """Список помеченных «мёртвых» ботов вместе с данными бота и владельца.
+
+    Боты, уже удалённые из панели, в список не попадают (запись без бота
+    бесполезна) — такие «хвосты» вычищаются на месте.
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT d.bot_id, d.reason, d.detected_at, "
+        "       b.username, b.first_name, b.owner_id "
+        "FROM dead_bots AS d JOIN bots AS b ON b.id = d.bot_id "
+        "ORDER BY d.detected_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_dead_bots() -> list[int]:
+    """Удаляет всех помеченных «мёртвых» ботов вместе с их данными.
+
+    Возвращает список удалённых bot_id (чтобы вызывающий код мог остановить
+    их опрос в менеджере дочерних ботов).
+    """
+    removed = [int(row["bot_id"]) for row in get_dead_bots()]
+    for bot_id in removed:
+        owner_id = get_bot_owner(bot_id)
+        if owner_id:
+            remove_user_bot(int(owner_id), bot_id)
+        else:
+            conn = _get_conn()
+            with _lock:
+                conn.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+                conn.commit()
+        clear_bot_dead(bot_id)
+    return removed
+
+# ═══════════════════════════════════════════════════════════
+#  Логи переписки (раздел «Логи» и техподдержка)
+# ═══════════════════════════════════════════════════════════
+# Telegram не умеет отдавать историю сообщений, поэтому тексты ПЗ и ответов
+# админов пишем сами — иначе «пришли логи» было бы нечем.
+
+LOG_MAX_CHARS = 2500
+LOG_MAX_MESSAGES = 40
+
+
+def save_log_message(bot_id: int, user_chat_id: int, direction: str,
+                     text: str, username: str = "") -> None:
+    """Сохраняет текст сообщения (in — от ПЗ, out — ответ админа)."""
+    clean = (text or "").strip()
+    if not clean:
+        return
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO user_logs (bot_id, user_chat_id, direction, text, username) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (bot_id, user_chat_id, direction, clean[:2000], username or ""),
+        )
+        # Подчищаем старое, чтобы таблица не росла бесконечно.
+        conn.execute(
+            "DELETE FROM user_logs WHERE id NOT IN "
+            "(SELECT id FROM user_logs ORDER BY id DESC LIMIT 2000)"
+        )
+        conn.commit()
+
+
+def get_user_logs(user_chat_id: int, limit: int = LOG_MAX_MESSAGES) -> list[dict]:
+    """Последние сообщения пользователя (его тексты и ответы админов)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM user_logs WHERE user_chat_id = ? ORDER BY id DESC LIMIT ?",
+        (user_chat_id, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def format_user_logs(user_chat_id: int, limit: int = LOG_MAX_MESSAGES) -> str:
+    """Готовый текст логов для отправки в цитировании и свёрнутом виде."""
+    logs = get_user_logs(user_chat_id, limit)
+    if not logs:
+        return "Логов пока нет: в этом боте ещё не было переписки."
+
+    lines: list[str] = []
+    size = 0
+    for item in logs:
+        who = "Пользователь" if item["direction"] == "in" else "Админ"
+        text = " ".join(str(item["text"]).split())[:300]
+        line = f"{who}: {text}"
+        if size + len(line) > LOG_MAX_CHARS:
+            lines.append("…")
+            break
+        lines.append(line)
+        size += len(line)
+    return "\n\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Тикеты поддержки (бывшие жалобы)
+# ═══════════════════════════════════════════════════════════
+
+TICKET_CATEGORIES: tuple[tuple[str, str], ...] = (
+    ("tech", "❓ Тех. вопрос"),
+    ("complaint", "⚠️ Жалоба"),
+    ("review", "⭐ Отзыв"),
+    ("other", "📦 Другое"),
+)
+
+TICKET_CATEGORY_TITLES: dict[str, str] = dict(TICKET_CATEGORIES)
+
+
+def create_ticket(user_id: int, category: str, text: str,
+                  photos: list[str] | None = None, has_logs: bool = False,
+                  username: str = "", first_name: str = "") -> int:
+    """Создаёт тикет и возвращает его ID."""
+    conn = _get_conn()
+    with _lock:
+        cursor = conn.execute(
+            "INSERT INTO tickets (user_id, username, first_name, category, text, "
+            "photos, has_logs, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')",
+            (user_id, username or "", first_name or "", category or "other",
+             text or "", json.dumps(photos or [], ensure_ascii=False),
+             1 if has_logs else 0),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def get_ticket(ticket_id: int) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def ticket_photos(ticket: dict) -> list[str]:
+    """Фото тикета (могут прийти как file_id — их бот видит в своей БД)."""
+    try:
+        data = json.loads(ticket.get("photos") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
+
+
+def get_user_tickets(user_id: int, status: str = "open") -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM tickets WHERE user_id = ? AND status = ? ORDER BY id DESC LIMIT 50",
+        (user_id, status),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_tickets(status: str = "open", limit: int = 50) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT ?",
+        (status, int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_ticket(ticket_id: int, answer: str = "") -> bool:
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE tickets SET status = 'closed', answer = ?, "
+            "closed_at = datetime('now') WHERE id = ?",
+            (answer or "", ticket_id),
+        )
+        conn.commit()
+    return True
+
+
+def ticket_counts() -> dict[str, int]:
+    conn = _get_conn()
+    rows = conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall()
+    counts = {"open": 0, "closed": 0}
+    for status, total in rows:
+        counts[str(status)] = int(total)
+    return counts
+
+
+# ═══════════════════════════════════════════════════════════
+#  Журнал ошибок ботов
+# ═══════════════════════════════════════════════════════════
+
+ERRORS_PER_BOT = 25
+
+
+def save_bot_error(bot_id: int, message: str, detail: str = "",
+                   owner_id: int = 0, source: str = "") -> None:
+    """Записывает ошибку обработчика конкретного бота."""
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "INSERT INTO bot_errors (bot_id, owner_id, source, message, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(bot_id), int(owner_id or 0), (source or "")[:60],
+             (message or "")[:300], (detail or "")[:1500]),
+        )
+        # Держим только последние записи по каждому боту.
+        conn.execute(
+            "DELETE FROM bot_errors WHERE bot_id = ? AND id NOT IN "
+            "(SELECT id FROM bot_errors WHERE bot_id = ? ORDER BY id DESC LIMIT ?)",
+            (int(bot_id), int(bot_id), 100),
+        )
+        conn.commit()
+
+
+def get_bot_errors(bot_id: int, limit: int = ERRORS_PER_BOT) -> list[dict]:
+    """Последние ошибки бота — свежие сверху."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bot_errors WHERE bot_id = ? ORDER BY id DESC LIMIT ?",
+        (int(bot_id), int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_owner_bot_errors(owner_id: int, limit: int = ERRORS_PER_BOT) -> list[dict]:
+    """Ошибки всех ботов пользователя (свежие сверху)."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bot_errors WHERE owner_id = ? ORDER BY id DESC LIMIT ?",
+        (int(owner_id), int(limit)),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def format_bot_errors(entries: list[dict]) -> str:
+    """Готовый текст журнала ошибок для свёрнутого блока."""
+    if not entries:
+        return "Ошибок не зафиксировано — бот работает штатно."
+
+    lines: list[str] = []
+    size = 0
+    for item in entries:
+        head = f"{str(item.get('created_at') or '')[:19]} · {item.get('message') or ''}"
+        block = f"⚠️ {head}"
+        detail = " ".join(str(item.get("detail") or "").split())[:400]
+        if detail:
+            block += f"\n    {detail}"
+        if size + len(block) > LOG_MAX_CHARS:
+            lines.append("…")
+            break
+        lines.append(block)
+        size += len(block)
+    return "\n\n".join(lines)

@@ -124,7 +124,7 @@ def antiraid_kb(owner_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔢 Количество заходов", callback_data="antiraid_threshold", style="primary")],
         [InlineKeyboardButton(text="🔗 Удаление ссылок", callback_data="antiraid_links_ask", style="primary")],
         [InlineKeyboardButton(text="👥 Удаление зашедших", callback_data="antiraid_members_ask", style="primary")],
-        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+        [InlineKeyboardButton(text="⬅️ Защита", callback_data="profile_protection")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -791,7 +791,7 @@ async def notify_antiraid_promoted_if_bound(event: ChatMemberUpdated) -> None:
         try:
             await bot.send_message(
                 owner_id,
-                f"🛡 <b>Антирейд теперь полностью активен!</b>\n\n"
+                "🛡 <b>Антирейд теперь полностью активен!</b>\n\n"
                 "YamoBot получил права администратора в чате админов — "
                 "видит заходы и сообщения, может блокировать нарушителей.\n\n"
                 "Если защита была отключена с пометкой «не хватает прав» — "

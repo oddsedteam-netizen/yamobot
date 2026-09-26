@@ -1,11 +1,16 @@
+import logging
+
 from aiogram import Router, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 
-from handlers._common import render_callback, safe_edit, cb_data, cb_uid, try_edit
+from handlers._common import render_callback, safe_edit, cb_data, cb_uid, try_edit, msg_uid
 from services.storage import (
     get_user_bots,
     get_bot_by_id,
@@ -17,15 +22,33 @@ from services.storage import (
     set_antispam_mode,
     set_bot_anonymous,
     get_bound_chat,
+    get_feedback_chat,
+    clear_feedback_chat,
     get_cat_ask_settings,
     set_cat_ask_enabled,
     set_cat_ask_categories,
+    get_cat_custom,
+    add_custom_category,
+    remove_custom_category,
+    toggle_custom_category,
+    get_admin_change_settings,
+    set_admin_change_enabled,
+    set_admin_change_limit,
+    DEFAULT_ADMIN_CHANGE_LIMIT,
+    MAX_ADMIN_CHANGE_LIMIT,
+    MAX_CUSTOM_CATEGORIES,
     DEFAULT_PZ_CATEGORIES,
 )
 from services.child_manager import ChildManager
 from handlers.my_bots import my_bots_kb
 
 router = Router()
+logger = logging.getLogger(__name__)
+
+
+class BotActionsFSM(StatesGroup):
+    waiting_custom_cat = State()   # ввод названия своей категории
+    waiting_change_limit = State()  # ввод лимита смен админа
 
 
 # Клавиатура, когда нужно вернуть юзера в главное меню (inline).
@@ -61,27 +84,44 @@ def _single_bot_text(bot_info: dict, is_running: bool) -> str:
 
 
 def single_bot_kb(bot_id: int, is_running: bool, anon_mode: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура карточки бота.
+
+    Раскладка «сверху вниз»: сверху самые частые и крупные кнопки
+    (рассылка, редактор, статистика), ниже мелкие парами (антиспам/аноним,
+    ПЗ/конфиг), в самом конце — опасные действия (остановка, удаление).
+    Кнопка на всю ширину = «крупная», две в ряд = «мелкие».
+    """
     stop_text = "⛔ Остановить" if is_running else "▶️ Запустить"
     stop_data = f"action_stop_{bot_id}" if is_running else f"action_start_{bot_id}"
+    stop_style = "danger" if is_running else "success"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            # ── Крупные кнопки ──
+            [InlineKeyboardButton(text="📨 Рассылка", callback_data=f"mailing_{bot_id}")],
+            [InlineKeyboardButton(text="✏️ Редактор", callback_data=f"editor_{bot_id}",
+                                  style="success")],
             [
-                InlineKeyboardButton(text="📨 Рассылка", callback_data=f"mailing_{bot_id}", style="primary"),
-                InlineKeyboardButton(text="🛡 Антиспам", callback_data=f"antispam_{bot_id}", style="primary"),
-                InlineKeyboardButton(text="🕶 Аноним", callback_data=f"action_anon_{bot_id}", style="primary"),
+                InlineKeyboardButton(text="🛡 Антиспам", callback_data=f"antispam_{bot_id}",
+                                     style="success"),
+                InlineKeyboardButton(text="🕶 Аноним", callback_data=f"action_anon_{bot_id}",
+                                     style="primary"),
             ],
-            [InlineKeyboardButton(text=stop_text, callback_data=stop_data, style=("danger" if is_running else "success"))],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_{bot_id}",
+                                  style="success")],
             [
-                InlineKeyboardButton(text="📊 Статистика", callback_data=f"stats_{bot_id}", style="primary"),
-                InlineKeyboardButton(text="✏️ Редактор", callback_data=f"editor_{bot_id}", style="primary"),
-                InlineKeyboardButton(text="📋 ПЗ", callback_data=f"pz_{bot_id}", style="primary"),
+                InlineKeyboardButton(text="📋 ПЗ", callback_data=f"pz_{bot_id}"),
+                InlineKeyboardButton(text="⚙️ Конфиг", callback_data=f"cfg_menu_{bot_id}"),
             ],
-            [InlineKeyboardButton(text="⚙️ Конфиг", callback_data=f"cfg_menu_{bot_id}",
-                                  style="primary")],
             [InlineKeyboardButton(text="🏷 Уточнение категории", callback_data=f"catask_{bot_id}",
+                                  style="success")],
+            [InlineKeyboardButton(text="🔄 Смена админа", callback_data=f"admchg_{bot_id}",
                                   style="primary")],
-            [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"action_delete_{bot_id}", style="danger")],
+            [InlineKeyboardButton(text="🔗 Перепривязка", callback_data=f"rebind_{bot_id}",
+                                  style="primary")],
+            [InlineKeyboardButton(text=stop_text, callback_data=stop_data, style=stop_style)],
+            [InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"action_delete_{bot_id}",
+                                  style="danger")],
             [InlineKeyboardButton(text="⬅️ Назад к ботам", callback_data="my_bots", style="primary")],
         ]
     )
@@ -451,9 +491,177 @@ def cat_ask_list_kb(bot_id: int, catalog: list[str],
             InlineKeyboardButton(text=f"{mark} #{name}",
                                  callback_data=f"catask_cat_{bot_id}_{index}"),
         ])
+    rows.append([InlineKeyboardButton(text="➕ Свои категории",
+                                      callback_data=f"catown_list_{bot_id}",
+                                      style="success")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"catask_{bot_id}",
                                       style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ═══════════════ Свои категории (до 3): добавить / выключить / удалить ═══════════════
+
+CUSTOM_CATS_TEXT = (
+    "➕ <b>Свои категории</b>\n\n"
+    f"Можно добавить до <b>{MAX_CUSTOM_CATEGORIES}</b> своих категорий к "
+    "стандартным. Выключенные (<b>⚪</b>) бот ПЗ не предлагает, удалённые "
+    "исчезают совсем.\n\n"
+    "Кнопки в сообщении ПЗ выстраиваются компактно, поэтому длинные названия "
+    "не растягивают сообщение."
+)
+
+
+def custom_cats_kb(bot_id: int, items: list[dict]) -> InlineKeyboardMarkup:
+    """Список своих категорий с переключателем и удалением."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, item in enumerate(items):
+        name = item["name"]
+        mark = "🟢" if item.get("active") else "⚪"
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} #{name}",
+                                 callback_data=f"catown_toggle_{bot_id}_{index}",
+                                 style="success" if item.get("active") else None),
+            InlineKeyboardButton(text="🗑", callback_data=f"catown_del_{bot_id}_{index}",
+                                 style="danger"),
+        ])
+    if len(items) < MAX_CUSTOM_CATEGORIES:
+        rows.append([InlineKeyboardButton(text="➕ Добавить категорию",
+                                          callback_data=f"catown_add_{bot_id}",
+                                          style="success")])
+    rows.append([InlineKeyboardButton(text="⬅️ К стандартным",
+                                      callback_data=f"catask_cats_{bot_id}", style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _custom_cats_text(items: list[dict]) -> str:
+    text = CUSTOM_CATS_TEXT
+    if not items:
+        return text + "\n\nПока своих категорий нет."
+    text += "\n\n" + "\n".join(
+        f"  • <b>#{item['name']}</b> — {'включена' if item['active'] else 'выключена'}"
+        for item in items
+    )
+    return text
+
+
+def _safe_int(value: str | None, default: int = 0) -> int:
+    """Мягкое приведение к int: битая кнопка не должна ронять бота."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+@router.callback_query(F.data.startswith("catown_"))
+async def cb_catown(callback: CallbackQuery, state: FSMContext) -> None:
+    """Свои категории: список, добавление, вкл/выкл, удаление.
+
+    Разбор callback_data строго по месту: у «catown_list_12» номер бота стоит
+    в конце, а у «catown_toggle_12_0» — на втором месте, поэтому берём его
+    по позиции действия, а не «как попалось».
+    """
+    data = cb_data(callback)
+    user_id = cb_uid(callback)
+
+    # ВНИМАНИЕ: разделять по «_» нельзя — в имени действия есть подчёркивание
+    # («catown_list_12» → ['catown', 'list', '12']). Поэтому действие узнаём по
+    # префиксу, а номер бота всегда берём с конца строки.
+    for action in ("catown_list", "catown_back", "catown_add",
+                   "catown_toggle", "catown_del"):
+        if data.startswith(f"{action}_"):
+            break
+    else:
+        return
+
+    if action in ("catown_add", "catown_back", "catown_list"):
+        bot_id = _safe_int(data.rsplit("_", 1)[-1])
+        if not get_bot_by_id(user_id, bot_id):
+            await callback.answer("⚠️ Бот не найден", show_alert=True)
+            return
+
+        if action == "catown_add":
+            if len(get_cat_custom(user_id, bot_id)) >= MAX_CUSTOM_CATEGORIES:
+                await callback.answer(
+                    f"⚠️ Уже добавлено {MAX_CUSTOM_CATEGORIES} категорий — это лимит",
+                    show_alert=True,
+                )
+                return
+            await state.set_state(BotActionsFSM.waiting_custom_cat)
+            await state.update_data(catown_bot_id=bot_id)
+            await render_callback(
+                callback,
+                "➕ <b>Новая категория</b>\n\n"
+                "Напиши <b>название</b> — одним словом или короткой фразой.\n\n"
+                f"Добавить можно не больше {MAX_CUSTOM_CATEGORIES} своих категорий.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена",
+                                          callback_data=f"catown_back_{bot_id}",
+                                          style="primary")]
+                ]),
+            )
+            await callback.answer()
+            return
+
+        if action == "catown_back":
+            _enabled, base = get_cat_ask_settings(bot_id)
+            await render_callback(callback, CAT_ASK_LIST_TEXT,
+                                  cat_ask_list_kb(bot_id, cat_ask_catalog(base), base))
+            return
+
+        items = get_cat_custom(user_id, bot_id)
+        await render_callback(callback, _custom_cats_text(items),
+                              custom_cats_kb(bot_id, items))
+        return
+
+    # Действия с индексом: catown_toggle_<bot_id>_<index>, catown_del_<bot_id>_<index>
+    tail = data[len(action) + 1:].split("_")
+    bot_id = _safe_int(tail[0] if tail else None)
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    items = get_cat_custom(user_id, bot_id)
+    index = _safe_int(tail[1] if len(tail) > 1 else None, -1)
+    if not (0 <= index < len(items)):
+        await callback.answer("⚠️ Категория не найдена", show_alert=True)
+        return
+
+    if action == "catown_toggle":
+        toggle_custom_category(user_id, bot_id, items[index]["name"])
+        items = get_cat_custom(user_id, bot_id)
+        await callback.answer(
+            "🟢 Включено" if items[index]["active"] else "⚪ Выключено"
+        )
+    elif action == "catown_del":
+        remove_custom_category(user_id, bot_id, items[index]["name"])
+        items = get_cat_custom(user_id, bot_id)
+        await callback.answer("🗑 Категория удалена")
+
+    await render_callback(callback, _custom_cats_text(items), custom_cats_kb(bot_id, items))
+
+
+@router.message(BotActionsFSM.waiting_custom_cat)
+async def fsm_custom_cat(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    user_id = msg_uid(message)
+    bot_id = int(data.get("catown_bot_id", 0))
+
+    if not get_bot_by_id(user_id, bot_id):
+        await state.clear()
+        await message.answer("⚠️ Бот не найден")
+        return
+
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("❌ Название не может быть пустым. Напиши его ещё раз.")
+        return
+
+    _ok, answer = add_custom_category(user_id, bot_id, name)
+    await state.clear()
+
+    items = get_cat_custom(user_id, bot_id)
+    await message.answer(f"{answer}\n\n{_custom_cats_text(items)}",
+                         reply_markup=custom_cats_kb(bot_id, items))
 
 
 CAT_ASK_LIST_TEXT = (
@@ -560,3 +768,221 @@ async def cb_cat_ask_cat_toggle(callback: CallbackQuery) -> None:
     _enabled, categories = get_cat_ask_settings(bot_id)
     await safe_edit(callback.message, CAT_ASK_LIST_TEXT,
                     cat_ask_list_kb(bot_id, catalog, categories))
+
+
+# ═══════════════ Смена админа: лимит смен для ПЗ в сутки ═══════════════
+
+def _adm_change_text(bot_id: int) -> str:
+    enabled, limit = get_admin_change_settings(bot_id)
+    status = "🟢 включено" if enabled else "⚪ выключено"
+    return (
+        "🔄 <b>Смена админа</b>\n\n"
+        "Если юзеру не ответил админ, он может попросить заменить его — кнопкой "
+        "«сменить админа» или командой в боте. Так можно бесконечно дёргать "
+        "админов, поэтому бот ставит <b>ограничение на количество смен в "
+        "сутки</b>.\n\n"
+        f"📊 По умолчанию разрешено <b>{DEFAULT_ADMIN_CHANGE_LIMIT} смен</b> в "
+        "сутки, число можно изменить. Когда лимит исчерпан, ПЗ покажет, что "
+        "смены на сегодня закончились, и счётчик обнулится через сутки.\n\n"
+        f"📌 Сейчас: <b>{status}</b>"
+        + (f", лимит — <b>{limit}</b> смен в сутки.\n\n" if enabled else ".\n\n")
+        + "Когда выключено — смены не ограничены вовсе."
+    )
+
+
+def _adm_change_kb(bot_id: int) -> InlineKeyboardMarkup:
+    enabled, limit = get_admin_change_settings(bot_id)
+    toggle = InlineKeyboardButton(
+        text="🔴 Выключить" if enabled else "🟢 Включить",
+        callback_data=f"admchg_set_{bot_id}_{0 if enabled else 1}",
+        style="danger" if enabled else "success",
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [toggle],
+        [InlineKeyboardButton(text=f"🔢 Сколько смен в сутки (сейчас {limit})",
+                              callback_data=f"admchg_num_{bot_id}", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}",
+                              style="primary")],
+    ])
+
+
+@router.callback_query(F.data.regexp(r"^admchg_\d+$"))
+async def cb_adm_change(callback: CallbackQuery) -> None:
+    """Экран «🔄 Смена админа»: объяснение + вкл/выкл + количество."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    if not get_bot_by_id(cb_uid(callback), bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+    await render_callback(callback, _adm_change_text(bot_id), _adm_change_kb(bot_id))
+
+
+@router.callback_query(F.data.regexp(r"^admchg_set_\d+_[01]$"))
+async def cb_adm_change_toggle(callback: CallbackQuery) -> None:
+    """Включает/выключает ограничение смен админа."""
+    data = cb_data(callback)
+    bot_id = int(data.split("_")[2])
+    enabled = data.endswith("_1")
+    user_id = cb_uid(callback)
+
+    if not get_bot_by_id(user_id, bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    set_admin_change_enabled(user_id, bot_id, enabled)
+    await callback.answer("🟢 Включено" if enabled else "🔴 Выключено")
+    await render_callback(callback, _adm_change_text(bot_id), _adm_change_kb(bot_id))
+
+
+@router.callback_query(F.data.regexp(r"^admchg_num_\d+$"))
+async def cb_adm_change_num(callback: CallbackQuery, state: FSMContext) -> None:
+    """Просит новое количество смен в сутки."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    if not get_bot_by_id(cb_uid(callback), bot_id):
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    await state.set_state(BotActionsFSM.waiting_change_limit)
+    await state.update_data(admchg_bot_id=bot_id)
+    await render_callback(
+        callback,
+        "🔢 <b>Сколько смен разрешить в сутки?</b>\n\n"
+        "Напиши число от <b>1</b> до "
+        f"<b>{MAX_ADMIN_CHANGE_LIMIT}</b>.\n\n"
+        f"Например: <code>{DEFAULT_ADMIN_CHANGE_LIMIT}</code> — это значение "
+        "по умолчанию.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admchg_{bot_id}",
+                                  style="primary")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(BotActionsFSM.waiting_change_limit)
+async def fsm_adm_change_limit(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    user_id = msg_uid(message)
+    bot_id = int(data.get("admchg_bot_id", 0))
+
+    if not get_bot_by_id(user_id, bot_id):
+        await state.clear()
+        await message.answer("⚠️ Бот не найден")
+        return
+
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("❌ Нужно число. Напиши его ещё раз.")
+        return
+
+    value = int(raw)
+    if not (1 <= value <= MAX_ADMIN_CHANGE_LIMIT):
+        await message.answer(
+            f"❌ Число должно быть от 1 до {MAX_ADMIN_CHANGE_LIMIT}. Напиши ещё раз."
+        )
+        return
+
+    set_admin_change_limit(user_id, bot_id, value)
+    set_admin_change_enabled(user_id, bot_id, True)
+    await state.clear()
+    await message.answer(
+        f"✅ Сохранено: <b>{value}</b> смен в сутки, ограничение включено.",
+        reply_markup=_adm_change_kb(bot_id),
+    )
+
+
+# ═══════════════ Перепривязка к другому рабочему чату ═══════════════
+
+REBIND_TEXT = (
+    "🔗 <b>Перепривязка к чату</b>\n\n"
+    "Один бот обслуживает <b>один рабочий чат</b> с темами. Если чат нужно "
+    "поменять — бот сейчас пишет «🚫 Этот бот уже привязан к другому чату», "
+    "хотя старый чат тебе больше не нужен.\n\n"
+    "<b>Что произойдёт:</b>\n"
+    "• бот отвяжется от текущего рабочего чата;\n"
+    "• постарается выйти из него, чтобы больше не писать туда;\n"
+    "• бот перезапустится и сможет подключиться к новому чату.\n\n"
+    "<b>Что НЕ произойдёт:</b>\n"
+    "• история ПЗ, пользователи и статистика останутся на месте;\n"
+    "• другие боты и их чаты не затрагиваются.\n\n"
+    "⚠️ <b>Важно:</b> после перепривязки добавь бота в новый чат с "
+    "<b>включёнными темами</b> — он подключится сам. До этого момента бот "
+    "не сможет создавать топики."
+)
+
+
+@router.callback_query(F.data.regexp(r"^rebind_\d+$"))
+async def cb_rebind_info(callback: CallbackQuery) -> None:
+    """Экран «🔗 Перепривязка»: описание + подтверждение."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    bot_info = get_bot_by_id(user_id, bot_id)
+    if not bot_info:
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    current = get_feedback_chat(bot_id)
+    current_line = (f"Сейчас привязан к: <code>{current}</code>"
+                    if current else "Сейчас бот ни к какому чату не привязан.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Перепривязать", callback_data=f"rebind_confirm_{bot_id}",
+                              style="danger")],
+        [InlineKeyboardButton(text="⬅️ Назад к боту", callback_data=f"bot_{bot_id}",
+                              style="primary")],
+    ])
+    await render_callback(callback, f"{current_line}\n\n{REBIND_TEXT}", kb)
+
+
+@router.callback_query(F.data.startswith("rebind_confirm_"))
+async def cb_rebind_confirm(callback: CallbackQuery,
+                            child_manager: ChildManager) -> None:
+    """Отвязывает бота от рабочего чата (и выходит из него)."""
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    bot_info = get_bot_by_id(user_id, bot_id)
+    if not bot_info:
+        await callback.answer("⚠️ Бот не найден", show_alert=True)
+        return
+
+    old_chat = get_feedback_chat(bot_id)
+    was_running = child_manager.is_running(bot_id)
+    left = False
+
+    if old_chat:
+        # Выходим из старого чата, чтобы бот не слал туда ПЗ. Если чат уже
+        # удалён или бота выгнали — это не помеха: привязку снимаем в любом случае.
+        child_bot = child_manager.get_bot(bot_id)
+        if child_bot is not None:
+            try:
+                await child_bot.leave_chat(int(old_chat))
+                left = True
+            except Exception as e:
+                logger.info("Не удалось выйти из чата %s: %s", old_chat, e)
+        clear_feedback_chat(bot_id)
+
+    # Перезапускаем, чтобы дочерний бот подхватил «чистое» состояние и
+    # подключился к новому чату при следующем добавлении.
+    if was_running:
+        await child_manager.restart_child(bot_info)
+
+    if old_chat:
+        result = (
+            f"✅ <b>Бот отвязан от чата</b> <code>{old_chat}</code>."
+            + ("" if left else " Из чата выйти не удалось — привязка снята.")
+            + "\n\nДобавь бота в новый чат с включёнными темами — он подключится сам."
+        )
+        await callback.answer("🔗 Перепривязка выполнена", show_alert=True)
+    else:
+        result = (
+            "ℹ️ Бот и так не был привязан ни к одному чату.\n\n"
+            "Добавь его в чат с включёнными темами — он подключится сам."
+        )
+        await callback.answer()
+
+    bot_info = get_bot_by_id(user_id, bot_id) or bot_info
+    running = child_manager.is_running(bot_id)
+    text = _single_bot_text(bot_info, running)
+    await render_callback(callback, f"{result}\n\n{text}",
+                          single_bot_kb(bot_id, running, bool(bot_info.get("anonymous_mode", 0))))

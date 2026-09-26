@@ -20,7 +20,6 @@ from services.storage import (
     get_bot_links,
     set_bot_links,
     get_user_bots,
-    set_welcome_for_all,
     set_welcome_bundle_for_all,
     set_links_for_all,
 )

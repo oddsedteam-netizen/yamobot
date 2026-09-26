@@ -72,7 +72,7 @@ def antinakrutka_kb(owner_id: int, settings: dict) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🔄 Сбросить защиту",
                                           callback_data="an_reset",
                                           style="danger")])
-    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")])
+    rows.append([InlineKeyboardButton(text="⬅️ Защита", callback_data="profile_protection")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -297,8 +297,8 @@ async def cb_an_release_no(callback: CallbackQuery) -> None:
             callback.message,
             "🛡 <b>Защита остаётся включённой.</b>\n\n"
             "Новые ПЗ не создаются, уведомления в «чат админов» не приходят.\n\n"
-            "Когда захочешь снять — <b>Профиль → 🚨 Антинакрутка → "
-            "🔄 Сбросить защиту</b>.",
+            "Когда захочешь снять — <b>Профиль → 🛡 Защита → "
+            "🚨 Антинакрутка → 🔄 Сбросить защиту</b>.",
             reply_markup=None,
         )
     await callback.answer("Защита оставлена")

@@ -8,6 +8,7 @@ import asyncio
 
 from handlers._common import render_callback, cb_data, cb_uid, msg_uid
 from services.child_manager import ChildManager
+from services.config import proxy_settings
 from services.storage import (
     add_user_bot, bot_display_name, set_bot_type, set_bot_keyboard,
     get_feedback_chat, get_bot_by_id_any_owner,
@@ -41,7 +42,9 @@ def _type_kb() -> InlineKeyboardMarkup:
 
 async def verify_token(token: str) -> dict | None:
     try:
-        tmp = Bot(token=token)
+        # Прокси из .env (PROXY_URL) — иначе проверка токена падает там, где
+        # api.telegram.org недоступен напрямую.
+        tmp = Bot(token=token, **proxy_settings())
         me = await tmp.get_me()
         # Пытаемся понять, не используется ли токен где-то ещё: чужой вебхук
         # означает, что апдейты могут уходить на другой сервер (например, бот

@@ -15,12 +15,13 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType, ChatType, ChatMemberStatus
 from aiogram.exceptions import (
     TelegramBadRequest, TelegramConflictError, TelegramForbiddenError, TelegramNetworkError,
-    TelegramRetryAfter, TelegramServerError,
+    TelegramRetryAfter, TelegramServerError, TelegramUnauthorizedError,
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     BufferedInputFile,
     ChatMemberUpdated,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -37,6 +38,7 @@ from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
                               try_edit_answer, try_edit)
 from services import premium_emoji as premium
+from services.config import proxy_settings
 from services.constants import BASE_WELCOME, BOT_CREDIT
 from services.polling import ResilientDispatcher, set_polling_problem_hook
 from services.promo import detect_promo_from_message
@@ -89,6 +91,18 @@ from services.storage import (
     reserve_topic_slot,
     set_topic_id,
     get_cat_ask_settings,
+    get_categories_for_pz,
+    get_work_hours,
+    is_within_work_hours,
+    save_log_message,
+    save_bot_error,
+    DEFAULT_WORK_START,
+    DEFAULT_WORK_END,
+    DEFAULT_WORK_MESSAGE,
+    admin_changes_left,
+    log_admin_change,
+    mark_bot_dead,
+    clear_bot_dead,
 )
 
 logger = logging.getLogger(__name__)
@@ -591,13 +605,20 @@ async def _ask_pz_category(bot_obj: Bot, bot_id: int, user_chat_id: int,
                            categories: list[str]) -> bool:
     """Спрашивает у ПЗ категорию инлайн-кнопками (без покраски).
 
+    Кнопки раскладываем по 2–3 в ряд: сообщение с кнопками в один столбик
+    растягивалось и выглядело «простынёй», особенно когда к стандартным
+    категориям добавлены свои.
+
     False — вопрос отправить не удалось (тогда вызывающий код уведомит админов
     как раньше, без категории).
     """
-    rows = [
-        [InlineKeyboardButton(text=name, callback_data=f"pzcat_{index}")]
+    buttons = [
+        InlineKeyboardButton(text=name[:24], callback_data=f"pzcat_{index}")
         for index, name in enumerate(categories)
     ]
+    # Раскладка: до 3 кнопок в ряд — так сообщение остаётся компактным.
+    per_row = 3 if len(buttons) > 4 else 2
+    rows = [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
     try:
         await _send_with_gate(
             bot_obj, user_chat_id,
@@ -713,6 +734,12 @@ async def _on_polling_problem(bot: Bot, kind: str) -> None:
         "Проверь бота в @BotFather (он мог быть удалён или пересоздан) и добавь "
         "его в панель заново с рабочим токеном.",
     )
+    # Авто-детект «мёртвого» бота: попал в список админ-панели, откуда его
+    # можно удалить пачкой вместе с остальными нерабочими ботами.
+    try:
+        mark_bot_dead(bot_id, "unauthorized")
+    except Exception as e:
+        logger.debug("Не удалось пометить бота %s мёртвым: %s", bot_id, e)
 
 
 # Проблемы polling (конфликт токена / мёртвый токен) показываем владельцу.
@@ -1654,12 +1681,83 @@ def _mirror_reactions(reactions: list) -> tuple[list | None, str | None]:
     return None, None
 
 
+# ── Время работы: автоответ ПЗ вне рабочего времени ───────────────────
+# Ключ (bot_id, user_chat_id) → когда последний раз слали автоответ этому ПЗ.
+_work_hours_replied: dict[tuple[int, int], float] = {}
+# Не чаще раза в час на пользователя: иначе на серию сообщений прилетела бы
+# серия одинаковых автоответов.
+_WORK_HOURS_REPEAT = 3600.0
+
+
+async def _send_work_hours_reply(bot_obj: Bot, owner_id: int, chat_id: int) -> None:
+    """Отвечает ПЗ в нерабочее время: бот отдыхает, свободный админ ответит.
+
+    Сообщение настраивается владельцем (раздел «🕐 Время работы» в профиле),
+    вместе с фото и премиум-эмодзи. Само обращение ПЗ при этом не теряется —
+    оно всё равно уходит в топик.
+    """
+    settings = get_work_hours(owner_id)
+    start = str(settings.get("start") or DEFAULT_WORK_START)
+    end = str(settings.get("end") or DEFAULT_WORK_END)
+    raw = str(settings.get("msg_text") or DEFAULT_WORK_MESSAGE)
+    text = raw.replace("{start}", start).replace("{end}", end)
+
+    entities = None
+    try:
+        from handlers.hours import build_entities
+        entities = build_entities(str(settings.get("msg_entities") or "[]"))
+    except Exception as e:  # премиум-эмодзи — украшение, ошибка тут не критична
+        logger.debug("Не удалось восстановить эмодзи ответа о времени работы: %s", e)
+
+    photo = str(settings.get("msg_photo") or "")
+    try:
+        if photo:
+            # file_id из лички владельца дочернему боту не подходит: тожимся через
+            # основной бот, у которого файл был принят.
+            if _MAIN_BOT is not None:
+                buffer = await _cached_media_bytes(photo)
+                if buffer is not None:
+                    await bot_obj.send_photo(
+                        chat_id=chat_id,
+                        photo=BufferedInputFile(buffer, filename="offline.jpg"),
+                        caption=text, caption_entities=entities, parse_mode=None,
+                    )
+                    return
+            await bot_obj.send_photo(chat_id=chat_id, photo=photo, caption=text,
+                                     caption_entities=entities, parse_mode=None)
+            return
+        await bot_obj.send_message(chat_id=chat_id, text=text, entities=entities,
+                                   parse_mode=None)
+    except Exception as e:
+        logger.warning("Не удалось отправить ответ о времени работы: %s", e)
+
+
 def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     # Устойчивый диспетчер: конфликт токена (вебхук/второй экземпляр бота) и
     # мёртвый токен больше не превращаются в бесконечные «tryings = 14000» в
     # логе — см. services/polling.py.
     child_dp = ResilientDispatcher()
     bot_id = bot_data["id"]
+
+    # Ошибки обработчиков пишем в журнал по этому боту: пользователь сможет
+    # прислать их в поддержку, а владелец платформы — посмотреть в админке.
+    async def _log_child_error(event: ErrorEvent) -> bool:
+        try:
+            update = getattr(event, "update", None)
+            save_bot_error(
+                bot_id,
+                type(event.exception).__name__ + ": " + str(event.exception)[:200],
+                detail=str(event.exception),
+                owner_id=int(bot_data.get("owner_id") or 0),
+                source=getattr(update, "event_type", "") if update else "",
+            )
+        except Exception as log_error:  # журнал не должен ломать обработку
+            logger.debug("Не удалось записать ошибку бота %s: %s", bot_id, log_error)
+        logger.error("Бот %s: ошибка обработчика: %s", bot_id, event.exception,
+                     exc_info=event.exception)
+        return True
+
+    child_dp.errors.register(_log_child_error)
 
     sticker_counts: dict[int, list[float]] = defaultdict(list)
     sticker_warnings: dict[int, bool] = defaultdict(bool)
@@ -2305,8 +2403,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         answer = parts[2]
         topic_id = int(parts[3])
         group_chat_id = int(parts[4])
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
 
         if answer == "yes":
+            # Лимит смен в сутки: считаем здесь же, чтобы не пустить сверх лимита.
+            if topic is not None:
+                if admin_changes_left(bot_id, topic["user_chat_id"]) == 0:
+                    await try_edit(callback.message,
+                                   "⏳ Смен на сегодня не осталось — попробуй завтра.")
+                    await callback.answer("Лимит смен исчерпан", show_alert=True)
+                    return
+                log_admin_change(bot_id, topic["user_chat_id"])
+
             reset_topic_admin(bot_id, topic_id, group_chat_id)
             try:
                 await _notify_admin_change(bot_id, group_chat_id, topic_id)
@@ -2387,25 +2495,49 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
         user_chat_id = msg_uid(message)
 
+        # ── Время работы: вне рабочего времени отвечаем сами ──
+        # Обращение при этом НЕ теряется: ниже оно всё равно уйдёт в топик, чтобы
+        # свободный админ мог ответить позже. Отвечаем не чаще раза в час на
+        # пользователя, иначе на серию сообщений прилетит серия автоответов.
+        _work_owner = get_bot_owner(bot_id) or 0
+        if _work_owner and not is_within_work_hours(_work_owner):
+            _key = (bot_id, user_chat_id)
+            _last = _work_hours_replied.get(_key, 0.0)
+            if time.time() - _last > _WORK_HOURS_REPEAT:
+                _work_hours_replied[_key] = time.time()
+                await _send_work_hours_reply(bot_obj, _work_owner, user_chat_id)
+
         # Обработка "сменить админа"
         if message.text and message.text.strip().lower() == "сменить админа":
             topic = get_topic_by_user(bot_id, user_chat_id)
-            if topic and topic["admin_user_id"]:
-                await message.answer(
-                    "❓ Вы уверены, что хотите сменить админа?",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="✅ Да",
-                                                  callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
-                            InlineKeyboardButton(text="❌ Нет",
-                                                  callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
-                        ]
-                    ])
-                )
-                return
-            else:
+            if not topic or not topic["admin_user_id"]:
                 await message.answer("У вас сейчас нет назначенного админа.")
                 return
+
+            # Показываем, сколько смен у юзера осталось (если лимит включён).
+            left = admin_changes_left(bot_id, user_chat_id)
+            if left == 0:
+                await message.answer(
+                    "⏳ <b>Смен на сегодня не осталось.</b>\n\n"
+                    "Лимит смен админа в сутки уже исчерпан. Завтра он "
+                    "обновится — или просто подожди ответа текущего админа.",
+                )
+                return
+
+            left_line = (f"\n\n🔄 Осталось смен сегодня: <b>{left}</b>."
+                         if left > 0 else "")
+            await message.answer(
+                f"❓ Вы уверены, что хотите сменить админа?{left_line}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да",
+                                              callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
+                        InlineKeyboardButton(text="❌ Нет",
+                                              callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
+                    ]
+                ])
+            )
+            return
 
         # Настройки антиспама
         now = time.time()
@@ -2563,18 +2695,25 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             # назвал — спросим кнопками, а уведомление пришлём после ответа.
             # Спрашиваем только когда «чат админов» привязан: иначе уведомление
             # всё равно некуда отправить и вопрос был бы бесполезным.
+            #
+            # Исключение — ПР/ВП: если первое сообщение похоже на предложение
+            # рекламы или взаимного пиара, категории не важны. Такое ПЗ сразу
+            # уходит в «чат админов» с пометкой, без лишнего вопроса пользователю.
+            promo_hint = detect_promo_from_message(message.text, message.caption)
+
             ask_enabled, ask_categories = get_cat_ask_settings(bot_id)
             categories = extract_pz_categories(message)
             if ask_enabled:
                 categories = pick_pz_category(message, ask_categories, categories)
-            need_ask = (ask_enabled and not categories
+            # Кнопки у ПЗ предлагаем с учётом своих категорий бота.
+            ask_list = get_categories_for_pz(owner_id, bot_id) if ask_enabled else []
+            need_ask = (ask_enabled and not categories and not promo_hint and bool(ask_list)
                         and bool(owner_id and get_bound_chat(owner_id, "admin")))
             if categories:
                 header_text += f"\n\n🏷 Категория: <b>{_html_escape(categories)}</b>"
 
             # О предложении пиара/ВП обычно пишут в первом сообщении — помечаем
             # новое ПЗ, чтобы админ сразу видел, о чём, скорее всего, речь.
-            promo_hint = detect_promo_from_message(message.text, message.caption)
             if promo_hint:
                 header_text += f"\n\n🔎 <b>{promo_hint}</b>"
 
@@ -2597,14 +2736,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             if sent:
                 save_feedback_message(bot_id, new_topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
+                if message.text:
+                    save_log_message(bot_id, user_chat_id, "in", message.text,
+                                     msg_username(message) or "")
 
             try:
                 if need_ask:
                     # Спрашиваем категорию у ПЗ; уведомление уйдёт после ответа
                     # (или через PZ_CATEGORY_TIMEOUT, если ПЗ не ответит).
                     asked = await _ask_pz_category(bot_obj, bot_id, user_chat_id,
-                                                   new_topic_id, group_chat_id,
-                                                   ask_categories)
+                                                   new_topic_id, group_chat_id, ask_list)
                     if not asked:
                         await _notify_new_pz(bot_id, group_chat_id, new_topic_id,
                                              promo_hint)
@@ -2643,6 +2784,11 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             if sent:
                 save_feedback_message(bot_id, topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
+                # Текст сохраняем отдельно: Telegram не отдаёт историю, а по
+                # логам пользователь шлёт техподдержку обращение.
+                if message.text:
+                    save_log_message(bot_id, user_chat_id, "in", message.text,
+                                     msg_username(message) or "")
             elif thread_not_found:
                 # Топик реально удалён/устарел — пересоздаём ровно один раз
                 # под тем же локом, чтобы не наплодить дубликатов при спаме.
@@ -2698,6 +2844,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if sent:
             save_feedback_message(bot_id, thread_id, group_chat_id, user_chat_id,
                                    "out", message.message_id, sent.message_id)
+            # Ответ админа тоже в логи: техподдержке видно всю переписку.
+            if message.text:
+                save_log_message(bot_id, user_chat_id, "out", message.text)
 
     # ═══════════════ Игнорируем general ═══════════════
 
@@ -2769,7 +2918,13 @@ class ChildManager:
         token = fresh.get("token") or bot_data.get("token", "")
 
         try:
-            child_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            # Прокси из .env нужен и дочерним ботам: без него они не смогут
+            # достучаться до Telegram так же, как не смог основной.
+            child_bot = Bot(
+                token=token,
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+                **proxy_settings(),
+            )
             me = await child_bot.get_me()
             logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
@@ -2828,9 +2983,25 @@ class ChildManager:
             # Успешный запуск: сбрасываем счётчик перезапусков и флаг остановки.
             self._restart_attempts[bot_id] = 0
             self._stopping.discard(bot_id)
+            # Бот поднялся — снимаем пометку «мёртвый», если она была раньше
+            # (например, токен починили и добавили бота заново).
+            try:
+                clear_bot_dead(bot_id)
+            except Exception:
+                pass
 
             logger.info("Бот @%s запущен", me.username)
             return True
+        except TelegramUnauthorizedError as e:
+            # Токен отозван или бот удалён в @BotFather: ретраить бессмысленно,
+            # помечаем бота мёртвым — он попадёт в список авто-детекта в
+            # админ-панели, где его можно удалить пачкой.
+            logger.error("Бот %s: токен недействителен — %s", bot_id, e)
+            try:
+                mark_bot_dead(bot_id, "unauthorized")
+            except Exception:
+                pass
+            return False
         except Exception as e:
             logger.error("Не удалось запустить бот %s: %s", bot_id, e)
             return False
@@ -3018,10 +3189,27 @@ class ChildManager:
 
     async def send_mailing(self, bot_id: int, text: str,
                            media_type: str = "", media_id: str = "",
-                           entities=None, progress_callback=None) -> dict:
+                           entities=None, progress_callback=None,
+                           reply_markup=None) -> dict:
+        """Рассылает сообщение всем активным пользователям бота.
+
+        Что изменилось по сравнению с прежней версией (жалобы были «из 100
+        дошло 10», при этом бота никто не банил):
+
+        * отправка идёт через «шлюз» :func:`_send_with_gate` — при 429 (flood)
+          ждём указанное Telegram время и повторяем, а не теряем сообщение;
+        * сетевые ошибки и ошибки серверов Telegram тоже ретраятся;
+        * у каждого получателя несколько попыток вместо одной;
+        * ведётся разбор причин недоставки и замер времени рассылки.
+
+        Возвращает ``sent``, ``failed``, ``total``, ``duration``,
+        ``reasons`` (причина → количество) и ``samples`` (примеры «кому и
+        почему не дошло»).
+        """
         bot = self._bots.get(bot_id)
         if not bot:
-            return {"sent": 0, "failed": 0, "total": 0}
+            return {"sent": 0, "failed": 0, "total": 0, "duration": 0.0,
+                    "reasons": {"бот не запущен": 1}, "samples": []}
 
         msg_entities = None
         if entities:
@@ -3031,6 +3219,16 @@ class ChildManager:
         total = len(users)
         sent = 0
         failed = 0
+        reasons: dict[str, int] = {}
+        samples: list[str] = []
+        started_at = time.monotonic()
+
+        def _fail(reason: str, detail: str = "") -> None:
+            nonlocal failed
+            failed += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if detail and len(samples) < 5:
+                samples.append(f"• {detail} — {reason}")
 
         # Медиа: байты скачиваем через основной бот один раз и перезаливаем
         # дочерним ботом (file_id чужого бота не работает).
@@ -3040,53 +3238,85 @@ class ChildManager:
 
         for i, user in enumerate(users):
             chat_id = user["chat_id"]
-            try:
+
+            def _call(chat_id: int = chat_id) -> Any:
+                """Сама отправка: её умеет повторять «шлюз» _send_with_gate."""
                 if media_type == "photo" and media_id:
                     photo = BufferedInputFile(media_bytes, filename="photo.jpg") \
                         if media_bytes is not None else media_id
-                    await bot.send_photo(chat_id=chat_id, photo=photo,
-                                         caption=text, caption_entities=msg_entities,
-                                         parse_mode=None)
-                elif media_type == "video" and media_id:
+                    return bot.send_photo(chat_id=chat_id, photo=photo,
+                                          caption=text, caption_entities=msg_entities,
+                                          parse_mode=None, reply_markup=reply_markup)
+                if media_type == "video" and media_id:
                     video = BufferedInputFile(media_bytes, filename="video.mp4") \
                         if media_bytes is not None else media_id
-                    await bot.send_video(chat_id=chat_id, video=video,
-                                         caption=text, caption_entities=msg_entities,
-                                         parse_mode=None)
-                elif media_type == "document" and media_id:
+                    return bot.send_video(chat_id=chat_id, video=video,
+                                          caption=text, caption_entities=msg_entities,
+                                          parse_mode=None, reply_markup=reply_markup)
+                if media_type == "document" and media_id:
                     document = BufferedInputFile(media_bytes, filename="file.bin") \
                         if media_bytes is not None else media_id
-                    await bot.send_document(chat_id=chat_id, document=document,
-                                            caption=text, caption_entities=msg_entities,
-                                            parse_mode=None)
-                elif media_type == "animation" and media_id:
+                    return bot.send_document(chat_id=chat_id, document=document,
+                                             caption=text, caption_entities=msg_entities,
+                                             parse_mode=None, reply_markup=reply_markup)
+                if media_type == "animation" and media_id:
                     animation = BufferedInputFile(media_bytes, filename="anim.gif") \
                         if media_bytes is not None else media_id
-                    await bot.send_animation(chat_id=chat_id, animation=animation,
-                                             caption=text, caption_entities=msg_entities,
-                                             parse_mode=None)
-                elif media_type == "sticker" and media_id:
+                    return bot.send_animation(chat_id=chat_id, animation=animation,
+                                              caption=text, caption_entities=msg_entities,
+                                              parse_mode=None, reply_markup=reply_markup)
+                if media_type == "sticker" and media_id:
                     sticker = BufferedInputFile(media_bytes, filename="sticker.webp") \
                         if media_bytes is not None else media_id
-                    await bot.send_sticker(chat_id=chat_id, sticker=sticker)
-                else:
-                    await bot.send_message(chat_id=chat_id, text=text,
-                                           entities=msg_entities, parse_mode=None)
+                    return bot.send_sticker(chat_id=chat_id, sticker=sticker)
+                return bot.send_message(chat_id=chat_id, text=text,
+                                        entities=msg_entities, parse_mode=None,
+                                        reply_markup=reply_markup)
+
+            try:
+                await _send_with_gate(bot, chat_id, _call)
                 sent += 1
                 add_stat(bot_id, "message_out")
             except TelegramForbiddenError:
+                # Юзер заблокировал бота: помечаем в базе, чтобы больше не
+                # пытаться слать (иначе он же и портит статистику).
                 await _handle_user_blocked(bot, bot_id, chat_id)
-                failed += 1
+                _fail("заблокировал бота", f"ID {chat_id}")
+            except TelegramRetryAfter as e:
+                _fail("лимит Telegram (flood)",
+                      f"ID {chat_id} — нужно подождать {getattr(e, 'retry_after', '?')}с")
+            except (TelegramNetworkError, TelegramServerError) as e:
+                _fail("сеть / серверы Telegram", f"ID {chat_id} — {type(e).__name__}")
+            except TelegramBadRequest as e:
+                msg = (getattr(e, "message", "") or "").lower()
+                if "chat not found" in msg:
+                    _fail("чат не найден", f"ID {chat_id}")
+                elif "bot was blocked" in msg or "user is deactivated" in msg:
+                    await _handle_user_blocked(bot, bot_id, chat_id)
+                    _fail("заблокировал бота", f"ID {chat_id}")
+                else:
+                    _fail("Telegram отклонил запрос",
+                          f"ID {chat_id} — {getattr(e, 'message', e)}")
             except Exception as e:
-                logger.warning("Ошибка отправки %s -> %s: %s", bot_id, chat_id, e)
-                failed += 1
+                logger.warning("Ошибка рассылки %s -> %s: %s", bot_id, chat_id, e)
+                _fail("прочая ошибка", f"ID {chat_id} — {type(e).__name__}")
 
             if progress_callback and ((i + 1) % 5 == 0 or (i + 1) == total):
                 await progress_callback(sent, failed, total, i + 1)
 
-            await asyncio.sleep(0.05)
+            # Пауза между получателями: шлюз сам придерживает темп при 429,
+            # а здесь — небольшая пауза, чтобы не ловить flood с ходу.
+            await asyncio.sleep(0.1)
 
+        duration = time.monotonic() - started_at
         save_mailing(bot_id, text, media_type, media_id, sent, failed)
         add_stat(bot_id, "mailing_done")
 
-        return {"sent": sent, "failed": failed, "total": total}
+        return {
+            "sent": sent,
+            "failed": failed,
+            "total": total,
+            "duration": duration,
+            "reasons": reasons,
+            "samples": samples,
+        }

@@ -1,5 +1,6 @@
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -13,7 +14,7 @@ from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
                               cb_uid, cb_username, cb_firstname, msg_uid,
                               msg_username, msg_firstname, try_edit_answer)
 from services.child_manager import ChildManager
-from services.config import is_super_admin
+from services.config import is_super_admin, proxy_settings
 from services.constants import (
     BOT_VERSION,
     SETTING_DONATE_URL,
@@ -24,8 +25,10 @@ from services.storage import (
     get_all_users_registry,
     get_user_bots,
     get_admins_all,
+    ticket_counts,
     get_all_bots_flat,
     get_all_topics_for_bot,
+    get_all_stats,
     get_stats,
     bot_display_name,
     utc_to_msk,
@@ -46,6 +49,12 @@ from services.storage import (
     transfer_bot,
     get_app_setting,
     set_app_setting,
+    get_antiraid_settings,
+    get_antinakrutka_settings,
+    get_dead_bots,
+    mark_bot_dead,
+    clear_bot_dead,
+    remove_dead_bots,
 )
 
 router = Router()
@@ -65,6 +74,12 @@ class LinksFSM(StatesGroup):
     waiting_link = State()
 
 
+class ProfileFSM(StatesGroup):
+    """Админ-панель: поиск бота и удаление одного бота."""
+    waiting_find_bot = State()
+    waiting_del_bot = State()
+
+
 
 def _user_line(u: dict) -> str:
     name = u.get("username") or u.get("first_name") or str(u["user_id"])
@@ -72,12 +87,79 @@ def _user_line(u: dict) -> str:
     return f"{status} {name}"
 
 
+# ── Постраничный вывод больших списков ────────────────────────────────
+# Большие списки (ВЛД, боты, админы) раньше выводились целиком: сообщение
+# упиралось в лимиты Telegram (4096 символов и размер клавиатуры), и вкладка
+# просто не открывалась. Теперь такие списки показываются страницами.
+LIST_PAGE_SIZE = 10
+# Списки админов показываем короче: у каждого админа три кнопки действий.
+ADMINS_PAGE_SIZE = 8
+
+
+def _parse_page(data: str, prefix: str) -> int:
+    """Номер страницы из callback_data вида ``<prefix><N>`` (по умолчанию 1)."""
+    tail = data[len(prefix):]
+    return int(tail) if tail.isdigit() and int(tail) > 0 else 1
+
+
+def _page_slice(items: list, page: int,
+                size: int = LIST_PAGE_SIZE) -> tuple[list, int, int]:
+    """Окно списка для страницы: ``(элементы, номер страницы, всего страниц)``."""
+    total_pages = max(1, (len(items) + size - 1) // size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * size
+    return items[start:start + size], page, total_pages
+
+
+def _pager_rows(prefix: str, page: int,
+                total_pages: int) -> list[list[InlineKeyboardButton]]:
+    """Строка перелистывания «◀️ · N/M · ▶️» (пусто, если страница одна)."""
+    if total_pages <= 1:
+        return []
+    prev_page = page - 1 if page > 1 else total_pages
+    next_page = page + 1 if page < total_pages else 1
+    return [[
+        InlineKeyboardButton(text="◀️", callback_data=f"{prefix}{prev_page}", style="primary"),
+        InlineKeyboardButton(text=f"📄 {page}/{total_pages}",
+                             callback_data=f"{prefix}{page}", style="primary"),
+        InlineKeyboardButton(text="▶️", callback_data=f"{prefix}{next_page}", style="primary"),
+    ]]
+
+
+def _page_note(page: int, total_pages: int) -> str:
+    """Приписка «Страница N из M» к тексту (пусто, если страница одна)."""
+    if total_pages <= 1:
+        return ""
+    return f"\n\n📄 Страница <b>{page}</b> из <b>{total_pages}</b>"
+
+
+def _short(text: str, limit: int = 60) -> str:
+    """Обрезает подпись кнопки: Telegram режет текст длиннее 64 символов."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📨 Список жалоб", callback_data="complaints_admin", style="primary"),
+            InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin", style="primary"),
+            InlineKeyboardButton(text="👤 Профиль ВЛД", callback_data="adm_owner_profile",
+                                 style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="🗂 Логи", callback_data="botlogs", style="primary"),
+            InlineKeyboardButton(text="🔎 Найти бота", callback_data="adm_find_bot", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Сводка", callback_data="adm_overview", style="primary"),
             InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list", style="primary"),
         ],
+        [
+            # Удаление ОДНОГО бота — с подтверждением (не «удалить всё сразу»).
+            InlineKeyboardButton(text="🗑 Удалить бота", callback_data="adm_del_bot", style="danger"),
+        ],
+        # Мёртвые боты (авто-детект) — красная: там удаление и «пачка».
+        [InlineKeyboardButton(text="🧟 Мёртвые боты", callback_data="dead_bots", style="danger")],
         [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="broadcast", style="primary")],
         [InlineKeyboardButton(text="🔗 Настройки ссылок", callback_data="links_settings", style="primary")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
@@ -181,6 +263,535 @@ async def fsm_broadcast(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="🛡 Админ-панель", callback_data="profile_admin", style="primary")]
         ]),
     )
+# ═══════════════ Мёртвые боты: авто-детект и удаление (только супер-админ) ═══════════════
+
+def _dead_row_display(row: dict) -> dict:
+    """Приводит запись «мёртвого» бота к виду, который понимает bot_display_name()."""
+    return {
+        "id": row.get("bot_id"),
+        "username": row.get("username") or "",
+        "first_name": row.get("first_name") or "",
+    }
+
+
+def _dead_reason_text(reason: str) -> str:
+    """Человекочитаемая причина, по которой бот признан мёртвым."""
+    reason = (reason or "").strip()
+    if reason == "unauthorized":
+        return "токен отозван или недействителен"
+    if reason == "нет токена":
+        return "нет токена"
+    return reason or "не отвечает"
+
+
+def _dead_bots_payload(status: str = "", page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран «🧟 Мёртвые боты»: список авто-детекта + действия (постранично)."""
+    dead = get_dead_bots()
+    total_bots = len(get_all_bots_flat())
+    window, page, total_pages = _page_slice(dead, page, LIST_PAGE_SIZE)
+
+    lines: list[str] = []
+    start = (page - 1) * LIST_PAGE_SIZE
+    for offset, row in enumerate(window):
+        i = start + offset + 1
+        name = bot_display_name(_dead_row_display(row))
+        lines.append(
+            f"{i}. {name} ⸱ 🆔 <code>{row['bot_id']}</code>\n"
+            f"    👤 <code>{row['owner_id']}</code> ⸱ "
+            f"⚠️ {_dead_reason_text(str(row.get('reason') or ''))}"
+        )
+    dead_text = "\n".join(lines) if lines else "  — мёртвых ботов нет 🎉 —"
+
+    text = (
+        "🧟 <b>Мёртвые боты</b>\n\n"
+        f"🤖 Всего ботов в панели: <b>{total_bots}</b>\n"
+        f"💀 Помечено мёртвыми: <b>{len(dead)}</b>\n\n"
+        f"{dead_text}\n\n"
+        "Бот помечается мёртвым автоматически, когда Telegram отвечает "
+        "«Unauthorized» (токен отозван или бот удалён в @BotFather). "
+        "Кнопка «🔍 Проверить ботов» опрашивает всех ботов панели сразу.\n\n"
+        "Что делаем?"
+    )
+    text += _page_note(page, total_pages)
+    if status:
+        text = f"{status}\n\n{text}"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for row in window:
+        bot_id = int(row["bot_id"])
+        rows.append([
+            InlineKeyboardButton(
+                text=_short(f"🗑 {bot_display_name(_dead_row_display(row))}"),
+                callback_data=(f"dead_del_{bot_id}"
+                               + (f"_p{page}" if total_pages > 1 else "")),
+                style="danger",
+            )
+        ])
+    if total_pages > 1:
+        rows.append([
+            InlineKeyboardButton(text="◀️",
+                                 callback_data=f"dead_bots_p{page - 1 if page > 1 else total_pages}",
+                                 style="primary"),
+            InlineKeyboardButton(text=f"📄 {page}/{total_pages}",
+                                 callback_data=f"dead_bots_p{page}", style="primary"),
+            InlineKeyboardButton(text="▶️",
+                                 callback_data=f"dead_bots_p{page + 1 if page < total_pages else 1}",
+                                 style="primary"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="🔍 Проверить ботов", callback_data="dead_check", style="primary")
+    ])
+    if dead:
+        rows.append([
+            InlineKeyboardButton(text=f"🗑 Удалить всех ({len(dead)})",
+                                 callback_data="dead_del_all", style="danger")
+        ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin", style="primary")
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _check_bots_alive() -> tuple[int, int, int]:
+    """Опрашивает всех ботов панели через ``get_me()``.
+
+    Возвращает ``(проверено, нерабочих, непроверенных)``:
+
+    * Telegram ответил «Unauthorized» (токен отозван/бот удалён) — это и есть
+      «мёртвый» бот, помечаем его;
+    * связи с Telegram нет вовсе (VPN отвалился, нет интернета) — бот ни при
+      чём, **не трогаем** пометки, иначе проверка пометила бы весь список
+      мёртвым из-за собственной сети админа;
+    * прочие ошибки (например, бот заблокирован) — помечаем с причиной.
+    """
+    checked = 0
+    dead = 0
+    skipped = 0
+    for b in get_all_bots_flat():
+        bot_id = int(b["id"])
+        token = str(b.get("token") or "")
+        if not token:
+            mark_bot_dead(bot_id, "нет токена")
+            dead += 1
+            checked += 1
+            continue
+
+        probe = Bot(token=token, **proxy_settings())
+        try:
+            await probe.get_me()
+        except TelegramUnauthorizedError:
+            mark_bot_dead(bot_id, "unauthorized")
+            dead += 1
+        except TelegramNetworkError:
+            # Нет связи с Telegram — это не «мёртвый» бот.
+            skipped += 1
+        except Exception as e:
+            mark_bot_dead(bot_id, f"ошибка проверки: {type(e).__name__}")
+            dead += 1
+        else:
+            clear_bot_dead(bot_id)
+        finally:
+            checked += 1
+            try:
+                await probe.session.close()
+            except Exception:
+                pass
+    return checked, dead, skipped
+
+
+async def _delete_bot_forever(bot_id: int, child_manager: ChildManager) -> str:
+    """Останавливает и полностью удаляет бота вместе с его данными."""
+    bot = get_bot_by_id_any_owner(bot_id)
+    owner_id = int(bot.get("owner_id") or 0) if bot else 0
+    if child_manager.is_running(bot_id):
+        try:
+            await child_manager.stop_child(bot_id)
+        except Exception:
+            pass
+    name = bot_display_name(bot) if bot else f"бот {bot_id}"
+    remove_user_bot(owner_id, bot_id)
+    clear_bot_dead(bot_id)
+    return name
+
+
+# ═══════════════ Профиль пользователя (админ-панель) ═══════════════
+
+def _owner_profile_text(owner_id: int) -> str:
+    """Полный профиль пользователя: чаты, боты, админы, тикеты."""
+    user = next(
+        (u for u in get_all_users_registry() if int(u.get("user_id") or 0) == owner_id),
+        {},
+    )
+    bots = get_user_bots(owner_id)
+    admins = get_admins_all(owner_id)
+    tickets = ticket_counts()
+
+    work_chat = get_bound_chat(owner_id, "work")
+    admin_chat = get_bound_chat(owner_id, "admin")
+
+    def _chat(value: int | None) -> str:
+        return f"<code>{value}</code>" if value else "не привязан"
+
+    bot_lines = "\n".join(
+        f"  • {bot_display_name(b)} <code>{b['id']}</code>"
+        + ("" if b.get("stopped") else " — 🟢 работает")
+        for b in bots
+    ) or "  — нет —"
+
+    return (
+        f"👤 <b>Профиль {owner_id}</b>\n\n"
+        f"🆔 ID: <code>{owner_id}</code>\n"
+        f"👤 Имя: {user.get('first_name') or '—'}"
+        f"{('@' + user['username']) if user.get('username') else ''}\n"
+        f"📅 В базе с: {str(user.get('created_at') or '—')[:19]}\n"
+        f"🚫 Забанен: {'да' if user.get('blocked') else 'нет'}\n\n"
+        f"💼 Чат работы: {_chat(work_chat)}\n"
+        f"🛡 Чат админов: {_chat(admin_chat)}\n\n"
+        f"🤖 <b>Ботов: {len(bots)}</b>\n{bot_lines}\n\n"
+        f"🛡 Админов: <b>{len(admins)}</b>\n"
+        f"🎫 Тикетов: 🟢 <b>{tickets.get('open', 0)}</b> / "
+        f"⚪ <b>{tickets.get('closed', 0)}</b>"
+    )
+
+
+@router.callback_query(F.data == "adm_owner_profile")
+async def cb_owner_profile(callback: CallbackQuery) -> None:
+    """Полный профиль владельца бота: чаты, боты, админы, тикеты."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await render_callback(
+        callback,
+        _owner_profile_text(cb_uid(callback)),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗂 Логи ботов", callback_data="botlogs",
+                                  style="primary")],
+            [InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin",
+                                  style="primary")],
+            [InlineKeyboardButton(text="📨 Рассылка", callback_data="broadcast",
+                                  style="primary")],
+            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin",
+                                  style="primary")],
+        ]),
+    )
+
+
+# ═══════════════ Сводка / поиск / удаление одного бота ═══════════════
+
+def _overview_text() -> str:
+    """Сводка по платформе: сколько людей, ботов, ПЗ и мёртвых токенов."""
+    bots = get_all_bots_flat()
+    users = get_all_users_registry()
+    dead = get_dead_bots()
+    bot_ids = [int(b["id"]) for b in bots]
+    stats = get_all_stats(bot_ids) if bot_ids else {}
+    running = sum(1 for b in bots if not b.get("stopped"))
+
+    return (
+        "📊 <b>Сводка по платформе</b>\n\n"
+        f"👤 Пользователей платформы: <b>{len(users)}</b>\n"
+        f"🤖 Ботов: <b>{len(bots)}</b> (из них работает <b>{running}</b>)\n"
+        f"🧟 Мёртвых токенов: <b>{len(dead)}</b>\n\n"
+        f"👥 ПЗ всего: <b>{stats.get('users_total', 0)}</b> "
+        f"(🚫 заблокировано <b>{stats.get('users_blocked', 0)}</b>)\n"
+        f"💬 Сообщений от ПЗ: <b>{stats.get('messages_in', 0)}</b>\n"
+        f"📨 Ответов админов: <b>{stats.get('messages_out', 0)}</b>\n"
+        f"📮 Рассылок отправлено: <b>{stats.get('mailings_sent', 0)}</b>"
+    )
+
+
+def _bot_card_text(bot: dict) -> str:
+    name = bot_display_name(bot)
+    owner_id = int(bot.get("owner_id") or 0)
+    owner = next(
+        (u.get("username") or u.get("first_name") for u in get_all_users_registry()
+         if int(u.get("user_id") or 0) == owner_id),
+        None,
+    ) or f"user {owner_id}"
+    state = "⏸ остановлен" if bot.get("stopped") else "🟢 работает"
+    return (
+        f"🤖 <b>{name}</b>\n\n"
+        f"🆔 ID: <code>{bot.get('id')}</code>\n"
+        f"🔗 Username: <code>{bot.get('username') or '—'}</code>\n"
+        f"👤 Владелец: <b>{owner}</b> (<code>{owner_id}</code>)\n"
+        f"📊 Состояние: {state}"
+    )
+
+
+def _find_bot_any(raw: str) -> dict | None:
+    """Ищет бота по ID или @username среди всех ботов платформы."""
+    raw = (raw or "").strip().lstrip("@")
+    if raw.isdigit():
+        bot = get_bot_by_id_any_owner(int(raw))
+        if bot:
+            return bot
+    return next(
+        (b for b in get_all_bots_flat()
+         if str(b.get("username") or "").lower().lstrip("@") == raw.lower()),
+        None,
+    )
+
+
+@router.callback_query(F.data == "adm_overview")
+async def cb_adm_overview(callback: CallbackQuery) -> None:
+    """Сводка по платформе."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await render_callback(
+        callback,
+        _overview_text(),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧟 Мёртвые боты", callback_data="dead_bots", style="danger")],
+            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_show")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm_find_bot")
+async def cb_adm_find_bot(callback: CallbackQuery, state: FSMContext) -> None:
+    """Поиск бота по ID или @username."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ProfileFSM.waiting_find_bot)
+    await render_callback(
+        callback,
+        "🔎 <b>Найти бота</b>\n\n"
+        "Пришли <b>ID</b> бота (число) или его <b>@username</b> — покажу, "
+        "кому он принадлежит и работает ли он.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_show", style="primary")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(ProfileFSM.waiting_find_bot)
+async def fsm_find_bot(message: Message, state: FSMContext) -> None:
+    """Показываем карточку найденного бота."""
+    if not is_super_admin(msg_uid(message)):
+        await state.clear()
+        await message.answer("⛔ Доступ запрещён")
+        return
+
+    await state.clear()
+    bot = _find_bot_any(message.text or "")
+    if bot is None:
+        await message.answer(
+            "🤷 Бот не найден. Проверь ID или @username — и попробуй ещё раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Искать снова", callback_data="adm_find_bot",
+                                      style="primary")]
+            ]),
+        )
+        return
+
+    bot_id = int(bot["id"])
+    await message.answer(
+        _bot_card_text(bot),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить этого бота",
+                                  callback_data=f"adm_del_ask_{bot_id}", style="danger")],
+            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_show",
+                                  style="primary")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "adm_del_bot")
+async def cb_adm_del_bot(callback: CallbackQuery, state: FSMContext) -> None:
+    """Удаление ОДНОГО бота: сначала просим ID или username."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await state.set_state(ProfileFSM.waiting_del_bot)
+    await render_callback(
+        callback,
+        "🗑 <b>Удаление одного бота</b>\n\n"
+        "Удаляется <b>только выбранный бот</b> — остальные останутся работать.\n\n"
+        "Пришли <b>ID</b> или <b>@username</b> бота, которого нужно удалить.\n\n"
+        "⚠️ Вместе с ботом удалятся его топики, админы и статистика. Пользователи "
+        "и ПЗ платформы не пострадают.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_show", style="primary")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(ProfileFSM.waiting_del_bot)
+async def fsm_del_bot(message: Message, state: FSMContext) -> None:
+    """Нашли бота по ID/username — просим подтверждение удаления."""
+    if not is_super_admin(msg_uid(message)):
+        await state.clear()
+        await message.answer("⛔ Доступ запрещён")
+        return
+
+    await state.clear()
+    bot = _find_bot_any(message.text or "")
+    if bot is None:
+        await message.answer("🤷 Бот не найден. Проверь ID или @username.")
+        return
+
+    bot_id = int(bot["id"])
+    await message.answer(
+        f"{_bot_card_text(bot)}\n\n"
+        "⚠️ <b>Удалить этого бота?</b> Отменить будет нельзя.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 Да, удалить",
+                                      callback_data=f"adm_del_yes_{bot_id}", style="danger"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="profile_show",
+                                      style="primary"),
+            ]
+        ]),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^adm_del_ask_\d+$"))
+async def cb_adm_del_ask(callback: CallbackQuery) -> None:
+    """Подтверждение удаления из карточки найденного бота."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        await callback.answer("⚠️ Бот уже удалён", show_alert=True)
+        return
+
+    await render_callback(
+        callback,
+        f"{_bot_card_text(bot)}\n\n"
+        "⚠️ <b>Удалить этого бота?</b> Остальные боты не пострадают.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"adm_del_yes_{bot_id}",
+                                  style="danger")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_show", style="primary")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^adm_del_yes_\d+$"))
+async def cb_adm_del_yes(callback: CallbackQuery, child_manager: ChildManager) -> None:
+    """Собственно удаление одного бота."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    if not get_bot_by_id_any_owner(bot_id):
+        await callback.answer("⚠️ Бот уже удалён", show_alert=True)
+        return
+
+    try:
+        name = await _delete_bot_forever(bot_id, child_manager)
+    except Exception as e:
+        await callback.answer("⚠️ Не удалось удалить", show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"⚠️ Ошибка при удалении: {e}")
+        return
+
+    await render_callback(
+        callback,
+        f"🗑 Бот <b>{name}</b> удалён. Остальные боты продолжают работать.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_show")]
+        ]),
+    )
+    await callback.answer("🗑 Удалено")
+
+
+
+@router.callback_query(F.data.startswith("dead_bots"))
+async def cb_dead_bots(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    page = _parse_page(cb_data(callback), "dead_bots_p")
+    text, kb = _dead_bots_payload(page=page)
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "dead_check")
+async def cb_dead_check(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.answer("🔍 Проверяю ботов…")
+    checked, dead, skipped = await _check_bots_alive()
+    status = (
+        f"🔍 <b>Проверка завершена:</b> опрошено <b>{checked}</b>, "
+        f"нерабочих — <b>{dead}</b>."
+    )
+    if skipped:
+        status += (
+            f"\n⚠️ <b>{skipped}</b> ботов не удалось проверить — нет связи с "
+            "Telegram. Их статус не менялся: повтори проверку при появлении сети."
+        )
+    text, kb = _dead_bots_payload(status)
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^dead_del_\d+(_p\d+)?$"))
+async def cb_dead_del(callback: CallbackQuery, child_manager: ChildManager) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    raw = cb_data(callback)
+    head, _, page_tail = raw.partition("_p")
+    bot_id = int(head.split("_")[-1])
+    page = int(page_tail) if page_tail.isdigit() else 1
+    name = await _delete_bot_forever(bot_id, child_manager)
+    text, kb = _dead_bots_payload(f"🗑 <b>Бот удалён:</b> {name}.", page)
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "dead_del_all")
+async def cb_dead_del_all_ask(callback: CallbackQuery) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    dead = get_dead_bots()
+    if not dead:
+        text, kb = _dead_bots_payload("⚠️ Мёртвых ботов нет — удалять нечего.")
+        await render_callback(callback, text, kb)
+        return
+
+    text = (
+        "🗑 <b>Удалить всех мёртвых ботов?</b>\n\n"
+        f"Будет удалено ботов: <b>{len(dead)}</b> — вместе с их данными "
+        "(ПЗ, статистика, пользователи, привязки).\n\n"
+        "⚠️ Действие необратимо."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить всех", callback_data="dead_del_all_yes",
+                              style="danger")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="dead_bots", style="primary")],
+    ])
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data == "dead_del_all_yes")
+async def cb_dead_del_all_yes(callback: CallbackQuery, child_manager: ChildManager) -> None:
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    for row in get_dead_bots():
+        bot_id = int(row["bot_id"])
+        if child_manager.is_running(bot_id):
+            try:
+                await child_manager.stop_child(bot_id)
+            except Exception:
+                pass
+
+    removed = remove_dead_bots()
+    text, kb = _dead_bots_payload(f"🗑 <b>Удалено мёртвых ботов:</b> {len(removed)}.")
+    await render_callback(callback, text, kb)
 
 
 def profiles_kb(users: list[dict]) -> InlineKeyboardMarkup:
@@ -242,30 +853,26 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
     chats_label = "📎 Чаты" if any_chat else "🔗 Привязать чаты"
     chats_data = "chats_info" if any_chat else "chats_bind"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🤖 Боты", callback_data="my_bots", style="primary"),
-            InlineKeyboardButton(text="👥 Админы", callback_data="gadmins", style="primary"),
-            InlineKeyboardButton(text="📋 ПЗ", callback_data="gpz", style="primary"),
-        ],
+        # «Боты», «Админы» и «ПЗ» переехали в reply-меню — в профиле оставляем
+        # только то, что относится к настройкам владельца.
         [
             InlineKeyboardButton(text=chats_label, callback_data=chats_data),
-            InlineKeyboardButton(text="🛡 Антирейд", callback_data="antiraid", style="primary"),
+            InlineKeyboardButton(text="📊 Норма", callback_data="norm"),
         ],
+        # «Защита» — красная: внутри антирейд и антинакрутка.
+        [InlineKeyboardButton(text="🛡 Защита", callback_data="profile_protection",
+                              style="danger")],
         [
             InlineKeyboardButton(text="⏰ Напоминалка", callback_data="reminder_menu", style="primary"),
         ],
+        [InlineKeyboardButton(text="🕐 Время работы", callback_data="work_hours", style="primary")],
         [
-            InlineKeyboardButton(text="🚨 Антинакрутка", callback_data="antinakrutka",
-                                 style="primary"),
-            InlineKeyboardButton(text="📊 Норма", callback_data="norm", style="primary"),
-        ],
-        [
-            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer", style="primary"),
-            InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all", style="primary"),
+            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer", style="danger"),
+            InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all", style="danger"),
         ],
         [
             InlineKeyboardButton(text="📂 Мои ссылки и конфиги", callback_data="my_links",
-                                 style="primary"),
+                                 style="success"),
         ],
     ])
     if is_super_admin(user_id):
@@ -311,6 +918,52 @@ async def cb_profile_restart_all(callback: CallbackQuery,
     else:
         status = "🔄 У тебя нет запущенных ботов для перезапуска."
     await render_callback(callback, f"{status}\n\n{text}", kb)
+
+
+# ═══════════════ «🛡 Защита» — антирейд и антинакрутка в одном разделе ═══════════════
+
+def _protection_kb() -> InlineKeyboardMarkup:
+    """Клавиатура раздела «🛡 Защита»."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛡 Антирейд", callback_data="antiraid", style="primary")],
+        [InlineKeyboardButton(text="🚨 Антинакрутка", callback_data="antinakrutka", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
+    ])
+
+
+@router.callback_query(F.data == "profile_protection")
+async def cb_profile_protection(callback: CallbackQuery, state: FSMContext) -> None:
+    """«🛡 Защита» — один экран для антирейда и антинакрутки.
+
+    Раньше это были две отдельные кнопки в профиле; теперь они внутри раздела,
+    а сверху видно текущее состояние обеих защит.
+    """
+    await state.clear()
+    owner_id = cb_uid(callback)
+
+    raid = get_antiraid_settings(owner_id)
+    raid_state = "🟢 включён" if raid["enabled"] else "🔴 выключен"
+
+    nakr = get_antinakrutka_settings(owner_id)
+    if not int(nakr.get("enabled", 1)):
+        nakr_state = "🔴 выключена"
+    elif nakr["triggered"]:
+        nakr_state = "🚨 активна (защита от наплыва ПЗ)"
+    else:
+        nakr_state = "🟢 следит за новыми ПЗ"
+
+    text = (
+        "🛡 <b>Защита</b>\n\n"
+        "Две независимые системы защиты — для «чата админов» и для ПЗ "
+        "твоих ботов:\n\n"
+        f"🛡 <b>Антирейд</b> — {raid_state}\n"
+        "  ловит массовые заходы и спам в привязанном «чате админов».\n\n"
+        f"🚨 <b>Антинакрутка</b> — {nakr_state}\n"
+        "  ловит наплыв новых ПЗ (накрутку) и временно останавливает "
+        "создание топиков.\n\n"
+        "Выбери раздел 👇"
+    )
+    await render_callback(callback, text, _protection_kb())
 
 
 # ═══════════════ Передача прав владельца ═══════════════
@@ -468,7 +1121,6 @@ async def handle_transfer_link(message: Message, token: str) -> None:
 @router.callback_query(F.data.startswith("transfer_accept_"))
 async def cb_transfer_accept(callback: CallbackQuery,
                              child_manager: ChildManager) -> None:
-    from aiogram.exceptions import TelegramBadRequest
     token = cb_data(callback).split("transfer_accept_", 1)[1]
     transfer = get_transfer(token)
     if not transfer:
@@ -734,18 +1386,23 @@ async def cb_profiles_list(callback: CallbackQuery) -> None:
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     all_users = get_all_users_registry()
-    vld_count = sum(1 for u in all_users if get_user_bots(u["user_id"]))
-    bots_count = len(get_all_bots_flat())
+    owners = [int(u["user_id"]) for u in all_users if get_user_bots(u["user_id"])]
+    # Админов считаем уникальными: один человек может быть админом у нескольких
+    # владельцев (и раньше в счётчик попадали боты, а не админы).
+    admin_ids: set[int] = set()
+    for owner_id in owners:
+        admin_ids.update(int(a["user_id"]) for a in get_admins_all(owner_id))
     text = (
         "👥 <b>Профили пользователей</b>\n\n"
-        f"Всего пользователей: <b>{len(all_users)}</b>\n"
-        f"🤖 ВЛД (владельцы ботов): <b>{vld_count}</b>\n"
-        f"👥 Админы (по ботам): <b>{bots_count}</b>\n\n"
+        f"👤 Всего пользователей: <b>{len(all_users)}</b>\n"
+        f"🤖 ВЛД (владельцы ботов): <b>{len(owners)}</b>\n"
+        f"👥 Админов у владельцев: <b>{len(admin_ids)}</b>\n\n"
         "Выбери категорию:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 ВЛД (владельцы)", callback_data="profiles_vld", style="primary")],
         [InlineKeyboardButton(text="👥 Админы (по ботам)", callback_data="profiles_admins_bots", style="primary")],
+        [InlineKeyboardButton(text="🧟 Мёртвые боты", callback_data="dead_bots", style="danger")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin", style="primary")],
     ])
     await render_callback(callback, text, kb)
@@ -753,20 +1410,22 @@ async def cb_profiles_list(callback: CallbackQuery) -> None:
 
 # ═══════════════ ВЛД — владельцы (у кого есть хотя бы один бот) ═══════════════
 
-def _vld_kb(users: list[dict]) -> InlineKeyboardMarkup:
+def _vld_kb(users: list[dict], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Клавиатура списка ВЛД (постранично, компактные подписи)."""
     rows: list[list[InlineKeyboardButton]] = []
     for u in users:
         name = u.get("username") or u.get("first_name") or str(u["user_id"])
         status = "🚫" if u.get("blocked") else "🟢"
         rows.append([InlineKeyboardButton(
-            text=f"{status} {name} ({len(get_user_bots(u['user_id']))} бот.)",
+            text=_short(f"{status} {name} ⸱ 🤖 {len(get_user_bots(u['user_id']))}"),
             callback_data=f"profile_view_{u['user_id']}",
         )])
+    rows.extend(_pager_rows("profiles_vld_p", page, total_pages))
     rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.callback_query(F.data == "profiles_vld")
+@router.callback_query(F.data.startswith("profiles_vld"))
 async def cb_profiles_vld(callback: CallbackQuery) -> None:
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -777,8 +1436,13 @@ async def cb_profiles_vld(callback: CallbackQuery) -> None:
             callback, "🤖 <b>ВЛД</b>\n\nПока нет владельцев с ботами.", admin_kb()
         )
         return
-    text = f"🤖 <b>ВЛД — владельцы</b> ({len(vld)})\n\nВыбери владельца:"
-    await render_callback(callback, text, _vld_kb(vld))
+    page = _parse_page(cb_data(callback), "profiles_vld_p")
+    window, page, total_pages = _page_slice(vld, page)
+    text = (
+        f"🤖 <b>ВЛД — владельцы</b> ({len(vld)})\n\n"
+        f"Выбери владельца:{_page_note(page, total_pages)}"
+    )
+    await render_callback(callback, text, _vld_kb(window, page, total_pages))
 
 
 @router.callback_query(F.data.startswith("profile_view_"))
@@ -826,21 +1490,39 @@ async def cb_profile_unban(callback: CallbackQuery) -> None:
 
 # ═══════════════ Админы (по ботам) ═══════════════
 
-def _admins_bots_kb(bots: list[dict]) -> InlineKeyboardMarkup:
+def _owner_name(owner_id: int) -> str:
+    """Короткое имя владельца для подписи кнопки (username, имя или ID)."""
+    if not owner_id:
+        return "—"
+    u = get_user_registry(owner_id)
+    if u:
+        return u.get("username") or u.get("first_name") or f"ID:{owner_id}"
+    return f"ID:{owner_id}"
+
+
+def _bots_admins_kb(bots: list[dict], page: int,
+                    total_pages: int) -> InlineKeyboardMarkup:
+    """Список ботов с числом админов их владельца (постранично, компактно).
+
+    Админы в панели — «на владельца» (работают со всеми его ботами), поэтому
+    у ботов одного владельца число админов одинаковое: это и подписываем.
+    """
     rows: list[list[InlineKeyboardButton]] = []
     for b in bots:
-        owner = b.get("owner_id", 0)
-        admins = get_admins_all(owner) if owner else []
-        label = f"{bot_display_name(b)} ⸱ 🆔 {b['id']} ⸱ адм.{len(admins)}"
+        owner_id = int(b.get("owner_id") or 0)
+        admins = get_admins_all(owner_id) if owner_id else []
+        bot_name = b.get("first_name") or b.get("username") or f"bot_{b['id']}"
+        label = f"{bot_name} ⸱ 👤 {_owner_name(owner_id)} ⸱ 👥 {len(admins)}"
         rows.append([InlineKeyboardButton(
-            text=label,
+            text=_short(label),
             callback_data=f"profiles_a_bot_{b['id']}",
         )])
+    rows.extend(_pager_rows("profiles_admins_bots_p", page, total_pages))
     rows.append([InlineKeyboardButton(text="⬅️ Категории", callback_data="profiles_list", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.callback_query(F.data == "profiles_admins_bots")
+@router.callback_query(F.data.startswith("profiles_admins_bots"))
 async def cb_profiles_admins_bots(callback: CallbackQuery) -> None:
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -849,57 +1531,84 @@ async def cb_profiles_admins_bots(callback: CallbackQuery) -> None:
     if not bots:
         await render_callback(callback, "👥 <b>Админы</b>\n\nБотов пока нет.", admin_kb())
         return
-    text = f"👥 <b>Админы — по ботам</b> ({len(bots)} ботов)\n\nВыбери бот:"
-    await render_callback(callback, text, _admins_bots_kb(bots))
+
+    # Считаем админов один раз на владельца — иначе для каждого бота это был бы
+    # отдельный запрос, и на большом списке вкладка открывалась бы долго.
+    admins_total = 0
+    for owner_id in {int(b.get("owner_id") or 0) for b in bots}:
+        if owner_id:
+            admins_total += len(get_admins_all(owner_id))
+
+    page = _parse_page(cb_data(callback), "profiles_admins_bots_p")
+    window, page, total_pages = _page_slice(bots, page)
+    text = (
+        f"👥 <b>Админы — по ботам</b>\n\n"
+        f"🤖 Ботов: <b>{len(bots)}</b> ⸱ 👥 Админов у владельцев: "
+        f"<b>{admins_total}</b>\n\n"
+        f"Выбери бот:{_page_note(page, total_pages)}"
+    )
+    await render_callback(callback, text, _bots_admins_kb(window, page, total_pages))
 
 
-def _bot_admins_kb(bot_id: int, owner_id: int, admins: list[dict]) -> InlineKeyboardMarkup:
+def _bot_admins_kb(bot_id: int, owner_id: int, admins: list[dict],
+                   page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Карточки админов владельца бота: профиль · бан · удалить (постранично)."""
     rows: list[list[InlineKeyboardButton]] = []
     for a in admins:
         uname = f"@{a['username']}" if a.get("username") else f"ID:{a['user_id']}"
         banned = is_registry_user_banned(a["user_id"])
-        ban_action = "✅ Разбанить" if banned else "🚫 Забанить"
+        ban_label = "✅" if banned else "🚫"
         ban_data = f"profiles_a_unban_{a['user_id']}" if banned else f"profiles_a_ban_{a['user_id']}"
         rows.append([
             InlineKeyboardButton(
-                text=f"👤 #{a['tag']} ({uname})",
+                text=_short(f"👤 #{a['tag']} ⸱ {uname}"),
                 callback_data=f"profile_view_{a['user_id']}",
             ),
-            InlineKeyboardButton(text="🗑", callback_data=f"profiles_a_del_{owner_id}_{a['user_id']}"),
+            InlineKeyboardButton(text=ban_label, callback_data=ban_data,
+                                 style=("success" if banned else "danger")),
+            InlineKeyboardButton(text="🗑",
+                                 callback_data=f"profiles_a_del_{owner_id}_{a['user_id']}",
+                                 style="danger"),
         ])
-        rows.append([InlineKeyboardButton(text=ban_action, callback_data=ban_data, style=("danger" if not banned else "success"))])
+    rows.extend(_pager_rows(f"profiles_a_bot_{bot_id}_p", page, total_pages))
     rows.append([InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@router.callback_query(F.data.regexp(r"^profiles_a_bot_\d+$"))
+@router.callback_query(F.data.regexp(r"^profiles_a_bot_\d+(_p\d+)?$"))
 async def cb_profiles_a_bot(callback: CallbackQuery) -> None:
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    bot_id = int(cb_data(callback).split("_")[-1])
+    raw = cb_data(callback)
+    head, _, page_tail = raw.partition("_p")
+    bot_id = int(head.split("_")[-1])
+    page = int(page_tail) if page_tail.isdigit() else 1
+
     bot = get_bot_by_id_any_owner(bot_id)
     if not bot:
         await callback.answer("Бот не найден")
         return
-    owner_id = bot.get("owner_id", 0)
+    owner_id = int(bot.get("owner_id") or 0)
     admins = get_admins_all(owner_id)
     if not admins:
         await render_callback(
             callback,
-            f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 {bot_id})\n\nУ владельца нет админов.",
+            f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 {bot_id})\n\n"
+            "У владельца нет админов.",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ Список ботов", callback_data="profiles_admins_bots", style="primary")]
             ]),
         )
         return
+
+    window, page, total_pages = _page_slice(admins, page, ADMINS_PAGE_SIZE)
     text = (
         f"👥 <b>Админы — {bot_display_name(bot)}</b> (🆔 <code>{bot_id}</code>)\n\n"
-        f"Владелец: <code>{owner_id}</code>\n"
-        f"Админов: <b>{len(admins)}</b>\n\n"
-        "Выбери действие:"
+        f"👤 Владелец: <code>{owner_id}</code> ⸱ 👥 Админов: <b>{len(admins)}</b>\n\n"
+        f"Выбери действие:{_page_note(page, total_pages)}"
     )
-    await render_callback(callback, text, _bot_admins_kb(bot_id, owner_id, admins))
+    await render_callback(callback, text, _bot_admins_kb(bot_id, owner_id, window, page, total_pages))
 
 
 @router.callback_query(F.data.regexp(r"^profiles_a_del_\d+_\d+$"))
