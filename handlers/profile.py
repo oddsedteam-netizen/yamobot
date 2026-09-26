@@ -1,3 +1,7 @@
+"""Профиль, привязка чатов, админ-панель и рассылки."""
+
+import logging
+
 from aiogram import Bot, Router, F
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
@@ -9,6 +13,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+
+logger = logging.getLogger(__name__)
 
 from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
                               cb_uid, cb_username, cb_firstname, msg_uid,
@@ -717,10 +723,23 @@ async def cb_dead_bots(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "dead_check")
 async def cb_dead_check(callback: CallbackQuery) -> None:
+    """Проверка живых ботов по сети.
+
+    Проверка 100+ ботов занимает десятки секунд, за это время Telegram считает
+    колбэк протухшим. Поэтому отвечаем сразу, а результат показываем НОВЫМ
+    сообщением: так он точно дойдёт и не зависит от времени жизни колбэка.
+    """
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
+
     await callback.answer("🔍 Проверяю ботов…")
+    try:
+        await callback.message.edit_text("🔍 <b>Проверяю ботов…</b>\n\nЭто может занять "
+                                        "до минуты — ботов много.")
+    except Exception:
+        pass
+
     checked, dead, skipped = await _check_bots_alive()
     status = (
         f"🔍 <b>Проверка завершена:</b> опрошено <b>{checked}</b>, "
@@ -732,7 +751,10 @@ async def cb_dead_check(callback: CallbackQuery) -> None:
             "Telegram. Их статус не менялся: повтори проверку при появлении сети."
         )
     text, kb = _dead_bots_payload(status)
-    await render_callback(callback, text, kb)
+    try:
+        await callback.message.answer(text, reply_markup=kb)
+    except Exception as e:
+        logger.info("Не удалось отправить итог проверки: %s", e)
 
 
 @router.callback_query(F.data.regexp(r"^dead_del_\d+(_p\d+)?$"))

@@ -15,6 +15,7 @@ from aiogram.types import (
 )
 
 _logger = logging.getLogger(__name__)
+logger = _logger
 
 
 # ═══════════════ Нормализация ссылок ═══════════════════════════════════
@@ -145,9 +146,23 @@ async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
 async def render_callback(callback: CallbackQuery, text: str,
                           reply_markup: InlineKeyboardMarkup | None = None,
                           force_answer: bool = False) -> None:
-    """Редактирует сообщение колбэка (с фолбэком на новое) и гасит спиннер."""
+    """Редактирует сообщение колбэка (с фолбэком на новое) и гасит спиннер.
+
+    Ответ на колбэк может не пройти: если обработчик работал долго (например,
+    проверял 120 ботов по сети), Telegram к этому моменту уже считает query
+    «протухшим» и отвечает «query is too old …». Это не поломка — просто
+    часики на кнопке не закрылись, поэтому такую ошибку молча гасим.
+    """
     await edit_or_answer(callback.message, text, reply_markup, force_answer=force_answer)
-    await callback.answer()
+    try:
+        await callback.answer()
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e) or "query ID is invalid" in str(e):
+            logger.debug("Колбэк протух (экран уже показан): %s", e)
+        else:
+            logger.debug("Не удалось ответить на колбэк: %s", e)
+    except Exception as e:
+        logger.debug("Не удалось ответить на колбэк: %s", e)
 
 
 async def safe_edit(target: MaybeInaccessibleMessage | None, text: str,
