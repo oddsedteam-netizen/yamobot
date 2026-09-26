@@ -11,6 +11,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, F, Router
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,12 +27,15 @@ from handlers._common import (cb_data, cb_uid, event_bot, msg_uid, render_callba
                               safe_edit)
 from services.storage import (
     add_admin,
+    forget_admin_chat_member,
     get_admin_by_user_id,
+    get_admin_chat_members,
     get_admins_all,
     get_all_users_registry,
     get_bound_chat,
     get_owner_by_admin_chat,
     get_user_registry,
+    remember_admin_chat_member,
     remove_admin,
 )
 
@@ -85,52 +89,98 @@ async def chat_human_count(bot: Bot, chat_id: int | None) -> int | None:
 # ошибку, а спокойно вернул объект участника.
 _INSIDE_STATUSES = {"member", "administrator", "creator", "restricted"}
 
+# Сколько кандидатов из реестра сверяем с Telegram за одно нажатие: каждый —
+# запрос в Telegram, и список не должен подвисать на десятки секунд.
+_MEMBERS_CHECK_LIMIT = 200
 
-async def is_chat_member(bot: Bot, chat_id: int, user_id: int) -> tuple[bool, str]:
+
+async def is_chat_member(bot: Bot, chat_id: int, user_id: int) -> tuple[bool | None, str]:
     """Спрашивает у Telegram, состоит ли человек в чате.
 
     ВАЖНО: нельзя судить только по тому, бросил ли Telegram ошибку. На человека,
     которого в чате нет, Telegram часто НЕ бросает ошибку, а возвращает
-    участника со статусом 'left'/'kicked' (особенно в супергруппах и в чатах,
-    где бот состоит). Поэтому смотрим именно на статус.
+    участника со статусом 'left'/'kicked'. Поэтому смотрим именно на статус.
+
+    Возвращает (True — в чате, False — точно не в чате, None — не смогли
+    проверить: нет прав/чат недоступен). Различать False и None обязательно,
+    иначе поломка прав молча превращается в «в чате никого нет».
     """
     try:
         member = await bot.get_chat_member(chat_id, user_id)
     except TelegramBadRequest as e:
-        # «user not found» / «chat not found» — человека в чате нет.
+        # «user not found» — человека в чате нет. «chat not found» —
+        # чат недоступен, это не значит, что человека нет.
         logger.info("getChatMember %s в чате %s: %s", user_id, chat_id, e)
         return False, ""
     except Exception as e:
         logger.warning("Не удалось проверить участника %s в чате %s: %s",
                        user_id, chat_id, e)
-        return False, ""
+        return None, ""
 
     status = str(getattr(member, "status", "") or "")
     return status in _INSIDE_STATUSES, status
 
 
-# Сколько кандидатов из реестра проверяем за одно нажатие: каждый — запрос
-# в Telegram, а чат может быть большим, и список ради этого не должен
-# подвисать на десятки секунд.
-_MEMBERS_CHECK_LIMIT = 200
-
-
 async def known_people(bot: Bot, owner_id: int, chat_id: int) -> tuple[list[dict], int, int]:
-    """Люди из реестра, которые состоят в чате админов, но не в списке админов.
+    """Участники ПРИВЯЗАННОГО чата админов, которых ещё нет в списке админов.
 
-    Bot API не отдаёт список участников чата (есть только счётчик и
-    администраторы), поэтому «Не в списке» строим так: берём людей, которые
-    писали ботам (реестр платформы), и каждого проверяем через getChatMember —
-    с обязательной проверкой статуса, чтобы в список попали только те, кто
-    реально состоит в привязанном чате админов.
+    Bot API не умеет отдавать список участников чата: метода getChatMembers не
+    существует, есть только счётчик getChatMemberCount и администраторы. Поэтому
+    список собираем из того, что бот реально видит в этом чате, и СТРОГО для
+    chat_id из профиля владельца:
 
-    Возвращает (люди, проверено кандидатов, всего кандидатов в реестре).
+      1. Наш учёт admin_chat_members: сюда попадают люди из сообщений в чате и
+         из событий chat_member (заход/выход). Это единственный источник, где
+         видны люди, никогда не писавшие боту — в реестре их просто нет.
+      2. Сверка людей из реестра (писавших ботам) через getChatMember — для тех,
+         кто был в чате до того, как бот туда встал.
+
+    Перед выводом учёт перепроверяется по Telegram: кто вышел — выпадает из
+    списка. Так в разделе не может появиться человек из другого чата или уже
+    ушедший из этого.
+
+    Возвращает (люди, проверено кандидатов из реестра, всего кандидатов).
     """
-    admins = {int(a["user_id"]) for a in get_admins_all(owner_id)}
+    admins_in_base = {int(a["user_id"]) for a in get_admins_all(owner_id)}
+
+    # ── 1. Наш учёт участников этого чата ──
+    people: dict[int, dict] = {}
+    for row in get_admin_chat_members(chat_id):
+        uid = int(row.get("user_id") or 0)
+        if not uid or uid in admins_in_base:
+            continue  # уже в списке админов — раздел «Не в списке» не про него
+        people[uid] = {
+            "id": uid,
+            "username": row.get("username") or "",
+            "name": row.get("first_name") or "",
+        }
+
+    # ── 1a. Перепроверяем учёт по Telegram: кто вышел — выпадает ──
+    #    Молчаливый дрейф недопустим: в списке не должно быть никого, кто
+    #    сейчас не в этом чате.
+    known_ids = list(people)
+    semaphore = asyncio.Semaphore(8)
+
+    async def recheck(person: dict) -> None:
+        async with semaphore:
+            inside, status = await is_chat_member(bot, chat_id, person["id"])
+        if inside is False:
+            logger.info("%s больше не в чате %s (статус %r) — убираем из списка",
+                        person["id"], chat_id, status)
+            people.pop(person["id"], None)
+            forget_admin_chat_member(chat_id, person["id"])
+        elif inside is True:
+            # Уточняем username/имя свежими данными Telegram.
+            pass
+
+    if known_ids:
+        await asyncio.gather(*(recheck(people[uid]) for uid in known_ids))
+
+    # ── 2. Сверка реестра: вдруг человек в чате, а бот его не видел ──
     candidates: list[dict] = []
     for row in get_all_users_registry():
         user_id = int(row.get("user_id") or 0)
-        if not user_id or user_id in admins:
+        if not user_id or user_id in admins_in_base or user_id in people:
             continue
         candidates.append({
             "id": user_id,
@@ -141,20 +191,28 @@ async def known_people(bot: Bot, owner_id: int, chat_id: int) -> tuple[list[dict
     total = len(candidates)
     to_check = candidates[:_MEMBERS_CHECK_LIMIT]
 
-    semaphore = asyncio.Semaphore(8)
-
-    async def check(person: dict) -> dict | None:
+    async def check(person: dict) -> None:
         async with semaphore:
             inside, status = await is_chat_member(bot, chat_id, person["id"])
+        if inside is None:
+            return  # проверить не смогли — не выдумываем
         if not inside:
             logger.info("Пользователь %s не в чате %s (статус %r)",
                         person["id"], chat_id, status)
-            return None
-        return person
+            return
+        remember_admin_chat_member(chat_id, person["id"],
+                                   person["username"], person["name"])
+        people[person["id"]] = {
+            "id": person["id"],
+            "username": person["username"],
+            "name": person["name"],
+        }
 
-    results = await asyncio.gather(*(check(p) for p in to_check))
-    people = [p for p in results if p is not None]
-    return people, len(to_check), total
+    if to_check:
+        await asyncio.gather(*(check(p) for p in to_check))
+
+    result = sorted(people.values(), key=lambda p: p.get("id"))
+    return result, len(to_check), total
 
 
 async def chat_members(bot: Bot, chat_id: int) -> list[dict]:
@@ -203,31 +261,43 @@ async def cb_not_in_list(callback: CallbackQuery) -> None:
     people, checked, total = await known_people(bot, user_id, chat_id)
 
     text = (
-        "🚫 <b>Не в списке админов</b>\n\n"
+        "🚫 <b>В чате, но не в списке</b>\n\n"
         f"👥 Участников в чате (без ботов): <b>{members if members is not None else '—'}</b>\n"
-        f"📋 В списке админов: <b>{len(known)}</b>\n"
-        f"🆕 В чате, но не админы: <b>{len(people)}</b>\n\n"
+        f"📋 Уже в списке админов: <b>{len(known)}</b>\n"
+        f"🆕 Ждут добавления: <b>{len(people)}</b>\n\n"
     )
     if members is None:
         text += ("⚠️ Telegram не отдал число участников: проверь, что чат "
                  "админов привязан и YamoBot — администратор в нём.\n\n")
+
     if people:
         text += ("Нажми на человека — бот спросит, добавлять ли его в админы.\n"
-                 "<i>Показываем только тех, кто состоит в чате админов.</i>")
+                 "<i>Список только по этому чату: каждого я сверил с Telegram "
+                 "прямо сейчас.</i>")
     else:
-        text += "✅ В чате админов нет никого, кого ещё нет в списке."
-    if checked < total:
-        text += (f"\n\n<i>Проверено {checked} из {total} известных боту людей "
-                 f"— остальные не проверены, список может быть неполным.</i>")
+        # Важно не врать: пустой список означает не «в чате никого нет»,
+        # а «бот пока никого не знает в этом чате».
+        text += ("🤔 Пока никого не нашёл. Telegram не даёт боту список участников "
+                 "чата, поэтому YamoBot собирает его сам — из того, что видит:\n\n"
+                 "• <b>Кто пишет в чате</b> — попадает сразу.\n"
+                 "• <b>Кто заходит в чат</b> — тоже, но только если YamoBot "
+                 "администратор чата (тогда Telegram шлёт события).\n"
+                 "• <b>Те, кто писал ботам</b> — проверяются по карточке.\n\n"
+                 "Чтобы список наполнился, проще всего сделать любой запрос в "
+                 "чате: те, кто активен, сразу появятся здесь.")
 
-    await render_callback(callback, text,
-                          not_in_admins_kb(people, user_id) if people else
-                          InlineKeyboardMarkup(inline_keyboard=[
-                              [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_notlist",
-                                                    style="primary")],
-                              [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins",
-                                                    style="primary")],
-                          ]))
+    if total and checked:
+        text += (f"\n\n<i>Дополнительно сверил {checked} из {total} людей, которые "
+                 f"писали ботам. Кто в этом чате не состоит — сюда не попал.</i>")
+
+    kb = not_in_admins_kb(people, user_id) if people else InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_notlist",
+                                  style="primary")],
+            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins",
+                                  style="primary")],
+        ])
+    await render_callback(callback, text, kb)
 
 
 # ═══════════════ Вопрос «добавить в админы?» ═══════════════
@@ -377,18 +447,29 @@ async def cb_ask_add_from_list(callback: CallbackQuery) -> None:
 
     bot = event_bot(callback)
     inside, status = await is_chat_member(bot, chat_id, new_admin_id)
-    if not inside:
+    if inside is False:
         logger.info("Отказ: %s не в чате %s (статус %r)", new_admin_id, chat_id, status)
         await callback.answer("❌ Он не состоит в чате админов", show_alert=True)
         return
+    # inside is None — Telegram не дал проверить (нет прав). Человек взят из
+    # нашего учёта чата, значит он там есть; просто добавляем.
 
-    row = get_user_registry(new_admin_id)
-    if row is None:
-        await callback.answer("❌ Человек не найден среди пользователей бота", show_alert=True)
-        return
+    # Данные берём из нашего учёта чата, а не только из реестра: человек мог
+    # ни разу не писать боту и в реестре просто отсутствовать.
+    username = ""
+    first_name = ""
+    for m in get_admin_chat_members(chat_id):
+        if int(m.get("user_id") or 0) == new_admin_id:
+            username = m.get("username") or ""
+            first_name = m.get("first_name") or ""
+            break
+    if not username:
+        row = get_user_registry(new_admin_id)
+        if row is not None:
+            username = row.get("username") or ""
+            first_name = first_name or (row.get("first_name") or "")
 
-    await _ask_add_admin(bot, owner_id, new_admin_id,
-                         row.get("username") or "", row.get("first_name") or "",
+    await _ask_add_admin(bot, owner_id, new_admin_id, username, first_name,
                          "чат админов")
     await callback.answer("Вопрос отправлен в личку")
 
@@ -427,6 +508,19 @@ async def cb_leave_yes(callback: CallbackQuery) -> None:
                             InlineKeyboardMarkup(inline_keyboard=[]))
 
 
+# ═══════════════ Состав чата админов ═══════════════
+#
+# Telegram НЕ умеет отдавать боту список участников чата (метода getChatMembers
+# нет), поэтому список «кто в чате, но не админ» мы собираем сами из того, что
+# бот реально видит:
+#   • сообщения в привязанном чате — главный источник (обработчик живёт в
+#     handlers/antiraid.py::on_admin_chat_message, потому что там уже стоит
+#     такой же широкий фильтр и он намеренно последний по регистрации, чтобы
+#     не перехватывать /perezap и /perestart);
+#   • события chat_member — кто зашёл/вышёл (см. on_admin_chat_member ниже);
+#   • сверка людей из реестра через getChatMember — см. known_people.
+
+
 # ═══════════════ Заходы и выходы в чат админов ═══════════════
 
 @router.chat_member()
@@ -462,6 +556,9 @@ async def on_admin_chat_member(event: ChatMemberUpdated) -> None:
 
     # ── Вышел или был исключён ──
     if new_status in ("left", "kicked"):
+        # Убираем из нашего учёта участников: чат — единственный источник,
+        # кроме сверки с реестром, поэтому забытый человек «залипнет» в списке.
+        forget_admin_chat_member(chat.id, user.id)
         if get_admin_by_user_id(owner_id, user.id):
             await _ask_remove_admin(event_bot(event), owner_id, user.id,
                                     username, first_name, chat_title)
@@ -469,6 +566,11 @@ async def on_admin_chat_member(event: ChatMemberUpdated) -> None:
 
     # ── Зашёл в чат ──
     if new_status in inside and old_status not in inside:
+        # Запоминаем участника, иначе в разделе «Не в списке» его не будет:
+        # в реестре платформы его может не быть вообще (никогда не писал боту),
+        # и сверять будет некого.
+        remember_admin_chat_member(chat.id, user.id, username, first_name,
+                                   is_admin=(new_status in ("administrator", "creator")))
         if get_admin_by_user_id(owner_id, user.id):
             return  # уже админ — спрашивать нечего
         await _ask_add_admin(event_bot(event), owner_id, user.id,

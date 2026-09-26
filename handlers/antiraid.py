@@ -57,6 +57,7 @@ from services.storage import (
     set_antiraid_del_members,
     set_antiraid_triggered,
     is_admin_chat_moderator,
+    remember_admin_chat_member,
 )
 
 logger = logging.getLogger(__name__)
@@ -974,6 +975,16 @@ async def on_admin_chat_message(message: Message) -> None:
       1) предупреждение + удаление сообщений нарушителя;
       2) при повторном флуде (или флуде после недавнего предупреждения) —
          юзер навсегда убирается из чата, владелец уведомляется.
+
+    Заодно ЗАПОМИНАЕТ участника чата: Telegram не умеет отдавать боту список
+    участников (метода getChatMembers нет), а раздел «В чате, но не в списке»
+    строить надо по составу чата. Сюда попадает каждый, кто пишет в чате, даже
+    если он никогда не писал боту и его нет в реестре платформы. Учёт сделан
+    ДО проверки антирейда, чтобы собирать состав чата независимо от того,
+    включён ли антирейд.
+
+    Этот обработчик намеренно последний: команды (/perezap, /perestart и др.)
+    зарегистрированы раньше и обрабатываются первыми.
     """
     sender = message.from_user
     if not sender or getattr(sender, "is_bot", False):
@@ -983,6 +994,15 @@ async def on_admin_chat_message(message: Message) -> None:
     owner_id = get_owner_by_admin_chat(chat_id)
     if not owner_id:
         return
+
+    # Состав чата собираем всегда, независимо от настроек антирейда.
+    remember_admin_chat_member(
+        chat_id,
+        sender.id,
+        getattr(sender, "username", "") or "",
+        getattr(sender, "first_name", "") or "",
+    )
+
     settings = get_antiraid_settings(owner_id)
     if not settings["enabled"] or settings["triggered"] or chat_id in _ARMED:
         return
