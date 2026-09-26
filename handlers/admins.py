@@ -46,10 +46,7 @@ class AdminFSM(StatesGroup):
 def admins_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list", style="primary"),
-                InlineKeyboardButton(text="🚫 Не в списке", callback_data="adm_notlist", style="danger"),
-            ],
+            [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list", style="primary")],
             [InlineKeyboardButton(text="📊 Статистика", callback_data="gadmins_stats", style="primary")],
             [
                 InlineKeyboardButton(text="➕ Добавить админа", callback_data="gadmins_add", style="success"),
@@ -71,7 +68,6 @@ def admins_list_kb(extra_rows: list[list[InlineKeyboardButton]] | None = None) -
         rows.extend(extra_rows)
     rows.append([
         InlineKeyboardButton(text="➕ Добавить", callback_data="gadmins_add", style="success"),
-        InlineKeyboardButton(text="🚫 Не в списке", callback_data="adm_notlist", style="danger"),
     ])
     rows.append([
         InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary"),
@@ -535,7 +531,7 @@ async def cb_add_admin(callback: CallbackQuery, state: FSMContext) -> None:
         "Формат:\n<code>123456789 тег</code>\n\n"
         "Username не нужен: если он есть, бот подставит его сам.\n"
         "ID можно узнать через @userinfobot или посмотреть у человека в "
-        "боте — кнопка «➕ Добавить» есть и в списке «🚫 Не в списке»."
+        "боте — кнопка «➕ Добавить» есть и в списке админов."
     )
 
     if callback.message:

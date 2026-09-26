@@ -429,20 +429,6 @@ def ensure_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        -- Участники привязанного «чата админов». Bot API не отдаёт список
-        -- участников чата, поэтому мы копим его сами: бот — администратор
-        -- чата и получает события chat_member (кто зашёл/вышел), а при
-        -- ручной сверке добавляем тех, кого нашли через getChatMember.
-        CREATE TABLE IF NOT EXISTS admin_chat_members (
-            chat_id    INTEGER NOT NULL,
-            user_id    INTEGER NOT NULL,
-            username   TEXT DEFAULT '',
-            first_name TEXT DEFAULT '',
-            is_admin   INTEGER DEFAULT 0,
-            seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (chat_id, user_id)
-        );
-
         CREATE TABLE IF NOT EXISTS transfers (
             token          TEXT PRIMARY KEY,
             from_user_id   INTEGER NOT NULL,
@@ -728,7 +714,19 @@ def ensure_db() -> None:
     # Один ТГК — один владелец: снимаем дубли привязок, оставшиеся от старых
     # версий (см. handlers/channels.py — там же проверка прав на привязку).
     _migrate_single_channel_owner(conn)
+    _drop_admin_chat_members(conn)
     conn.commit()
+
+
+def _drop_admin_chat_members(conn: sqlite3.Connection) -> None:
+    """Удаляет таблицу учёта участников «чата админов».
+
+    Раздел «Не в списке» удалён: собрать полный состав чата бот не может
+    (метода getChatMembers в Bot API нет), и раздел только вводил в
+    заблуждение. Таблица больше не нужна — убираем, чтобы не осталось
+    мёртвых данных.
+    """
+    conn.execute("DROP TABLE IF EXISTS admin_chat_members")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2522,70 +2520,6 @@ def get_owner_by_admin_chat(chat_id: int) -> int | None:
         (chat_id,)
     ).fetchone()
     return row[0] if row else None
-
-
-# ═══════════════════════════════════════════════════════════
-#  Участники «чата админов» (свой учёт, Bot API списка не даёт)
-# ═══════════════════════════════════════════════════════════
-
-def remember_admin_chat_member(chat_id: int, user_id: int, username: str = "",
-                               first_name: str = "", is_admin: bool = False) -> None:
-    """Запоминает участника чата админов (зашёл в чат или найден сверкой)."""
-    if not chat_id or not user_id:
-        return
-    conn = _get_conn()
-    with _lock:
-        conn.execute(
-            "INSERT INTO admin_chat_members "
-            "(chat_id, user_id, username, first_name, is_admin, seen_at) "
-            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
-            "username=CASE WHEN excluded.username != '' THEN excluded.username "
-            "              ELSE admin_chat_members.username END, "
-            "first_name=CASE WHEN excluded.first_name != '' THEN excluded.first_name "
-            "              ELSE admin_chat_members.first_name END, "
-            "is_admin=excluded.is_admin, seen_at=CURRENT_TIMESTAMP",
-            (chat_id, user_id, username or "", first_name or "", 1 if is_admin else 0),
-        )
-        conn.commit()
-
-
-def forget_admin_chat_member(chat_id: int, user_id: int) -> None:
-    """Человек вышел из чата админов — убираем его из нашего учёта."""
-    conn = _get_conn()
-    with _lock:
-        conn.execute(
-            "DELETE FROM admin_chat_members WHERE chat_id = ? AND user_id = ?",
-            (chat_id, user_id),
-        )
-        conn.commit()
-
-
-def get_admin_chat_members(chat_id: int) -> list[dict]:
-    """Все запомненные участники чата админов (свежие — первыми)."""
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM admin_chat_members WHERE chat_id = ? "
-        "ORDER BY is_admin DESC, seen_at DESC",
-        (chat_id,),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def count_admin_chat_members(chat_id: int) -> int:
-    conn = _get_conn()
-    row = conn.execute(
-        "SELECT COUNT(*) FROM admin_chat_members WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
-    return int(row[0]) if row else 0
-
-
-def clear_admin_chat_members(chat_id: int) -> None:
-    """Забывает всех участников чата (например, чат перепривязали)."""
-    conn = _get_conn()
-    with _lock:
-        conn.execute("DELETE FROM admin_chat_members WHERE chat_id = ?", (chat_id,))
-        conn.commit()
 
 
 def set_pending_bind(user_id: int, kind: str | None) -> bool:

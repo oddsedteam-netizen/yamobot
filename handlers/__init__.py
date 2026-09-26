@@ -81,7 +81,7 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(editor_router)
     dp.include_router(mailing_router)
     dp.include_router(admins_router)
-    # Заходы/выходы в чат админов и список «не в списке».
+    # Заходы/выходы в чат админов.
     dp.include_router(admin_chat_watch_router)
     dp.include_router(coowners_router)
     dp.include_router(pz_router)
