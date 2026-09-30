@@ -35,7 +35,7 @@ from aiogram.types import (
 
 from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
-                              render_callback, try_edit_answer, try_edit)
+                              try_edit_answer, try_edit)
 from services import premium_emoji as premium
 from services.config import proxy_settings
 from services.constants import BASE_WELCOME, BOT_CREDIT
@@ -810,6 +810,67 @@ def _topic_refuse_only_kb(topic_id: int, group_chat_id: int) -> InlineKeyboardMa
                              callback_data=f"refuse_{topic_id}_{group_chat_id}",
                              style="danger"),
     ]])
+
+
+def _topic_refuse_choice_kb(topic_id: int, group_chat_id: int) -> InlineKeyboardMarkup:
+    """Выбор «как сообщить ПЗ об отказе» + «⬅️ Отмена»."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🤫 Анонимно",
+            callback_data=f"refuse_q_{topic_id}_{group_chat_id}_0",
+            style="primary",
+        ),
+        InlineKeyboardButton(
+            text="📣 Сообщить ПЗ",
+            callback_data=f"refuse_q_{topic_id}_{group_chat_id}_1",
+            style="danger",
+        ),
+    ], [
+        InlineKeyboardButton(text="⬅️ Отмена",
+                             callback_data="refuse_cancel",
+                             style="primary"),
+    ]])
+
+
+# Вопрос об отказе. Вынесен в константу, чтобы текст не разъезжался с тестами.
+REFUSE_ASK_TEXT = (
+    "🚫 <b>Отказаться от обращения?</b>\n\n"
+    "Как сообщить об этом пользователю?\n\n"
+    "🤫 <b>Анонимно</b> — пользователь ничего не узнает, увидит "
+    "только обычную смену админа.\n"
+    "📣 <b>Сообщить ПЗ</b> — пользователь получит уведомление, "
+    "что админ отказался и ему ищут нового."
+)
+
+
+async def _ask_refuse_confirm(bot_obj: Bot, topic_id: int,
+                              group_chat_id: int) -> bool:
+    """Спрашивает у админа, как сообщить ПЗ об отказе.
+
+    Вопрос уходит **отдельным** сообщением, а шапка ПЗ с кнопками
+    «✋ Я беру» / «🚫 Отказ» остаётся нетронутой.
+
+    Регресс, ради которого так сделано: раньше вопрос ПОДМЕНЯЛ текст шапки
+    (``render_callback``), а «⬅️ Отмена» ставила «Отказ отменён» вообще без
+    клавиатуры. Вернуть шапку было нечем — админ терял и инфу о ПЗ, и обе
+    кнопки: ни взять обращение, ни отказаться позже было нельзя.
+
+    False — вопрос отправить не удалось (наружу не бросаем: админ просто
+    увидит уведомление Telegram об ошибке).
+    """
+    try:
+        await _send_with_gate(
+            bot_obj, group_chat_id,
+            lambda: bot_obj.send_message(
+                chat_id=group_chat_id, message_thread_id=topic_id,
+                text=REFUSE_ASK_TEXT,
+                reply_markup=_topic_refuse_choice_kb(topic_id, group_chat_id),
+            ),
+        )
+    except Exception as e:
+        logger.warning("Не удалось отправить вопрос об отказе: %s", e)
+        return False
+    return True
 
 
 async def _pin_topic_action(bot_obj: Bot, bot_id: int, group_chat_id: int,
@@ -1672,6 +1733,81 @@ def _drop_reply(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in kwargs.items() if key != "reply_to_message_id"}
 
 
+# Эмодзи, которые Telegram принимает в ``send_dice``. Другие он отвергает,
+# поэтому незнакомый эмодзи подменяем стандартным кубиком.
+_DICE_EMOJI = ("🎲", "🎯", "🏀", "⚽", "🎳", "🎰")
+
+# Типы сообщений, которые боту переслать НЕЛЬЗЯ (Telegram не даёт пересоздать
+# их через Bot API). Вместо самого сообщения получатель увидит понятную
+# пометку: молчаливая потеря тут хуже всего — админ ответил, а ПЗ не понял,
+# что вообще что-то было.
+_NON_COPYABLE_NOTES = {
+    "poll": "📊 Опрос — Telegram не позволяет боту переслать его.",
+    "story": "📸 История — Telegram не даёт боту переслать её.",
+    "game": "🎮 Игра — Telegram не даёт боту переслать её.",
+    "paid_media": "💰 Платное медиа — бот не может его переслать.",
+    "invoice": "🧾 Счёт — бот не может его переслать.",
+}
+
+
+def _content_type_of(source_msg: Message) -> str:
+    """Строковый тип содержимого сообщения (``location``, ``poll``, …).
+
+    Нужен именно строковый вид: ``Message.content_type`` в aiogram возвращает
+    ``ContentType`` — это str-enum, у которого ``str()`` даёт
+    ``ContentType.LOCATION``, а не ``location``. Из-за этого поиск по словарю
+    молча не срабатывал бы.
+    """
+    ctype = source_msg.content_type
+    return str(getattr(ctype, "value", ctype))
+
+
+def _dice_emoji(source_msg: Message) -> str:
+    """Эмодзи «кубика»; незнакомый Telegram не примет — берём стандартный."""
+    dice = source_msg.dice
+    emoji = dice.emoji if dice and dice.emoji else ""
+    return emoji if emoji in _DICE_EMOJI else "🎲"
+
+
+def _describe_message(source_msg: Message) -> str:
+    """Короткое описание сообщения — для журнала и диагностики.
+
+    Без него строка «сообщение не доставлено» бесполезна: непонятно, ЧТО
+    именно потерялось. Пример: ``текст «привет, хочу заказ»`` или ``геолокация``.
+    """
+    if source_msg.photo:
+        return "фото"
+    if source_msg.video:
+        return "видео"
+    if source_msg.sticker:
+        return "стикер"
+    if source_msg.animation:
+        return "GIF"
+    if source_msg.voice:
+        return "голосовое"
+    if source_msg.video_note:
+        return "видео-кружок"
+    if source_msg.audio:
+        return "аудио"
+    if source_msg.document:
+        name = (source_msg.document.file_name or "") if source_msg.document else ""
+        return f"файл «{name}»" if name else "файл"
+    if source_msg.location or source_msg.venue:
+        return "геолокация"
+    if source_msg.contact:
+        return "контакт"
+    if source_msg.dice:
+        return f"кубик {_dice_emoji(source_msg)}"
+    if source_msg.poll:
+        return "опрос"
+
+    text = (source_msg.text or source_msg.caption or "").strip().replace("\n", " ")
+    if text:
+        preview = text[:60] + ("…" if len(text) > 60 else "")
+        return f"текст «{preview}»"
+    return f"сообщение типа {_content_type_of(source_msg)}"
+
+
 def _source_media(source_msg: Message) -> tuple[str, str] | None:
     """Тип и file_id самого крупного медиа сообщения (или None)."""
     if source_msg.photo:
@@ -1815,8 +1951,53 @@ async def _copy_message(source_msg: Message, bot: Bot, kwargs: dict[str, Any],
     if source_msg.video_note:
         return await bot.send_video_note(**kwargs, video_note=source_msg.video_note.file_id)
 
+    # ── Типы, которых нет в _source_media ───────────────────────────────
+    # Раньше они проваливались в проверку текста ниже и молча возвращали None:
+    # жалоба «некоторые сообщения не доходят, и непонятно какие». Теперь их
+    # либо пересылаем как есть (геолокация, контакт, кубик), либо честно
+    # помечаем текстом, если Telegram пересоздать сообщение не даёт.
+    if source_msg.location is not None:
+        return await bot.send_location(
+            **kwargs,
+            latitude=source_msg.location.latitude,
+            longitude=source_msg.location.longitude,
+        )
+
+    if source_msg.venue is not None:
+        venue = source_msg.venue
+        return await bot.send_venue(
+            **kwargs,
+            latitude=venue.location.latitude,
+            longitude=venue.location.longitude,
+            title=venue.title,
+            address=venue.address,
+        )
+
+    if source_msg.contact is not None:
+        contact = source_msg.contact
+        return await bot.send_contact(
+            **kwargs,
+            phone_number=contact.phone_number,
+            first_name=contact.first_name,
+            last_name=contact.last_name or "",
+        )
+
+    if source_msg.dice is not None:
+        return await bot.send_dice(**kwargs, emoji=_dice_emoji(source_msg))
+
+    note = _NON_COPYABLE_NOTES.get(_content_type_of(source_msg))
+    if note:
+        logger.info("Сообщение типа %s боту переслать нельзя — отправляю пометку",
+                    _content_type_of(source_msg))
+        return await bot.send_message(**kwargs, text=note, **extra)
+
     text_kw = _text_kwargs(source_msg, native)
     if not text_kw["text"]:
+        # Ни текста, ни известного медиа: тип, который бот пока не умеет
+        # копировать. Раньше отсюда МОЛЧА возвращался None — сообщение
+        # исчезало без единой строки в журнале. Теперь это видно в логе.
+        logger.warning("Переслать не удалось (%s): тип %s бот не поддерживает",
+                       _describe_message(source_msg), _content_type_of(source_msg))
         return None
     try:
         return await bot.send_message(**kwargs, **text_kw, **extra)
@@ -1918,11 +2099,14 @@ async def _send_to_user(source_msg: Message, bot: Bot,
         )
     except TelegramForbiddenError:
         # Юзер заблокировал/забанил бота — обрабатываем топик
+        logger.warning("ПЗ %s заблокировал бота — %s не доставлено",
+                       chat_id, _describe_message(source_msg))
         if bot_id:
             await _handle_user_blocked(bot, bot_id, chat_id)
         return None
     except Exception as e:
-        logger.error("Ошибка отправки юзеру: %s", e)
+        logger.error("Не удалось отправить ПЗ %s: %s | не доставлено: %s",
+                     chat_id, e, _describe_message(source_msg))
     return None
 
 
@@ -2698,32 +2882,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             await callback.answer("❌ Это не твоё обращение", show_alert=True)
             return
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🤫 Анонимно",
-                callback_data=f"refuse_q_{topic_id}_{group_chat_id}_0",
-                style="primary",
-            ),
-            InlineKeyboardButton(
-                text="📣 Сообщить ПЗ",
-                callback_data=f"refuse_q_{topic_id}_{group_chat_id}_1",
-                style="danger",
-            ),
-        ], [
-            InlineKeyboardButton(text="⬅️ Отмена",
-                                  callback_data="refuse_cancel",
-                                  style="primary"),
-        ]])
-        await render_callback(
-            callback,
-            "🚫 <b>Отказаться от обращения?</b>\n\n"
-            "Как сообщить об этом пользователю?\n\n"
-            "🤫 <b>Анонимно</b> — пользователь ничего не узнает, увидит "
-            "только обычную смену админа.\n"
-            "📣 <b>Сообщить ПЗ</b> — пользователь получит уведомление, "
-            "что админ отказался и ему ищут нового.",
-            kb,
-        )
+        # Вопрос уходит ОТДЕЛЬНЫМ сообщением — шапку ПЗ с кнопками
+        # «✋ Я беру» / «🚫 Отказ» не переписываем (см. _ask_refuse_confirm).
+        await _ask_refuse_confirm(bot_obj, topic_id, group_chat_id)
+        await callback.answer()
 
     @child_dp.callback_query(F.data.regexp(r"^refuse_q_-?\d+_-?\d+_[01]$"))
     async def cb_refuse_confirm(callback: CallbackQuery) -> None:
@@ -2794,6 +2956,17 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
 
     @child_dp.callback_query(F.data == "refuse_cancel")
     async def cb_refuse_cancel(callback: CallbackQuery) -> None:
+        """Админ передумал отказываться.
+
+        Правим ТОЛЬКО сообщение с вопросом об отказе: шапка ПЗ с кнопками
+        «✋ Я беру» / «🚫 Отказ» при отказе не переписывается (см.
+        ``_ask_refuse_confirm``), поэтому после отмены обе кнопки остаются на
+        месте — обращение можно взять или отклонить позже в любой момент.
+
+        Регресс: раньше вопрос подменял текст шапки, а здесь она затиралась
+        на «Отказ отменён» вообще без клавиатуры — админ терял и инфу о ПЗ, и
+        обе кнопки, вернуть их было нечем.
+        """
         await callback.answer("Отменено")
         await try_edit_answer(callback.message, "👌 Отказ отменён.")
 
@@ -3191,6 +3364,14 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 if message.text:
                     save_log_message(bot_id, user_chat_id, "in", message.text,
                                      msg_username(message) or "")
+            else:
+                # Первое сообщение ПЗ не доехало в только что созданный топик.
+                # Без описания тут не понять, ЧТО потерялось: ПЗ «молчит», а
+                # в журнале только техническая ошибка отправки.
+                logger.warning(
+                    "Первое сообщение ПЗ %s не доставлено в топик %s. Сообщение: %s",
+                    user_chat_id, new_topic_id, _describe_message(message),
+                )
 
             try:
                 if need_ask:
@@ -3257,9 +3438,12 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 # Временный сбой доставки — топик НЕ трогаем: иначе при спаме
                 # каждое неудачное сообщение плодило бы новый топик, а ПЗ
                 # «размазывался» бы по нескольким топикам.
+                # Пишем, что именно не доехало: по строке «не удалось
+                # доставить» без описания невозможно понять, что теряется.
                 logger.warning(
-                    "Не удалось доставить сообщение в топик %s (юзера %s).",
-                    topic_id, user_chat_id,
+                    "Не удалось доставить сообщение в топик %s (юзера %s), "
+                    "но топик рабочий. Сообщение: %s",
+                    topic_id, user_chat_id, _describe_message(message),
                 )
 
     # ═══════════════ Закрытие/открытие топика ═══════════════
@@ -3360,10 +3544,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             # Раньше в этом случае запись не появлялась, и напоминалка
             # приходила с «ПЗ без ответа!» на ПЗ, которому админ ответил.
             # Поэтому отмечаем активность топика независимо от доставки.
+            # В строку добавлено, ЧТО именно не доехало: без этого «сообщение
+            # не доставлено» не помогало понять, какие сообщения теряются.
             logger.info(
-                "Бот %s: ответ админа в топик %s не доставлен ПЗ (%s), "
-                "но засчитан как ответ",
-                bot_id, thread_id, user_chat_id,
+                "Бот %s: ответ админа в топик %s (%s) не доставлен ПЗ %s, "
+                "но засчитан как ответ. Сообщение: %s",
+                bot_id, thread_id, topic_web_link(group_chat_id, thread_id),
+                user_chat_id, _describe_message(message),
             )
 
         # Отметка активности топика: последним написал АДМИН, значит ПЗ
