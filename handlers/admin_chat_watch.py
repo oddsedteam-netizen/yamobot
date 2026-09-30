@@ -18,7 +18,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import (cb_data, cb_uid, event_bot, msg_uid, safe_edit)
+from handlers._common import (cb_data, cb_uid, event_bot, html_escape, msg_uid,
+                              safe_edit)
 from services.storage import (
     add_admin,
     get_admin_by_user_id,
@@ -77,13 +78,13 @@ async def chat_human_count(bot: Bot, chat_id: int | None) -> int | None:
 async def _ask_add_admin(bot: Bot, owner_id: int, user_id: int,
                          username: str, first_name: str, chat_title: str) -> None:
     """Спрашивает в ЛС владельца: добавлять ли нового участника в админы."""
-    who = f"@{username}" if username else f"ID:{user_id}"
-    name = f" ({first_name})" if first_name else ""
+    who = f"@{html_escape(username)}" if username else f"ID:{user_id}"
+    name = f" ({html_escape(first_name)})" if first_name else ""
     text = (
         "🆕 <b>Новый участник в чате админов</b>\n\n"
         f"👤 {who}{name}\n"
         f"🆔 <code>{user_id}</code>\n"
-        f"💬 Чат: <b>{chat_title}</b>\n\n"
+        f"💬 Чат: <b>{html_escape(chat_title)}</b>\n\n"
         "Добавить его в список админов?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -103,13 +104,13 @@ async def _ask_add_admin(bot: Bot, owner_id: int, user_id: int,
 async def _ask_remove_admin(bot: Bot, owner_id: int, user_id: int,
                             username: str, first_name: str, chat_title: str) -> None:
     """Спрашивает в ЛС: убрать ли участника из списка админов (он вышел)."""
-    who = f"@{username}" if username else f"ID:{user_id}"
-    name = f" ({first_name})" if first_name else ""
+    who = f"@{html_escape(username)}" if username else f"ID:{user_id}"
+    name = f" ({html_escape(first_name)})" if first_name else ""
     text = (
         "🚪 <b>Админ вышел из чата</b>\n\n"
         f"👤 {who}{name}\n"
         f"🆔 <code>{user_id}</code>\n"
-        f"💬 Чат: <b>{chat_title}</b>\n\n"
+        f"💬 Чат: <b>{html_escape(chat_title)}</b>\n\n"
         "Он был в списке админов. Убрать его из списка?"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[

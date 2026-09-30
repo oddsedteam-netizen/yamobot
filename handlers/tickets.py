@@ -386,8 +386,8 @@ async def _create_ticket_and_notify(source: CallbackQuery | Message,
     header = (
         f"🎫 <b>Новый тикет #{ticket_id}</b>\n\n"
         f"🗂 Категория: <b>{_html(title)}</b>\n"
-        f"👤 {first_name or '—'}"
-        + (f" (@{username})" if username else "")
+        f"👤 {_html(first_name) or '—'}"
+        + (f" (@{_html(username)})" if username else "")
         + f"\n🆔 <code>{user_id}</code>\n"
         f"🤖 Ботов у него: <b>{len(get_user_bots(user_id))}</b>\n"
         f"📎 Фото: <b>{len(data.get('tk_photos') or [])}</b>\n"

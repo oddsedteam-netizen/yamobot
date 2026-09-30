@@ -371,6 +371,51 @@ def _bot_name_of(bot_id: int) -> str:
     return bot_display_name(info) if info else f"bot_{bot_id}"
 
 
+def _bot_admin_tag(bot_id: int, user_id: int) -> str | None:
+    """Тег админа для топика (или None, если человек не админ этого бота).
+
+    Единая точка «кто здесь админ»: используется и кнопкой «✋ Я беру»,
+    и проверками команд ``/ban``, ``/unban``, ``/otkaz``. Раньше эти команды
+    вообще не проверяли отправителя — любой участник «чата работы» мог
+    забанить ПЗ или отказаться от обращения за админа.
+    """
+    owner_id = get_bot_owner(bot_id) or 0
+    admin = get_admin_by_user_id(owner_id, user_id)
+    if not admin and owner_id != 0:
+        # Легаси-записи (до введения owner_id) лежат с owner_id = 0.
+        admin = get_admin_by_user_id(0, user_id)
+    if admin:
+        return str(admin["tag"])
+
+    # Владелец бота — всегда админ, даже без записи в таблице admins.
+    if owner_id and owner_id == user_id:
+        return f"owner:{user_id}"
+    return None
+
+
+def _is_bot_admin(bot_id: int, user_id: int) -> bool:
+    """Админ ли этот человек у данного бота (или сам владелец).
+
+    Нужен для команд в топике: они меняют состояние ПЗ, поэтому должны быть
+    доступны только админам и владельцу.
+    """
+    if not user_id:
+        return False
+    return _bot_admin_tag(bot_id, user_id) is not None
+
+
+async def _deny_not_admin(message: Message) -> None:
+    """Отвечает, что команда доступна только админу.
+
+    Отказ НЕ молчаливый: иначе человек решит, что команда сломалась, и
+    напишет в поддержку.
+    """
+    try:
+        await message.answer("⛔ Команда доступна только администратору этого бота.")
+    except Exception:
+        logger.debug("Не удалось ответить на отказ в команде", exc_info=True)
+
+
 async def _main_send(chat_id: int, **kwargs: Any):
     """Отправка от основного бота YamoBot (через «шлюз», с учётом flood-wait).
 
@@ -1100,7 +1145,7 @@ async def _ask_change_admin(bot_obj: Bot, bot_id: int, user_chat_id: int,
 
 
 async def _send_admin_greeting(bot_obj: Bot, bot_id: int, user_chat_id: int,
-                              admin_user_id: int) -> None:
+                              admin_user_id: int) -> bool:
     """Отправляет ПЗ заготовленное приветствие админа (если оно есть).
 
     Приветствие заводится админом в основном боте: «🆔 YID» → «Моё
@@ -1109,21 +1154,25 @@ async def _send_admin_greeting(bot_obj: Bot, bot_id: int, user_chat_id: int,
 
     Не заменяет ответ админа — уходит первым сообщением, чтобы ПЗ сразу
     получил представление о том, кто ему отвечает.
+
+    Возвращает True, только если приветствие реально доставлено: вызывающий
+    код показывает админу «✅ отправлено» лишь при успехе, иначе он решил бы,
+    что ПЗ получил текст, которого тот не видел.
     """
     if not user_chat_id or not admin_user_id:
-        return
+        return False
     try:
         greeting = get_admin_greeting(bot_id, admin_user_id)
     except Exception:
         logger.debug("Не удалось прочитать приветствие админа", exc_info=True)
-        return
+        return False
     if not greeting:
         return
 
     text = str(greeting.get("text") or "").strip()
     photo = str(greeting.get("photo_id") or "").strip()
     if not text and not photo:
-        return
+        return False
 
     entities = None
     raw_entities = str(greeting.get("text_entities") or "[]")
@@ -1187,6 +1236,107 @@ async def _send_admin_greeting(bot_obj: Bot, bot_id: int, user_chat_id: int,
             except Exception:
                 logger.debug("Не удалось отправить текст приветствия",
                              exc_info=True)
+                return False
+            return True
+        return False
+    return True
+
+
+def _greeting_prompt_kb(topic_id: int, group_chat_id: int) -> InlineKeyboardMarkup:
+    """Кнопки подтверждения отправки приветствия."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да — отправить",
+                             callback_data=f"greet_yes_{topic_id}_{group_chat_id}",
+                             style="success"),
+        InlineKeyboardButton(text="🚫 Нет — не отправлять",
+                             callback_data=f"greet_no_{topic_id}_{group_chat_id}",
+                             style="danger"),
+    ]])
+
+
+GREETING_ASK_TEXT = (
+    "💬 <b>Отправить приветствие?</b>\n\n"
+    "У вас заготовлено приветствие для этого бота.\n"
+    "Отправить его пользователю первым сообщением?"
+)
+
+
+async def _ask_admin_greeting(bot_obj: Bot, bot_id: int, topic_id: int,
+                              group_chat_id: int, admin_user_id: int) -> bool:
+    """Спрашивает админа, отправлять ли заготовленное приветствие.
+
+    Раньше приветствие уходило ПЗ СРАЗУ после «✋ Я беру». Владелец просил
+    подтверждение: текст может быть неуместен для конкретного обращения,
+    а отменить отправленное сообщение уже нельзя.
+
+    Вопрос появляется ТОЛЬКО если приветствие реально заведено — иначе нечего
+    спрашивать (поведение как раньше: ничего не отправляем).
+
+    False — приветствия нет или вопрос отправить не удалось.
+    """
+    if not admin_user_id:
+        return False
+    try:
+        greeting = get_admin_greeting(bot_id, admin_user_id)
+    except Exception:
+        logger.debug("Не удалось прочитать приветствие админа", exc_info=True)
+        return False
+    if not greeting:
+        return False
+
+    has_content = bool(str(greeting.get("text") or "").strip()
+                       or str(greeting.get("photo_id") or "").strip())
+    if not has_content:
+        return False
+
+    try:
+        await _send_with_gate(
+            bot_obj, group_chat_id,
+            lambda: bot_obj.send_message(
+                chat_id=group_chat_id, message_thread_id=topic_id,
+                text=GREETING_ASK_TEXT,
+                reply_markup=_greeting_prompt_kb(topic_id, group_chat_id),
+            ),
+        )
+    except Exception as e:
+        logger.warning("Не удалось спросить про приветствие: %s", e)
+        return False
+    return True
+
+
+async def _apply_greeting_decision(bot_obj: Bot, bot_id: int, admin_user_id: int,
+                                   topic_id: int, group_chat_id: int,
+                                   send: bool,
+                                   callback_message: Any = None) -> tuple[bool, str]:
+    """Применяет решение админа по приветствию.
+
+    Возвращает ``(выполнено, текст-для-админа)``. Проверки здесь, а не в
+    хендлере, чтобы их можно было протестировать: кнопки лежат в общем чате
+    и доступны любому админу.
+    """
+    topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
+    if not topic:
+        return False, "❌ Обращение не найдено"
+
+    # Отвечать может только тот, кто ведёт обращение. Если админ успел
+    # смениться, старые кнопки не сработают.
+    current_admin = int(topic.get("admin_user_id") or 0)
+    if current_admin and current_admin != admin_user_id:
+        return False, "❌ Это не твоё обращение"
+
+    if not send:
+        return True, "👌 Без приветствия"
+
+    greeting = get_admin_greeting(bot_id, admin_user_id)
+    if not greeting:
+        return False, "⚠️ Приветствие уже удалено"
+
+    sent = await _send_admin_greeting(
+        bot_obj, bot_id, int(topic.get("user_chat_id") or 0), admin_user_id,
+    )
+    if not sent:
+        return False, "⚠️ Не удалось отправить приветствие"
+    return True, "✅ Приветствие отправлено"
 
 
 async def _rename_topic(bot_obj: Bot, group_chat_id: int, topic_id: int,
@@ -2702,6 +2852,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if not topic:
             return
 
+        # Забанить может только админ этого бота: команда необратимо убирает ПЗ.
+        if not _is_bot_admin(bot_id, msg_uid(message)):
+            logger.warning("Забанен не-админ: %s в топике %s бота %s",
+                           msg_uid(message), thread_id, bot_id)
+            await _deny_not_admin(message)
+            return
+
         user_chat_id = topic["user_chat_id"]
         ban_user(bot_id, user_chat_id)
 
@@ -2749,6 +2906,14 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     )
     async def cmd_unban(message: Message, thread_id: int) -> None:
         group_chat_id = message.chat.id
+
+        # Разбанить может только админ этого бота.
+        if not _is_bot_admin(bot_id, msg_uid(message)):
+            logger.warning("Разбан не-админом: %s в топике %s бота %s",
+                           msg_uid(message), thread_id, bot_id)
+            await _deny_not_admin(message)
+            return
+
         topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
         # При бане запись ПЗ удаляется, поэтому ищем юзера по маппингу забаненных топиков.
         if topic:
@@ -2833,6 +2998,20 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if not topic:
             return
 
+        # Отказаться может только админ, причём именно тот, кто ведёт ПЗ:
+        # иначе любой участник чата «отбирал» бы обращение у коллеги.
+        sender_id = msg_uid(message)
+        current_admin = int(topic.get("admin_user_id") or 0)
+        if not _is_bot_admin(bot_id, sender_id):
+            logger.warning("Отказ не-админом: %s в топике %s бота %s",
+                           sender_id, thread_id, bot_id)
+            await _deny_not_admin(message)
+            return
+        if current_admin and current_admin != sender_id:
+            await message.answer("⚠️ Это обращение ведёт другой админ. "
+                                 "Отказаться можете только вы, если возьмёте его.")
+            return
+
         user_chat_id = topic["user_chat_id"]
         reset_topic_admin(bot_id, thread_id, group_chat_id)
         try:
@@ -2860,6 +3039,38 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         )
         await message.answer("✅ Пользователю отправлено уведомление.")
 
+    # ═══════════════ Callback: «Отправить приветствие?» ═══════════════
+
+    @child_dp.callback_query(F.data.regexp(r"^greet_(yes|no)_-?\d+_-?\d+$"))
+    async def cb_greet_decision(callback: CallbackQuery) -> None:
+        """Админ ответил, отправлять ли заготовленное приветствие.
+
+        Фильтр строго ``^greet_(yes|no)_<топик>_<чат>$``: префиксы не должны
+        пересекаться с другими кнопками, иначе нажатие попадёт в чужой
+        обработчик (такой случай уже был с «refuse_»).
+        """
+        data = cb_data(callback)
+        send = data.startswith("greet_yes_")
+        ids = parse_topic_ids(data, 2, 2)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id = ids
+
+        ok, note = await _apply_greeting_decision(
+            bot_obj, bot_id, cb_uid(callback), topic_id, group_chat_id, send,
+        )
+
+        if not ok:
+            await callback.answer(note, show_alert=True)
+            return
+
+        await callback.answer(note)
+        # Кнопки снимаем: повторное нажатие не должно отправить приветствие
+        # второй раз или переписать результат.
+        await try_edit_answer(callback.message, note)
+
     # ═══════════════ Callback: "я беру" ═══════════════
 
     @child_dp.callback_query(F.data.regexp(r"^take_user_-?\d+_-?\d+$"))
@@ -2871,34 +3082,50 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             return
         topic_id, group_chat_id = ids
 
-        # Запись топика нужна для авто-приветствия: ПЗ отправляем именно ему.
+        # Запись топика нужна для приветствия: ПЗ отправляем именно ему.
+        # Проверка обязательна: записи может уже не быть (ПЗ заблокировал бота,
+        # топик удалили и пересоздали, кнопка осталась от старого сообщения).
+        # Раньше здесь падало «'NoneType' object has no attribute 'get'»
+        # на строке с topic.get("user_chat_id") ниже.
         topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
+        if not topic:
+            await callback.answer("❌ Обращение не найдено", show_alert=True)
+            return
 
-        # Владелец чата — тот, кому принадлежит бот. После «передачи прав»
-        # этим владельцем становится новый юзер, поэтому админа ищем именно у него.
-        owner_id = get_bot_owner(bot_id) or 0
-        admin = get_admin_by_user_id(owner_id, cb_uid(callback))
-        if not admin and owner_id != 0:
-            # Легаси-записи (до введения owner_id) лежат с owner_id = 0.
-            admin = get_admin_by_user_id(0, cb_uid(callback))
+        me_id = cb_uid(callback)
+        # Взять обращение может только админ этого бота (или владелец):
+        # кнопка «✋ Я беру» лежит в общем чате и доступна всем участникам.
+        if not _is_bot_admin(bot_id, me_id):
+            logger.warning("Взятие ПЗ не-админом: %s в топике %s бота %s",
+                           me_id, topic_id, bot_id)
+            await callback.answer("⛔ Только админ этого бота может взять обращение",
+                                  show_alert=True)
+            return
 
-        if admin:
-            tag = admin["tag"]
-        elif owner_id == cb_uid(callback):
-            # Владелец/новый владелец, у которого нет записи админа — используем его
-            # ник как тег, чтобы топик назывался админским тегом, а не личным именем.
+        admin_tag = _bot_admin_tag(bot_id, me_id)
+        # «owner:<id>» — владелец без записи в admins; учитываем это отдельно,
+        # чтобы не засчитывать ему «действие админа» в статистике.
+        is_registered_admin = bool(admin_tag) and not admin_tag.startswith("owner:")
+        tag = admin_tag or str(me_id)
+        if tag.startswith("owner:"):
+            # У владельца нет тега админа — берём его ник, чтобы топик
+            # назывался админским тегом, а не служебным «owner:123».
             if getattr(callback.from_user, "username", None):
                 tag = f"@{cb_username(callback)}"
             elif getattr(callback.from_user, "first_name", None):
                 tag = cb_firstname(callback)
             else:
-                tag = str(cb_uid(callback))
-            logger.debug("Владелец %s взял ПЗ без тега админа, используем ник как тег", owner_id)
-        else:
-            tag = cb_firstname(callback) or str(cb_uid(callback))
+                tag = str(me_id)
+            logger.debug("Владелец %s взял ПЗ без тега админа, используем ник как тег",
+                         me_id)
 
         # Назначаем и получаем инфу
-        result = assign_admin_to_topic(bot_id, topic_id, group_chat_id, cb_uid(callback), tag)
+        result = assign_admin_to_topic(bot_id, topic_id, group_chat_id, me_id, tag)
+        if not result.get("ok"):
+            # Строка топика исчезла между чтением и записью (например, ПЗ
+            # заблокировал бота прямо в этот момент) — честно отказываем.
+            await callback.answer("❌ Обращение уже недоступно", show_alert=True)
+            return
 
         try:
             await bot_obj.edit_forum_topic(
@@ -2907,15 +3134,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         except Exception as e:
             logger.warning("Не удалось переименовать топик: %s", e)
 
-        if admin:
+        if is_registered_admin:
             add_admin_message(bot_id, cb_uid(callback), "action")
 
-        # Заготовленное приветствие админа уходит ПЗ автоматически. Это
-        # ДОПОЛНИТЕЛЬНОЕ сообщение: админ сможет сразу дописать своё обычным
-        # ответом в топике и не теряет контроль над разговором.
-        await _send_admin_greeting(
-            bot_obj, bot_id, int(topic.get("user_chat_id") or 0), cb_uid(callback),
-        )
+        # Приветствие больше НЕ уходит автоматически: админ подтверждает
+        # кнопкой (см. _ask_admin_greeting). Раньше текст улетал ПЗ сразу, и
+        # отменить отправленное было нельзя.
+        await _ask_admin_greeting(bot_obj, bot_id, topic_id, group_chat_id, me_id)
 
         # Только редактируем текст — НЕ удаляем инфу о юзере. Клавиатуру НЕ
         # снимаем целиком: исчезает лишь «✋ Я беру», а «🚫 Отказ» остаётся —
@@ -3002,6 +3227,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
         if not topic:
             await callback.answer("❌ Обращение не найдено", show_alert=True)
+            return
+
+        # Отказаться может только тот, кто сейчас ведёт обращение.
+        # Проверка обязательна и ЗДЕСЬ: вопрос об отказе уходит отдельным
+        # сообщением в общий топик, поэтому кнопки «Анонимно»/«Сообщить ПЗ»
+        # видит ЛЮБОЙ админ чата. Без этой проверки чужой админ завершал бы
+        # отказ за коллегу.
+        current_admin = int(topic.get("admin_user_id") or 0)
+        if current_admin and current_admin != cb_uid(callback):
+            await callback.answer("❌ Это не твоё обращение", show_alert=True)
             return
 
         user_chat_id = int(topic["user_chat_id"])

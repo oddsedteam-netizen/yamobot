@@ -8,7 +8,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, cb_data, cb_uid, msg_uid, msg_username, try_edit
+from handlers._common import (render_callback, cb_data, cb_uid, html_escape,
+                              msg_uid, msg_username, try_edit)
 from handlers.profile import admin_kb
 from services.config import OWNER_ID, is_super_admin
 from services.storage import (
@@ -117,7 +118,8 @@ async def _notify_admin(bot, complaint_id: int, category: str, comment: str) -> 
         await bot.send_message(
             OWNER_ID,
             f"🆕 <b>Новая жалоба #{complaint_id}</b>\n"
-            f"Категория: <b>{category}</b>\nКомментарий: {comment}",
+            f"Категория: <b>{html_escape(category)}</b>\n"
+            f"Комментарий: {html_escape(comment)}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Открыть жалобу",
                                      callback_data=f"comp_view_{complaint_id}")]
@@ -165,8 +167,8 @@ async def cb_complaint_view(callback: CallbackQuery) -> None:
         return
     txt = (f"📨 <b>Жалоба #{c['id']}</b>\n\n"
            f"👤 Податель: <code>{c['user_id']}</code>\n"
-           f"📂 Категория: {c['category'] or '—'}\n"
-           f"💬 Комментарий: {c['comment'] or '—'}")
+           f"📂 Категория: {html_escape(c['category']) or '—'}\n"
+           f"💬 Комментарий: {html_escape(c['comment']) or '—'}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"comp_acc_{cid}", style="success")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"comp_rej_{cid}", style="danger")],

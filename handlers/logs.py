@@ -19,7 +19,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from handlers._common import cb_data, cb_uid, event_bot, render_callback, try_edit
+from handlers._common import (cb_data, cb_uid, event_bot, html_escape,
+                              render_callback, try_edit)
 from services.config import is_super_admin
 from services.storage import (
     bot_display_name,
@@ -119,7 +120,7 @@ async def cb_logs_bot(callback: CallbackQuery) -> None:
     errors = get_bot_errors(bot_id)
     text = (
         f"🆘 <b>Логи бота {bot_display_name(bot)}</b>\n\n"
-        f"👤 Отправитель: {callback.from_user.first_name or '—'}\n"
+        f"👤 Отправитель: {html_escape(callback.from_user.first_name) or '—'}\n"
         f"🆔 <code>{user_id}</code>\n"
         f"🤖 <code>{bot_id}</code>\n"
         f"⚠️ Ошибок в журнале: <b>{len(errors)}</b>\n\n"

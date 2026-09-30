@@ -29,7 +29,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import (cb_data, cb_uid, msg_uid, render_callback)
+from handlers._common import (cb_data, cb_uid, html_escape, msg_uid,
+                              render_callback)
 from services.storage import (
     bot_display_name,
     delete_admin_greeting,
@@ -52,7 +53,24 @@ class GreetingFSM(StatesGroup):
 
 
 def _bot_title(bot: dict) -> str:
-    return bot_display_name(bot) if bot else f"бот {bot.get('id')}"
+    """Сырое имя бота — для текста кнопок и всплывашек Telegram.
+
+    Там разметка НЕ парсится, поэтому экранировать нельзя: иначе админ
+    увидел бы «&amp;» вместо «&». Для HTML-текстов есть ``_bot_title_html``.
+    """
+    if not bot:
+        return "бот"
+    return bot_display_name(bot)
+
+
+def _bot_title_html(bot: dict) -> str:
+    """Имя бота, безопасное для вставки в HTML-разметку.
+
+    Имя задаёт владелец в @BotFather, там бывают «<», «>» и «&». В HTML-режиме
+    такой символ ломает разметку целиком, и Telegram отвечает
+    «can't parse entities» — экран не показывается вообще.
+    """
+    return html_escape(_bot_title(bot))
 
 
 # ═══════════════ Карточка YID ═══════════════════════════════════════════
@@ -63,9 +81,9 @@ def _card_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     label = f"Y{card['yid']}" if card["yid"] else "—"
     registered = (card["registered_at"] or "—")[:19].replace("T", " ")
 
-    name_line = f"👤 Имя: <b>{card['first_name'] or '—'}</b>"
+    name_line = f"👤 Имя: <b>{html_escape(card['first_name']) or '—'}</b>"
     if card["username"]:
-        name_line += f" (@{card['username']})"
+        name_line += f" (@{html_escape(card['username'])})"
 
     lines = [
         f"🆔 <b>Твой YID: {label}</b>\n",
@@ -82,7 +100,7 @@ def _card_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("\n<b>Боты, где ты админ:</b>")
         for row in bots:
             lines.append(
-                f"\n  🤖 <b>{_bot_title(row)}</b>"
+                f"\n  🤖 <b>{_bot_title_html(row)}</b>"
                 + (" 👑" if row.get("is_owner") else "")
                 + f"\n     🤝 взял: <b>{row['pz_taken']}</b>"
                 + f" · 💬 ответов: <b>{row['replies']}</b>"
@@ -144,13 +162,14 @@ async def cb_yid_my_admins(callback: CallbackQuery) -> None:
             f"Ты админ в <b>{len(bots)}</b> ботах.\n"]
     for bot in bots:
         title = _bot_title(bot)
+        title_html = _bot_title_html(bot)
         if bot.get("is_owner"):
-            text.append(f"🤖 <b>{title}</b> 👑 <i>(твой бот)</i>")
+            text.append(f"🤖 <b>{title_html}</b> 👑 <i>(твой бот)</i>")
             rows.append([InlineKeyboardButton(
                 text=f"💬 {title}",
                 callback_data=f"yid_greeting_pick_{bot['id']}", style="primary")])
         else:
-            text.append(f"🤖 <b>{title}</b>")
+            text.append(f"🤖 <b>{title_html}</b>")
             rows.append([InlineKeyboardButton(
                 text=f"🚫 Отвязать: {title}",
                 callback_data=f"yid_unbind_{bot['id']}", style="danger")])
@@ -229,7 +248,7 @@ def _greeting_bots_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             mark = ", ".join(marks)
         else:
             mark = "— не задано"
-        lines.append(f"🤖 <b>{title}</b> — {mark}")
+        lines.append(f"🤖 <b>{_bot_title_html(bot)}</b> — {mark}")
         row = [InlineKeyboardButton(
             text=f"🤖 {title}",
             callback_data=f"yid_greeting_pick_{bot['id']}", style="primary",
@@ -268,11 +287,18 @@ async def cb_yid_greeting_pick(callback: CallbackQuery, state: FSMContext) -> No
     current = get_admin_greeting(bot_id, user_id)
     hint = "Пришли текст приветствия — можно с фото и премиум-эмодзи."
     if current:
-        hint += "\n\nСейчас сохранено: " + str(current.get("text") or "(только фото)")
+        # Текст экранируем: приветствие пишет сам админ, там бывают «<», «&»
+        # и просто длинные строки. Сырой текст в HTML ломал экран целиком:
+        # Telegram отвечал «can't parse entities» на edit и на повтор при
+        # отправке — кнопка «умирала» без объяснений.
+        saved = str(current.get("text") or "").strip()
+        hint += "\n\nСейчас сохранено: " + (
+            html_escape(saved[:300]) if saved else "(только фото)"
+        )
 
     await render_callback(
         callback,
-        f"💬 <b>Приветствие для «{_bot_title(bot)}»</b>\n\n{hint}\n\n"
+        f"💬 <b>Приветствие для «{_bot_title_html(bot)}»</b>\n\n{hint}\n\n"
         "📌 Это <b>дополнительное</b> первое сообщение для ПЗ: ты потом "
         "сможешь написать ему своими словами.",
         InlineKeyboardMarkup(inline_keyboard=[[
@@ -327,7 +353,7 @@ async def fsm_greeting(message: Message, state: FSMContext) -> None:
     )
     await message.answer(
         f"✅ <b>Приветствие сохранено!</b> ({what})\n\n"
-        f"🤖 Бот: <b>{_bot_title(bot) if bot else bot_id}</b>\n\n"
+        f"🤖 Бот: <b>{_bot_title_html(bot) if bot else bot_id}</b>\n\n"
         "Теперь оно уйдёт ПЗ автоматически, когда ты возьмёшь обращение."
     )
     text_card, kb = _card_payload(user_id)

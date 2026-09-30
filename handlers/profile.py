@@ -17,8 +17,8 @@ from aiogram.types import (
 logger = logging.getLogger(__name__)
 
 from handlers._common import (render_callback, ADMIN_CHAT_WELCOME, cb_data,
-                              cb_uid, cb_username, cb_firstname, msg_uid,
-                              msg_username, msg_firstname, try_edit_answer)
+                              cb_uid, cb_username, cb_firstname, html_escape,
+                              msg_uid, msg_username, msg_firstname, try_edit_answer)
 from services.child_manager import ChildManager
 from services.config import is_super_admin, proxy_settings
 from services.constants import (
@@ -453,8 +453,8 @@ def _owner_profile_text(owner_id: int) -> str:
     return (
         f"👤 <b>Профиль {owner_id}</b>\n\n"
         f"🆔 ID: <code>{owner_id}</code>\n"
-        f"👤 Имя: {user.get('first_name') or '—'}"
-        f"{('@' + user['username']) if user.get('username') else ''}\n"
+        f"👤 Имя: {html_escape(user.get('first_name')) or '—'}"
+        f"{('@' + html_escape(user['username'])) if user.get('username') else ''}\n"
         f"📅 В базе с: {str(user.get('created_at') or '—')[:19]}\n"
         f"🚫 Забанен: {'да' if user.get('blocked') else 'нет'}\n\n"
         f"💼 Чат работы: {_chat(work_chat)}\n"
@@ -958,7 +958,7 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
 
     text = (
         f"👤 <b>Профиль</b>\n\n"
-        f"📛 Имя: <b>{first_name}</b>\n"
+        f"📛 Имя: <b>{html_escape(first_name)}</b>\n"
         f"🆔 ID: <code>{user_id}</code>\n\n"
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"👥 Админов: <b>{len(admins)}</b>\n"
@@ -1606,7 +1606,7 @@ async def cb_profile_view(callback: CallbackQuery) -> None:
     bots = get_user_bots(uid)
     status = "🚫 заблокирован" if u.get("blocked") else "🟢 активен"
     text = (
-        f"👤 <b>{u.get('username') or u.get('first_name') or uid}</b>\n"
+        f"👤 <b>{html_escape(u.get('username') or u.get('first_name') or uid)}</b>\n"
         f"🆔 ID: <code>{uid}</code>\n"
         f"📅 Регистрация: {utc_to_msk(u.get('created_at'))[:10]}\n"
         f"🤖 Ботов: <b>{len(bots)}</b>\n"

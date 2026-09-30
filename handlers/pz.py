@@ -9,8 +9,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import (_is_not_modified, render_callback, safe_edit,
-                              cb_data, cb_uid, try_edit_answer)
+from handlers._common import (_is_not_modified, html_escape, render_callback,
+                              safe_edit, cb_data, cb_uid, try_edit_answer)
 from services.storage import (
     get_bot_by_id,
     bot_display_name,
@@ -260,8 +260,8 @@ async def _show_pz_details(msg_or_cb, bot_id: int, user_chat_id: int) -> None:
         text = (
             f"👤 <b>ПЗ — {user_chat_id}</b>\n\n"
             f"<b>Пользователь:</b>\n"
-            f"  📛 Имя: {first_name}\n"
-            f"  👤 Username: {username}\n"
+            f"  📛 Имя: {html_escape(first_name)}\n"
+            f"  👤 Username: {html_escape(username)}\n"
             f"  🆔 ID: <code>{user_chat_id}</code>\n"
             f"  📅 Первый визит: {first_seen}\n"
             f"  📌 Статус: {status_line}\n\n"

@@ -45,7 +45,8 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import render_callback, cb_data, cb_uid, try_edit_answer
+from handlers._common import (cb_data, cb_uid, html_escape, render_callback,
+                              try_edit_answer)
 from services.config import is_super_admin
 from services.storage import (
     get_owner_by_admin_chat,
@@ -752,12 +753,15 @@ async def _ban_spammer(bot, chat_id: int, uid: int, kind: str,
     for key in [k for k in _SPAM_WARNED if k[0] == chat_id and k[1] == uid]:
         _SPAM_WARNED.pop(key, None)
 
-    title = chat_title or f"чат <code>{chat_id}</code>"
+    # Имя чата задаёт владелец — «<» или «&» в нём ломают разметку. Если имени
+    # нет, подставляем уже готовый HTML-фрагмент, поэтому и здесь экранируем
+    # только сырое имя, а не подставку.
+    title = html_escape(chat_title) if chat_title else f"чат <code>{chat_id}</code>"
     label = "стикерами" if kind == "sticker" else "сообщениями"
     links_line = "🔗 Ссылка-приглашение отозвана — по ней больше не зайти." if links_revoked else ""
     notice = (
         f"🚫 <b>Спамер удалён из чата.</b>\n\n"
-        f"👤 <code>{name}</code> флудил {label} в чате админов.\n"
+        f"👤 <code>{html_escape(name)}</code> флудил {label} в чате админов.\n"
         f"Его сообщения удалены, аккаунт забанен в чате."
         + ("" if banned else
            "\n\n⚠️ Не удалось забанить — проверь права администратора у бота.")
@@ -773,7 +777,7 @@ async def _ban_spammer(bot, chat_id: int, uid: int, kind: str,
             owner_id,
             f"🚨 <b>Антирейд: спам в чате админов!</b>\n\n"
             f"Чат: <b>{title}</b>\n"
-            f"Нарушитель: <code>{name}</code>\n"
+            f"Нарушитель: <code>{html_escape(name)}</code>\n"
             f"Тип: {label}\n\n"
             + ("✅ Спамер удалён из чата." if banned else
                "⚠️ Не удалось удалить нарушителя — проверь права администратора у бота.")
@@ -835,7 +839,7 @@ async def _trigger_antiraid(bot, chat_id: int, chat_title: str,
             await bot.send_message(
                 owner_id,
                 "🚨 <b>Не удалось заблокировать чат админов!</b>\n\n"
-                f"Чат: <b>{chat_title or chat_id}</b>\n\n"
+                f"Чат: <b>{html_escape(chat_title) or chat_id}</b>\n\n"
                 "Похоже, у YamoBot нет прав администратора — без них Telegram "
                 "не даёт менять права чата и убирать нарушителей.\n"
                 "Выдай права: «Управление чатом → Администраторы → YamoBot → "
@@ -853,7 +857,7 @@ async def _trigger_antiraid(bot, chat_id: int, chat_title: str,
     if settings.get("del_members"):
         await _remove_recent_joiners(bot, chat_id, joins)
 
-    title = chat_title or f"чат <code>{chat_id}</code>"
+    title = html_escape(chat_title) if chat_title else f"чат <code>{chat_id}</code>"
     alert = (
         "🚨 <b>Антирейд!</b>\n\n"
         f"В чат <b>{title}</b> зашло за короткое время "
