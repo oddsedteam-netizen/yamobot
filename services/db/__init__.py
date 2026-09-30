@@ -65,7 +65,8 @@ from services.db.norms import (
 )
 from services.db.outbox import (
     OUTBOX_FAILED, OUTBOX_PENDING, OUTBOX_SENT, enqueue_outbox, fail_outbox,
-    fetch_due_outbox, mark_outbox_sent, outbox_counts, outbox_failed_list,
+    fail_pending_for_chat, fetch_due_outbox, mark_outbox_sent, outbox_counts,
+    outbox_counts_for_bots, outbox_counts_for_owner, outbox_failed_list,
     purge_outbox, reschedule_outbox
 )
 from services.db.protection import (
@@ -212,6 +213,7 @@ __all__ = [
     "ensure_db",
     "ensure_yid",
     "fail_outbox",
+    "fail_pending_for_chat",
     "fetch_due_outbox",
     "format_bot_errors",
     "format_user_logs",
@@ -325,6 +327,8 @@ __all__ = [
     "mark_user_blocked",
     "normalize_config_code",
     "outbox_counts",
+    "outbox_counts_for_bots",
+    "outbox_counts_for_owner",
     "outbox_failed_list",
     "purge_outbox",
     "register_user",

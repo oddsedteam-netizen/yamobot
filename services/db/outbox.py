@@ -11,6 +11,7 @@ from services.db.connection import (
     _get_conn,
     _lock,
 )
+from services.db.helpers import _owner_bot_ids
 
 
 OUTBOX_PENDING = "pending"    # ждёт отправки (или повторной попытки)
@@ -88,7 +89,7 @@ def fail_outbox(row_id: int, attempts: int, error: str) -> None:
         conn.commit()
 
 def outbox_counts() -> dict:
-    """Сколько сообщений ждёт, сколько доставлено, сколько не дошло."""
+    """Сколько сообщений ждёт, сколько доставлено, сколько не дошло (ВСЯ база)."""
     conn = _get_conn()
     rows = conn.execute(
         "SELECT status, COUNT(*) FROM outbox GROUP BY status"
@@ -97,6 +98,54 @@ def outbox_counts() -> dict:
     for status, total in rows:
         counts[str(status)] = int(total)
     return counts
+
+
+def outbox_counts_for_bots(bot_ids: list[int]) -> dict:
+    """То же, но только по указанным ботам.
+
+    Нужно для «Диагностики»: глобальный ``outbox_counts`` считает всю таблицу,
+    поэтому каждому владельцу показывались недоставленные сообщения ЧУЖИХ
+    чатов — «чужие ошибки в моей диагностике».
+    """
+    counts = {OUTBOX_PENDING: 0, OUTBOX_SENT: 0, OUTBOX_FAILED: 0}
+    ids = [int(b) for b in bot_ids]
+    if not ids:
+        return counts
+    placeholders = ",".join("?" for _ in ids)
+    conn = _get_conn()
+    rows = conn.execute(
+        f"SELECT status, COUNT(*) FROM outbox WHERE bot_id IN ({placeholders}) "
+        "GROUP BY status",
+        tuple(ids),
+    ).fetchall()
+    for status, total in rows:
+        counts[str(status)] = int(total)
+    return counts
+
+
+def outbox_counts_for_owner(owner_id: int) -> dict:
+    """Состояние очереди по всем ботам владельца — для раздела «Диагностика»."""
+    return outbox_counts_for_bots(_owner_bot_ids(owner_id))
+
+
+def fail_pending_for_chat(bot_id: int, chat_id: int, error: str) -> int:
+    """Закрывает ВСЕ ожидающие сообщения в недоступный чат.
+
+    Вызывается, когда стало точно известно, что чата больше нет
+    («chat not found», бота выгнали): держать такие сообщения в очереди
+    бессмысленно — каждая попытка всё равно упадёт. Возвращает, сколько
+    записей закрыто.
+    """
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE outbox SET status = ?, last_error = ? "
+            "WHERE status = ? AND bot_id = ? AND chat_id = ?",
+            (OUTBOX_FAILED, (error or "")[:300], OUTBOX_PENDING,
+             int(bot_id or 0), int(chat_id)),
+        )
+        conn.commit()
+        return cur.rowcount
 
 def outbox_failed_list(limit: int = 10) -> list[dict]:
     """Последние недоставленные сообщения — чтобы понять, что сломалось."""

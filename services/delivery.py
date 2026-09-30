@@ -36,6 +36,7 @@ from aiogram.exceptions import (
 
 from services.storage import (
     fail_outbox,
+    fail_pending_for_chat,
     fetch_due_outbox,
     mark_outbox_sent,
     outbox_counts,
@@ -80,6 +81,24 @@ def _is_final(err: Exception) -> bool:
         return True
     text = (getattr(err, "message", "") or str(err)).lower()
     return any(marker in text for marker in _FINAL_MESSAGES)
+
+
+# Чаты, в которые писать бессмысленно: Telegram ответил «chat not found» или
+# «bot was kicked». Второй раз в тот же чат не стучимся — иначе бот бесконечно
+# долбит удалённую группу, а владелец видит только растущий счётчик
+# «недоставленные сообщения». Набор живёт в памяти: после перезапуска
+# пробуем снова (за это время чат могли привязать заново).
+_DEAD_CHATS: set[tuple[int, int]] = set()
+
+
+def _chat_is_gone(err: Exception) -> bool:
+    """True, если САМОГО чата больше нет (удалён / бота из него выгнали)."""
+    text = (getattr(err, "message", "") or str(err)).lower()
+    return ("chat not found" in text
+            or "bot was kicked" in text
+            or "bot is not a member" in text
+            or "group chat was deactivated" in text
+            or "chat was deleted" in text)
 
 
 def _backoff(attempts: int) -> float:
@@ -187,12 +206,48 @@ class OutboxWorker:
             await asyncio.sleep(POLL_INTERVAL)
 
     # ── Работа с очередью ──────────────────────────────────────
+    async def _forget_chat(self, bot_id: int, chat_id: int, err: Exception) -> None:
+        """Чат недоступен: больше не пишем и чистим очередь по нему.
+
+        Иначе бот стучится в удалённую группу до бесконечности, а владелец
+        видит только растущий счётчик «недоставленные сообщения» и не
+        понимает, что чат надо привязать заново.
+        """
+        key = (int(bot_id), int(chat_id))
+        if key in _DEAD_CHATS:
+            return
+        _DEAD_CHATS.add(key)
+        closed = fail_pending_for_chat(bot_id, chat_id, _describe(err))
+        logger.warning(
+            "Чат %s недоступен боту %s (%s) — больше в него не пишем, "
+            "закрыто сообщений: %d",
+            chat_id, bot_id, _describe(err), closed,
+        )
+        # Снимаем привязку (если чат привязан) и объясняем владельцу, что
+        # делать. Импорт внутри функции: child_manager сам импортирует delivery.
+        try:
+            from services.child_manager import handle_dead_chat
+            await handle_dead_chat(bot_id, chat_id, _describe(err))
+        except Exception:
+            logger.debug("Не удалось обработать недоступный чат %s", chat_id,
+                         exc_info=True)
+
     async def drain(self, limit: int = BATCH_SIZE) -> tuple[int, int]:
         """Обрабатывает очередь один раз. Возвращает (доставлено, отказов)."""
         sent = failed = 0
         for record in fetch_due_outbox(limit):
             row_id = int(record["id"])
             bot_id = int(record.get("bot_id") or 0)
+            chat_id = int(record.get("chat_id") or 0)
+
+            if (bot_id, chat_id) in _DEAD_CHATS:
+                # Чат уже признан недоступным — Telegram не дёргаем вовсе.
+                fail_outbox(row_id, int(record.get("attempts") or 0) + 1,
+                            "чат недоступен (chat not found)")
+                self.failed_total += 1
+                failed += 1
+                continue
+
             bot = self.bot_for(bot_id)
             if bot is None:
                 # Бота нет в памяти (удалён или ещё не поднялся) — ждём:
@@ -206,13 +261,16 @@ class OutboxWorker:
                 raise
             except Exception as err:
                 wait = _retry_after(err)
+                if _chat_is_gone(err):
+                    # Чат мёртв: повторять бессмысленно, снимаем привязку.
+                    await self._forget_chat(bot_id, chat_id, err)
                 if _is_final(err):
                     fail_outbox(row_id, attempts, _describe(err))
                     self.failed_total += 1
                     failed += 1
                     logger.warning(
                         "Сообщение #%s доставить невозможно (%s) — чат %s",
-                        row_id, _describe(err), record.get("chat_id"),
+                        row_id, _describe(err), chat_id,
                     )
                     continue
                 if attempts >= MAX_ATTEMPTS:
@@ -247,6 +305,7 @@ class OutboxWorker:
             "sent_total": self.sent_total,
             "failed_total": self.failed_total,
             "bots": len(self._bots),
+            "dead_chats": len(_DEAD_CHATS),
             "running": bool(self._task and not self._task.done()),
         }
 

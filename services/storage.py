@@ -67,7 +67,8 @@ from services.db.norms import (
 )
 from services.db.outbox import (
     OUTBOX_FAILED, OUTBOX_PENDING, OUTBOX_SENT, enqueue_outbox, fail_outbox,
-    fetch_due_outbox, mark_outbox_sent, outbox_counts, outbox_failed_list,
+    fail_pending_for_chat, fetch_due_outbox, mark_outbox_sent, outbox_counts,
+    outbox_counts_for_bots, outbox_counts_for_owner, outbox_failed_list,
     purge_outbox, reschedule_outbox
 )
 from services.db.protection import (
@@ -153,7 +154,7 @@ __all__ = [
     "create_bot_config", "create_complaint", "create_ticket", "create_topic_record", "create_transfer", "default_bot_keyboard",
     "delete_admin_greeting", "delete_admin_invite", "delete_banned_topic", "delete_bot_config", "delete_channel_post", "delete_reminder",
     "delete_reminder_mute", "delete_topic_record", "delete_topics_for_owner_user", "delete_transfer", "enqueue_outbox", "ensure_admin",
-    "ensure_db", "ensure_yid", "fail_outbox", "fetch_due_outbox", "format_bot_errors", "format_user_logs",
+    "ensure_db", "ensure_yid", "fail_outbox", "fail_pending_for_chat", "fetch_due_outbox", "format_bot_errors", "format_user_logs",
     "get_accessible_bots", "get_admin_active_topics", "get_admin_active_topics_list", "get_admin_by_tag", "get_admin_by_user_id", "get_admin_change_settings",
     "get_admin_chat_moderators", "get_admin_greeting", "get_admin_invite", "get_admin_invite_owner", "get_admin_message_stats", "get_admin_period_messages",
     "get_admin_tag_history", "get_admins_all", "get_all_admins_stats", "get_all_bots_flat", "get_all_enabled_reminders", "get_all_norm_settings",
@@ -172,7 +173,7 @@ __all__ = [
     "get_user_tickets", "get_warn_settings", "get_work_hours", "get_yid", "get_yid_owner", "import_users_bulk",
     "is_admin_chat_moderator", "is_bot_anonymous", "is_bot_dead", "is_coowner", "is_registry_user_banned", "is_topic_reserved",
     "is_user_banned", "is_user_muted", "is_within_work_hours", "log_admin_change", "mark_bot_dead",
-    "mark_outbox_sent", "mark_user_blocked", "normalize_config_code", "outbox_counts", "outbox_failed_list", "owner_topic_keys",
+    "mark_outbox_sent", "mark_user_blocked", "normalize_config_code", "outbox_counts", "outbox_counts_for_bots", "outbox_counts_for_owner", "outbox_failed_list", "owner_topic_keys",
     "purge_expired_mutes", "purge_outbox", "purge_topic_reminder_state", "register_user", "remember_custom_emoji", "remove_admin",
     "remove_admin_chat_moderator", "remove_coowner", "remove_custom_category", "remove_dead_bots", "remove_user_bot", "reschedule_outbox",
     "reserve_topic_slot", "reset_all_antiraid_triggered", "reset_reminder_countdown", "reset_topic_admin", "reset_user_warns",

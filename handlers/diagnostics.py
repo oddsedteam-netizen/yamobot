@@ -37,7 +37,7 @@ from services.storage import (
     get_bot_errors,
     get_user_bots,
     is_registry_user_banned,
-    outbox_counts,
+    outbox_counts_for_owner,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,12 +160,19 @@ def _check_protection(owner_id: int) -> list[dict]:
     return found
 
 
-def _check_outbox() -> list[dict]:
-    """Проверка очереди доставки: не застряли ли сообщения."""
-    if not outbox_counts().get("failed"):
+def _check_outbox(owner_id: int) -> list[dict]:
+    """Проверка очереди доставки: не застряли ли сообщения.
+
+    Считаем ТОЛЬКО по ботам этого владельца. Раньше здесь брался общий
+    ``outbox_counts`` по всей таблице, из-за чего в «Диагностике» каждого
+    пользователя показывались недоставленные сообщения чужих чатов —
+    «чужие ошибки в моей диагностике».
+    """
+    failed = int(outbox_counts_for_owner(owner_id).get("failed") or 0)
+    if not failed:
         return []
     return [_finding(
-        WARN, f"Не доставлено сообщений: {outbox_counts()['failed']}",
+        WARN, f"Не доставлено сообщений: {failed}",
         "Обычно это чаты, куда бот писать не может. Проверь, что чаты живы "
         "и YamoBot — администратор.",
     )]
@@ -193,7 +200,7 @@ async def collect_diagnostics(owner_id: int, bot: Bot | None,
             ))
 
     found += _check_bots(bots, running)
-    found += _check_outbox()
+    found += _check_outbox(owner_id)
     found += _check_protection(owner_id)
 
     if not found:

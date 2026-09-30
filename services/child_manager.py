@@ -67,6 +67,9 @@ from services.storage import (
     get_antispam_mode,
     set_feedback_chat,
     get_feedback_chat,
+    clear_feedback_chat,
+    get_owner_by_admin_chat,
+    set_bound_chat,
     get_topic_by_user,
     get_topic_by_topic_id,
     get_pinned_message_id,
@@ -461,6 +464,21 @@ def _is_thread_not_found(err: Exception) -> bool:
             or "topic not found" in msg)
 
 
+def _is_chat_gone(err: Exception) -> bool:
+    """True, если САМОГО чата больше нет: удалён или бота из него выгнали.
+
+    Такую ошибку бессмысленно повторять: пока владелец не привяжет чат
+    заново, каждая отправка будет падать. Поэтому вызывающий код снимает
+    привязку (``handle_dead_chat``), а не долбит мёртвый чат вечно.
+    """
+    msg = (getattr(err, "message", "") or str(err)).lower()
+    return ("chat not found" in msg
+            or "bot was kicked" in msg
+            or "bot is not a member" in msg
+            or "group chat was deactivated" in msg
+            or "chat was deleted" in msg)
+
+
 # ── Разбор callback_data кнопок в топиках ─────────────────────────
 # Кнопки одного экрана делят общий префикс: «refuse_<топик>_<чат>»,
 # «refuse_q_<топик>_<чат>_<0|1>», «refuse_cancel». Раньше на них стоял
@@ -714,6 +732,83 @@ async def notify_owner(bot_id: int, text: str) -> None:
         await _MAIN_BOT.send_message(chat_id=owner_id, text=text)
     except Exception as e:
         logger.warning("Не удалось уведомить владельца %s: %s", owner_id, e)
+
+
+async def handle_dead_chat(bot_id: int, chat_id: int, reason: str = "") -> None:
+    """Чат недоступен боту: снимаем привязку и говорим владельцу.
+
+    Когда бота выгнали из группы или чат удалили, каждая отправка падала с
+    «chat not found». Бот продолжал туда писать, сообщения копились в
+    очереди, в «Диагностике» рос счётчик «недоставленные», а понять причину
+    было нечем. Теперь привязка снимается один раз — и владелец видит, что
+    чат надо привязать заново.
+
+    Идемпотентна: повторный вызов для уже снятой привязки ничего не делает.
+    ``bot_id`` = 0 — это сообщение основного бота (например, в «чат админов»).
+    """
+    chat_id = int(chat_id or 0)
+    if not chat_id:
+        return
+
+    detached: list[str] = []
+
+    # 1) «Чат работы» дочернего бота — группа, в которой живут топики ПЗ.
+    if bot_id:
+        try:
+            if get_feedback_chat(bot_id) == chat_id:
+                clear_feedback_chat(bot_id)
+                detached.append("чат работы бота")
+        except Exception:
+            logger.debug("Не удалось снять привязку чата работы бота %s",
+                         bot_id, exc_info=True)
+
+    # 2) «Чат админов» владельца — туда идут уведомления и напоминалки.
+    owner_id = 0
+    try:
+        found = get_owner_by_admin_chat(chat_id)
+        if found:
+            owner_id = int(found)
+            set_bound_chat(owner_id, "admin", None)
+            detached.append("чат админов")
+    except Exception:
+        logger.debug("Не удалось снять привязку чата админов %s",
+                     chat_id, exc_info=True)
+
+    if not detached:
+        return
+
+    logger.warning(
+        "Чат %s недоступен боту %s (%s) — снято: %s. Больше туда не пишем.",
+        chat_id, bot_id, reason or "chat not found", ", ".join(detached),
+    )
+
+    # Владельцу — понятное объяснение, что делать дальше. Пишем через ЛС
+    # основного бота: это другой чат, он не сломан.
+    if bot_id:
+        await notify_owner(
+            bot_id,
+            "⚠️ <b>Чат работы недоступен</b>\n\n"
+            f"Бот не может писать в привязанную группу: {reason or 'чат удалён'}.\n\n"
+            "Привязка снята — привяжи чат заново: "
+            "профиль → «🔗 Привязать чаты».",
+        )
+    elif owner_id:
+        main = get_main_bot()
+        if main is not None:
+            try:
+                await main.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        "⚠️ <b>«Чат админов» недоступен</b>\n\n"
+                        f"YamoBot не может писать в привязанный чат: "
+                        f"{reason or 'чат удалён'}.\n\n"
+                        "Привязка снята — привяжи чат заново: "
+                        "профиль → «🔗 Привязать чаты»."
+                    ),
+                )
+            except Exception as e:
+                logger.debug("Не удалось уведомить владельца %s: %s", owner_id, e)
+
 
 
 def _find_bot_id_by_telegram_id(telegram_id: int) -> int | None:
@@ -2044,7 +2139,8 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
 
 async def _send_to_topic_retry(source_msg: Message, bot: Bot,
                                group_chat_id: int, topic_id: int,
-                               reply_to: int | None = None) -> tuple[Message | None, bool]:
+                               reply_to: int | None = None,
+                               bot_id: int = 0) -> tuple[Message | None, bool]:
     """Отправляет сообщение в топик, переживая flood-control (429).
 
     Возвращает (sent, thread_not_found):
@@ -2079,6 +2175,11 @@ async def _send_to_topic_retry(source_msg: Message, bot: Bot,
             logger.warning("Топик %s не найден (thread not found) — требуется пересоздание.",
                            topic_id)
             return None, True
+        if _is_chat_gone(e):
+            # Группы, в которой жили топики, больше нет. Пересоздавать топик
+            # бессмысленно: снимаем привязку, чтобы бот не долбил мёртвый чат.
+            await handle_dead_chat(bot_id, group_chat_id, _error_text(e))
+            return None, False
         logger.error("Ошибка отправки в топик %s: %s", topic_id, e)
     except Exception as e:
         logger.error("Не удалось отправить в топик %s: %s", topic_id, e)
@@ -3357,7 +3458,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 await _pin_topic_action(bot_obj, bot_id, group_chat_id,
                                         new_topic_id, header)
 
-            sent, _ = await _send_to_topic_retry(message, bot_obj, group_chat_id, new_topic_id)
+            sent, _ = await _send_to_topic_retry(message, bot_obj, group_chat_id,
+                                                 new_topic_id, bot_id=bot_id)
             if sent:
                 save_feedback_message(bot_id, new_topic_id, group_chat_id, user_chat_id,
                                        "in", sent.message_id, message.message_id)
@@ -3411,7 +3513,7 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     reply_to_group = orig["group_msg_id"]
 
             sent, thread_not_found = await _send_to_topic_retry(
-                message, bot_obj, group_chat_id, topic_id, reply_to_group
+                message, bot_obj, group_chat_id, topic_id, reply_to_group, bot_id=bot_id
             )
 
             if sent:
