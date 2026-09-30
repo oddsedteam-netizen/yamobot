@@ -384,7 +384,11 @@ async def cb_delmail_yes(callback: CallbackQuery,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
                         text="👀 Подобрать нового",
-                        callback_data=f"picknew_{t['topic_id']}_{t['group_chat_id']}",
+                        # Именно find_admin_: такой callback_data обрабатывает
+                        # хендлер «Найти админа» в дочернем боте. Раньше здесь
+                        # был picknew_, под который обработчика не существовало —
+                        # кнопка просто не работала.
+                        callback_data=f"find_admin_{t['topic_id']}_{t['group_chat_id']}",
                     )]
                 ]),
             )

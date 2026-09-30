@@ -30,6 +30,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from services.child_manager import (check_premium_delivered, get_main_bot,
                                     send_with_gate)
+from services.guards import supervised_task
 from services.premium_emoji import markup_to_entities
 from services.storage import (
     get_bound_channel,
@@ -343,8 +344,15 @@ class ChannelService:
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
+        """Запускает публикатор под присмотром (services/guards.py).
+
+        Падение в цикле больше не убивает сервис навсегда: задача
+        перезапускается, а причина пишется в журнал.
+        """
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run(), name="channel_service")
+            self._task = supervised_task(
+                lambda: self._run(), "channel_service", log=logger,
+            )
 
     async def stop(self) -> None:
         task = self._task
@@ -361,8 +369,10 @@ class ChannelService:
         while True:
             try:
                 await self._scan_once()
-            except Exception as e:
-                logger.exception("Ошибка в цикле отложенных постов: %s", e)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Ошибка в цикле отложенных постов")
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def _scan_once(self) -> None:

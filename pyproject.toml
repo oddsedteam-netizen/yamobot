@@ -1,0 +1,49 @@
+[project]
+name = "yamobot"
+version = "1.22.0"
+description = "YamoBot — конструктор Telegram-ботов с ПЗ, админами и защитой"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.7,<4.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pyflakes>=3.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# ═══════════════ pytest ═══════════════
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# У каждого теста своя папка: тесты не трогают рабочую data/yamobot.db.
+addopts = "-q --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+# ═══════════════ Линтер ═══════════════
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Сначала ловим реальные баги, потом уже стиль.
+select = ["E", "F", "W", "B", "C4", "UP", "SIM", "RET", "ARG"]
+ignore = [
+    "E501",    # длину строк контролируем сами (в коде много русских текстов)
+    "B008",    # Bot()/Dispatcher() в аргументах — обычный паттерн aiogram
+    "SIM105",  # contextlib.suppress удобнее читается в местах с логированием
+    "ARG001",  # _unused-аргументы нужны для единообразных сигнатур middleware
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG", "RET", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["services", "handlers"]

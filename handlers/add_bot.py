@@ -13,6 +13,9 @@ from services.storage import (
     add_user_bot, bot_display_name, set_bot_type, set_bot_keyboard,
     get_feedback_chat, get_bot_by_id_any_owner,
 )
+import logging
+
+logger = logging.getLogger("handlers")
 router = Router()
 
 
@@ -55,7 +58,10 @@ async def verify_token(token: str) -> dict | None:
             hook = await tmp.get_webhook_info()
             webhook_url = hook.url or ""
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         info = {'token': token, 'id': me.id,
                 'username': me.username or '', 'first_name': me.first_name or '',
                 'welcome_text': '', 'stopped': False, 'links': [],
@@ -127,10 +133,10 @@ async def fsm_receive_token(message, state):
     await state.update_data(bot_info=info)
     text = (
         'Отлично! Теперь выбери тип бота:\n\n'
-        '🗂 <b>Стандарт</b> — обычный бот, к нему привяжется '
-        'reply-клавиатура «сменить админа».\n'
-        '📝 <b>Анкетница</b> — бот-анкета без reply-кнопок, '
-        'только инлайн-кнопки.'
+        '🗂 <b>Стандарт</b> — обычный бот, где пользователь может попросить '
+        'заменить админа.\n'
+        '📝 <b>Анкетница</b> — бот-анкета без смены админа, '
+        'только приветствие и инлайн-кнопки.'
     )
     if warning:
         text = f'{warning}\n\n{text}'

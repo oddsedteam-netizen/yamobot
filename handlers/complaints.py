@@ -17,6 +17,9 @@ from services.storage import (
     get_complaint,
     set_complaint_status,
 )
+import logging
+
+logger = logging.getLogger("handlers")
 
 router = Router()
 
@@ -121,14 +124,20 @@ async def _notify_admin(bot, complaint_id: int, category: str, comment: str) -> 
             ]),
         )
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 async def _notify_user(bot, user_id: int, complaint_id: int, text: str) -> None:
     try:
         await bot.send_message(user_id, f"ℹ️ <b>Ваша жалоба #{complaint_id}</b>\n{text}")
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 @router.callback_query(F.data == "complaints_admin")

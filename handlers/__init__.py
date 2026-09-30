@@ -59,6 +59,16 @@ def register_all_handlers(dp: Dispatcher) -> None:
     from handlers.antinakrutka import router as antinakrutka_router
     from handlers.configs import router as configs_router
     from handlers.reminders import router as reminders_router
+    # Заглушки/сброс отсчёта напоминалки. ВАЖНО: подключаем ДО antiraid —
+    # у антирейда есть обработчик с широким фильтром («любое сообщение в
+    # группе»), и номер, написанный владельцем в «чате админов», съедался бы
+    # им раньше, чем дойдёт до этого роутера. Ровно поэтому ввод номера
+    # работает в handlers/start.py: он подключён самым первым.
+    from handlers.reminder_mutes import router as reminder_mutes_router
+    # Раздел YID (внутренний номер и личная статистика админа).
+    from handlers.yid import router as yid_router
+    # Диагностика: проверка ботов и привязок с подсказками «что делать».
+    from handlers.diagnostics import router as diagnostics_router
     from handlers.other import router as other_router
     from handlers.norms import router as norms_router
     from handlers.admin_chat_watch import router as admin_chat_watch_router
@@ -94,10 +104,22 @@ def register_all_handlers(dp: Dispatcher) -> None:
     # restart ДО antiraid: у антирейда есть широкий фильтр сообщений группы
     # (мониторинг спама), и он не должен перехватывать /perezap и /perestart.
     dp.include_router(restart_router)
+    # reminder_mutes ТОЖЕ до antiraid: его ввод номера обращения — обычное
+    # сообщение в группе, и без этого порядка антирейд перехватил бы его
+    # раньше (широкий фильтр + «обработка останавливается на первом
+    # подошедшем обработчике»). Порядок критичен, не переставлять.
+    dp.include_router(reminder_mutes_router)
     dp.include_router(antiraid_router)
     dp.include_router(antinakrutka_router)
     dp.include_router(configs_router)
+    # Напоминалка: список режимов, тихие часы, диагностика. Кнопки (callback)
+    # не конфликтуют по порядку, но держим рядом с reminder_mutes для читаемости.
     dp.include_router(reminders_router)
+    # YID держим после напоминалки: его кнопки живут в профиле, и порядок
+    # не влияет на фильтры — регистрируем рядом с профилем для читаемости.
+    dp.include_router(yid_router)
+    # Диагностика идёт следом: кнопка живёт в профиле рядом с YID.
+    dp.include_router(diagnostics_router)
     # Нормы админов: кнопка «📊 Норма» в профиле + уведомления о недоборе.
     dp.include_router(norms_router)
     # Время работы: кнопка «🕐 Время работы» в профиле.

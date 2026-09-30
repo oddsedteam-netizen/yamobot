@@ -559,7 +559,10 @@ async def cb_mailing_confirm(
                     f"✅ {sent}  ❌ {failed}",
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
 
         result = await child_manager.send_mailing(
             bot_id=bot_id,

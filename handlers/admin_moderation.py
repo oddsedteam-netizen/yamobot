@@ -61,7 +61,10 @@ async def _reply(message: Message, text: str, kb: InlineKeyboardMarkup | None = 
             attempts=2,
         )
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 async def _admins_stats(owner_id: int, period: str) -> str:

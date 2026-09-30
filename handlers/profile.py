@@ -149,7 +149,7 @@ def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin", style="primary"),
-            InlineKeyboardButton(text="👤 Профиль ВЛД", callback_data="adm_owner_profile",
+            InlineKeyboardButton(text="👤 Владелец бота", callback_data="adm_owner_pick",
                                  style="primary"),
         ],
         [
@@ -401,7 +401,10 @@ async def _check_bots_alive() -> tuple[int, int, int]:
             try:
                 await probe.session.close()
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
     return checked, dead, skipped
 
 
@@ -413,7 +416,10 @@ async def _delete_bot_forever(bot_id: int, child_manager: ChildManager) -> str:
         try:
             await child_manager.stop_child(bot_id)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
     name = bot_display_name(bot) if bot else f"бот {bot_id}"
     remove_user_bot(owner_id, bot_id)
     clear_bot_dead(bot_id)
@@ -460,26 +466,113 @@ def _owner_profile_text(owner_id: int) -> str:
     )
 
 
-@router.callback_query(F.data == "adm_owner_profile")
-async def cb_owner_profile(callback: CallbackQuery) -> None:
-    """Полный профиль владельца бота: чаты, боты, админы, тикеты."""
+@router.callback_query(F.data == "adm_owner_pick")
+async def cb_owner_pick(callback: CallbackQuery) -> None:
+    """Выбор бота, чтобы открыть профиль ЕГО владельца.
+
+    Раньше кнопка сразу открывала профиль того, кто её нажал, — то есть
+    профиль самого супер-админа. Теперь можно посмотреть профиль владельца
+    любого бота из списка.
+    """
     if not is_super_admin(cb_uid(callback)):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    await render_callback(
-        callback,
-        _owner_profile_text(cb_uid(callback)),
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗂 Логи ботов", callback_data="botlogs",
-                                  style="primary")],
-            [InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin",
-                                  style="primary")],
-            [InlineKeyboardButton(text="📨 Рассылка", callback_data="broadcast",
-                                  style="primary")],
-            [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin",
-                                  style="primary")],
-        ]),
-    )
+
+    bots = get_all_bots_flat()
+    if not bots:
+        await render_callback(
+            callback,
+            "👤 <b>Владелец бота</b>\n\nВ системе пока нет ни одного бота.",
+            InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Админ-панель",
+                                      callback_data="profile_admin",
+                                      style="primary"),
+            ]]),
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    text = ["👤 <b>Владелец бота</b>\n",
+            "Выбери бота — откроется профиль его владельца.\n"]
+    for bot in bots:
+        owner_id = int(bot.get("owner_id") or 0)
+        title = bot_display_name(bot)
+        text.append(f"🤖 <b>{title}</b> — <code>{owner_id}</code>")
+        rows.append([InlineKeyboardButton(
+            text=f"{title[:24]} · {owner_id}",
+            callback_data=f"adm_owner_of_{bot['id']}",
+            style="primary",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель",
+                                      callback_data="profile_admin",
+                                      style="primary")])
+
+    await render_callback(callback, "\n".join(text),
+                          InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm_owner_of_\d+$"))
+async def cb_owner_of_bot(callback: CallbackQuery) -> None:
+    """Открывает профиль владельца выбранного бота."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    bot = get_bot_by_id_any_owner(bot_id)
+    if not bot:
+        await callback.answer("❌ Бот не найден", show_alert=True)
+        return
+
+    owner_id = int(bot.get("owner_id") or 0)
+    if not owner_id:
+        await render_callback(
+            callback,
+            "⚠️ У этого бота не записан владелец.\n"
+            "Скорее всего, бот создан до перехода на новую схему прав.",
+            InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ К списку",
+                                      callback_data="adm_owner_pick",
+                                      style="primary"),
+            ]]),
+        )
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗂 Логи ботов", callback_data="botlogs",
+                              style="primary")],
+        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin",
+                              style="primary")],
+        [InlineKeyboardButton(text="⬅️ К списку ботов",
+                              callback_data="adm_owner_pick", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель",
+                              callback_data="profile_admin", style="primary")],
+    ])
+    await render_callback(callback, _owner_profile_text(owner_id), kb)
+
+
+@router.callback_query(F.data == "adm_owner_profile")
+async def cb_owner_profile(callback: CallbackQuery) -> None:
+    """Профиль владельца, заданного в данных кнопки (старые ссылки)."""
+    if not is_super_admin(cb_uid(callback)):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+
+    parts = cb_data(callback).split("_")
+    owner_id = cb_uid(callback)
+    if len(parts) > 3 and parts[3].isdigit():
+        owner_id = int(parts[3])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗂 Логи ботов", callback_data="botlogs",
+                              style="primary")],
+        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin",
+                              style="primary")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="profile_admin",
+                              style="primary")],
+    ])
+    await render_callback(callback, _owner_profile_text(owner_id), kb)
+
 
 
 # ═══════════════ Сводка / поиск / удаление одного бота ═══════════════
@@ -738,7 +831,10 @@ async def cb_dead_check(callback: CallbackQuery) -> None:
         await callback.message.edit_text("🔍 <b>Проверяю ботов…</b>\n\nЭто может занять "
                                         "до минуты — ботов много.")
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
     checked, dead, skipped = await _check_bots_alive()
     status = (
@@ -809,7 +905,10 @@ async def cb_dead_del_all_yes(callback: CallbackQuery, child_manager: ChildManag
             try:
                 await child_manager.stop_child(bot_id)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
 
     removed = remove_dead_bots()
     text, kb = _dead_bots_payload(f"🗑 <b>Удалено мёртвых ботов:</b> {len(removed)}.")
@@ -874,28 +973,45 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
     any_chat = work_chat or admin_chat
     chats_label = "📎 Чаты" if any_chat else "🔗 Привязать чаты"
     chats_data = "chats_info" if any_chat else "chats_bind"
+    # Раскладка кнопок профиля: четыре пары «слева/справа» и две широкие
+    # кнопки в конце. Отдельного размера у инлайн-кнопок в Telegram нет —
+    # ширину делят поровну кнопки одного ряда, поэтому «маленькие» кнопки
+    # получаются именно за счёт пары в ряду, а «большие» — за счёт ряда
+    # из одной кнопки во всю ширину.
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        # «Боты», «Админы» и «ПЗ» переехали в reply-меню — в профиле оставляем
-        # только то, что относится к настройкам владельца.
+        # Ряд 1 — без цвета: это «спокойные» разделы-настройки по умолчанию.
         [
             InlineKeyboardButton(text=chats_label, callback_data=chats_data),
             InlineKeyboardButton(text="📊 Норма", callback_data="norm"),
         ],
-        # «Защита» — красная: внутри антирейд и антинакрутка.
-        [InlineKeyboardButton(text="🛡 Защита", callback_data="profile_protection",
-                              style="danger")],
+        # Ряд 2 — синий: режимы-напоминания, которые настраивают по расписанию.
         [
-            InlineKeyboardButton(text="⏰ Напоминалка", callback_data="reminder_menu", style="primary"),
+            InlineKeyboardButton(text="⏰ Напоминалка", callback_data="reminder_menu",
+                                 style="primary"),
+            InlineKeyboardButton(text="🕐 Время работы", callback_data="work_hours",
+                                 style="primary"),
         ],
-        [InlineKeyboardButton(text="🕐 Время работы", callback_data="work_hours", style="primary")],
+        # Ряд 3 — «Защита» красная (внутри антирейд и антинакрутка),
+        # «Диагностика» синяя: обе подсказывают, что делать, если «не работает».
         [
-            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer", style="danger"),
-            InlineKeyboardButton(text="🔄 Полный перезапуск", callback_data="profile_restart_all", style="danger"),
+            InlineKeyboardButton(text="🛡 Защита", callback_data="profile_protection",
+                                 style="danger"),
+            InlineKeyboardButton(text="🩺 Диагностика", callback_data="user_diagnostics",
+                                 style="primary"),
         ],
+        # Ряд 4 — оба красные: передача прав меняет владельца бота,
+        # полный перезапуск трогает сразу все боты.
         [
-            InlineKeyboardButton(text="📂 Мои ссылки и конфиги", callback_data="my_links",
-                                 style="success"),
+            InlineKeyboardButton(text="👑 Передать права", callback_data="transfer",
+                                 style="danger"),
+            InlineKeyboardButton(text="🔄 Полный перезапуск",
+                                 callback_data="profile_restart_all", style="danger"),
         ],
+        # YID — зелёным и на всю ширину: это про сотрудника (его номер Y100+
+        # и личная статистика по админским ботам), а не про владельца.
+        [InlineKeyboardButton(text="🆔 YID", callback_data="yid_card", style="success")],
+        [InlineKeyboardButton(text="📂 Мои ссылки и конфиги", callback_data="my_links",
+                              style="success")],
     ])
     if is_super_admin(user_id):
         kb.inline_keyboard.append([
@@ -1190,7 +1306,10 @@ async def cb_transfer_accept(callback: CallbackQuery,
                     if await child_manager.restart_child(b):
                         restart_count += 1
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
     if restart_count:
         summary += f"\n\n🔄 Перезапущено ботов: <b>{restart_count}</b>"
@@ -1216,7 +1335,10 @@ async def cb_transfer_accept(callback: CallbackQuery,
                 f"<b>{_user_display(to_uid)}</b> принял ваши права: {rights_text}.",
             )
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 @router.callback_query(F.data.startswith("transfer_reject_"))
@@ -1237,7 +1359,10 @@ async def cb_transfer_reject(callback: CallbackQuery) -> None:
                     "❌ Новый владелец отклонил передачу прав.",
                 )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
 
 # ═══════════════ Админ-панель пользователей ═══════════════
@@ -1906,7 +2031,10 @@ async def cb_bind_done(callback: CallbackQuery) -> None:
                     if bot is not None:
                         await bot.leave_chat(chat_id)
                 except Exception:
-                    pass
+                    logger.debug(
+                        "Исключение проглочено",
+                        exc_info=True,
+                    )
             await callback.answer("✅ Привязано!")
             text, kb = _profile_payload(user_id, cb_firstname(callback) or "—")
             await render_callback(callback, text, kb)
@@ -1956,7 +2084,10 @@ async def cb_unbind_admin(callback: CallbackQuery) -> None:
             if bot is not None:
                 await bot.leave_chat(chat_id)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         await callback.answer("🛡 Чат админов отвязан")
     text, kb = _chats_info_payload(user_id)
     await render_callback(callback, text, kb)
@@ -2013,11 +2144,17 @@ async def on_bot_added_to_chat(event) -> None:
                 "💼 Чат работы привязан. YamoBot запомнил его и покидает чат. 👋",
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         try:
             await bot.leave_chat(chat.id)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         confirm_text = (
             f"✅ <b>Чат работы привязан!</b>\n\n"
             f"📎 Чат: <b>{chat_name}</b>\n"
@@ -2029,7 +2166,10 @@ async def on_bot_added_to_chat(event) -> None:
         try:
             await bot.send_message(chat.id, welcome_admin)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         confirm_text = (
             f"✅ <b>Чат админов привязан!</b>\n\n"
             f"📎 Чат: <b>{chat_name}</b>\n"
@@ -2045,5 +2185,8 @@ async def on_bot_added_to_chat(event) -> None:
     try:
         await bot.send_message(adder.id, confirm_text)
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 

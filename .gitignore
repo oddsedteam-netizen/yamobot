@@ -1,27 +1,36 @@
-# Токен и секреты
+# Секреты и локальные настройки
 .env
 .env.txt
+.env.*
+!.env.example
 
-# Данные ботов
+# Данные и базы
 data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
 
 # Виртуальное окружение
 venv/
+.venv/
+env/
 
-# Python кэш
+# Python-кэш
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Логи
+logs/
 *.log
 
 # IDE
 .idea/
 .vscode/
 *.swp
-
-*.pyrightconfig.json
-*.pyrightconfig

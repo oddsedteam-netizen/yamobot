@@ -652,16 +652,25 @@ async def _remove_recent_joiners(bot, chat_id: int, joins: list[dict]) -> None:
             try:
                 await bot.delete_message(chat_id, mid)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
         # Кик: баним и сразу разбаниваем (удаляет участника).
         try:
             await bot.ban_chat_member(chat_id, uid)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
         try:
             await bot.unban_chat_member(chat_id, uid)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -693,7 +702,10 @@ async def _warn_spammer(bot, chat_id: int, uid: int, kind: str, name: str) -> No
             try:
                 await bot.delete_message(chat_id, mid)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
     label = "стикерами" if kind == "sticker" else "сообщениями"
     try:
         await bot.send_message(
@@ -716,7 +728,10 @@ async def _ban_spammer(bot, chat_id: int, uid: int, kind: str,
             try:
                 await bot.delete_message(chat_id, mid)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
     try:
         await bot.ban_chat_member(chat_id, uid)
         banned = True

@@ -18,8 +18,7 @@ from aiogram.types import (
     Message,
 )
 
-from handlers._common import (cb_data, cb_uid, event_bot, msg_uid, render_callback,
-                              safe_edit)
+from handlers._common import (cb_data, cb_uid, event_bot, msg_uid, safe_edit)
 from services.storage import (
     add_admin,
     get_admin_by_user_id,
@@ -187,7 +186,10 @@ async def fsm_join_tag(message: Message, state: FSMContext) -> None:
             member = await event_bot(message).get_chat_member(chat_id, new_admin_id)
             username = getattr(member.user, "username", "") or ""
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
     add_admin(owner_id, new_admin_id, username, tag)
     await state.clear()

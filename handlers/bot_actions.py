@@ -127,9 +127,16 @@ def single_bot_kb(bot_id: int, is_running: bool, anon_mode: bool = False) -> Inl
     )
 
 
-@router.callback_query(F.data.startswith("bot_"))
+@router.callback_query(F.data.regexp(r"^bot_\d+$"))
 async def cb_single_bot(callback: CallbackQuery,
                         child_manager: ChildManager) -> None:
+    """Экран одного бота.
+
+    Фильтр строго ``^bot_<число>$``: прежний ``startswith("bot_")``
+    перехватывал ещё и кнопки выбора типа бота («bot_type_standard»,
+    «bot_type_anketa») — их обслуживает роутер добавления бота, а если он
+    почему-то не совпадёт, здесь падало ``int("type_standard")``.
+    """
     bot_id = int(cb_data(callback).split("_", 1)[1])
     user_id = cb_uid(callback)
 
@@ -777,8 +784,8 @@ def _adm_change_text(bot_id: int) -> str:
     status = "🟢 включено" if enabled else "⚪ выключено"
     return (
         "🔄 <b>Смена админа</b>\n\n"
-        "Если юзеру не ответил админ, он может попросить заменить его — кнопкой "
-        "«сменить админа» или командой в боте. Так можно бесконечно дёргать "
+        "Если юзеру не ответил админ, он может попросить заменить его — написав "
+        "боту «сменить админа» или команду /smena. Так можно бесконечно дёргать "
         "админов, поэтому бот ставит <b>ограничение на количество смен в "
         "сутки</b>.\n\n"
         f"📊 По умолчанию разрешено <b>{DEFAULT_ADMIN_CHANGE_LIMIT} смен</b> в "

@@ -20,10 +20,13 @@ from aiogram.types import (
 )
 
 from handlers._common import cb_data, cb_uid, msg_uid, render_callback
-from services.reminder_service import (format_duration, parse_quiet_range,
-                                       quiet_hours_label)
+from services.reminder_service import (REASON_BOT_DOWN, REASON_NO_CHAT, REASON_OFF,
+                                       REASON_QUIET, format_duration,
+                                       parse_quiet_range, quiet_hours_label,
+                                       reminder_diagnostics)
 from services.storage import (
     add_reminder,
+    count_active_mutes,
     delete_reminder,
     get_bound_chat,
     get_reminders,
@@ -71,6 +74,16 @@ REMINDER_MENU_TEXT = (
     "Тихие часы: в этот интервал (по МСК) напоминания <b>не отправляются</b>, "
     "чтобы не спамить админов, когда они спят.\n"
     "По стандарту: <b>с 21:00 до 09:00</b>.\n\n"
+    "<b>3) 🔇 Заглушить</b>\n"
+    "Если какое-то ПЗ не нужно напоминать (например, топик удалили, а новый "
+    "не создаётся) — нажми «🔇 Заглушить» прямо в уведомлении, выбери номер "
+    "и скажи: <b>навсегда</b> или <b>на сутки</b>. Снять заглушку можно в "
+    "«📋 Мои напоминалки» → «🔇 Заглушённые».\n\n"
+    "<b>4) ♻️ Сброс отсчёта</b>\n"
+    "Бывает, что напоминаний накопилось много, а функцию выключали и снова "
+    "включили — тогда всё приходит разом. Кнопка «♻️ Сбросить» в списке "
+    "напоминалок возвращает отсчёт на ноль: каждое обращение снова ждёт "
+    "полный срок, и напоминания идут по одному.\n\n"
     "Выбери режим ниже 👇"
 )
 
@@ -84,6 +97,8 @@ def _mode_kb(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🕒 Настройка времени",
                               callback_data="reminder_quiet", style="primary")],
         [InlineKeyboardButton(text="📋 Мои напоминалки", callback_data="reminder_list", style="primary")],
+        [InlineKeyboardButton(text="🔇 Заглушённые", callback_data="rm_muted", style="primary")],
+        [InlineKeyboardButton(text="🩺 Диагностика", callback_data="reminder_diag", style="primary")],
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")],
     ])
 
@@ -174,6 +189,8 @@ def _ask_quiet_text(user_id: int) -> str:
 
 def _reminders_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     reminders = get_reminders(user_id)
+    # Считаем один раз и ДО текста: значение нужно и в тексте, и на кнопке.
+    muted_count = count_active_mutes(user_id)
     if not reminders:
         text = (
             "📋 <b>Мои напоминалки</b>\n\n"
@@ -187,7 +204,15 @@ def _reminders_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             label = MODE_LABELS.get(r.get("mode", ""), r.get("mode", "?"))
             dur = format_duration(r.get("duration_seconds") or 0)
             lines.append(f"{status} | {label} — <b>{dur}</b>")
-        lines.append("\nСписок обновляется: пересоздай напоминалку при изменении.")
+        lines.append(
+            "\n♻️ <b>Сбросить</b> — если напоминаний накопилось много и они "
+            "приходят разом. Отсчёт начнётся заново, по одному обращению."
+        )
+        if muted_count:
+            lines.append(
+                f"\n🔇 Заглушено обращений: <b>{muted_count}</b> — по ним "
+                "напоминания не приходят."
+            )
         text = "\n".join(lines)
 
     kb_rows: list[list[InlineKeyboardButton]] = []
@@ -196,10 +221,20 @@ def _reminders_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         toggle_text = "⏸ Выкл" if r.get("enabled") else "▶️ Вкл"
         kb_rows.append([
             InlineKeyboardButton(text=toggle_text, callback_data=f"reminder_toggle_{rid}", style="primary"),
+            # Сброс отсчёта — на случай «накопилось много напоминаний»: без
+            # него включение функции после перерыва вываливает всё разом.
+            InlineKeyboardButton(text="♻️ Сбросить", callback_data=f"rm_reset_ask:{rid}", style="primary"),
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"reminder_del_{rid}", style="danger"),
         ])
+    muted_count = count_active_mutes(user_id)
+    kb_rows.append([InlineKeyboardButton(
+        text=f"🔇 Заглушённые ({muted_count})" if muted_count else "🔇 Заглушённые",
+        callback_data="rm_muted", style="primary",
+    )])
     kb_rows.append([InlineKeyboardButton(text="🕒 Настройка времени",
                                          callback_data="reminder_quiet", style="primary")])
+    kb_rows.append([InlineKeyboardButton(text="🩺 Диагностика",
+                                         callback_data="reminder_diag", style="primary")])
     kb_rows.append([InlineKeyboardButton(text="➕ Добавить напоминалку",
                                          callback_data="reminder_menu", style="primary")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show")])
@@ -215,6 +250,73 @@ def _ask_time_text(mode: str) -> str:
         "Можно вместе: <code>1 час 30 минут</code>.\n"
         "Диапазон: от 30 секунд до 30 дней."
     )
+
+
+# ── Диагностика: почему напоминалка молчит ──────────────────────────────────
+
+def _diagnostics_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Экран «🩺 Диагностика»: честно показываем, что мешает напоминаниям."""
+    d = reminder_diagnostics(user_id)
+
+    lines = ["🩺 <b>Диагностика напоминалки</b>\n", d["reason_text"], ""]
+
+    if d["reminders"]:
+        lines.append("<b>Мои напоминалки:</b>")
+        for p in d["reminders"]:
+            status = "🟢 вкл" if p["enabled"] else "⚪ выкл"
+            waiting = f" · ждут: <b>{p['due']}</b>" if p["enabled"] else ""
+            lines.append(f"  {status} | {p['label']} — {p['duration']}{waiting}")
+    else:
+        lines.append("<b>Мои напоминалки:</b> пока пусто.")
+
+    lines.append("")
+    lines.append("<b>Проверки:</b>")
+    lines.append(f"  Бот на связи: {'✅ да' if d['bot_ready'] else '❌ нет'}")
+    lines.append(
+        f"  Чат админов привязан: {'✅ да' if d['admin_chat'] else '❌ нет'}"
+    )
+    lines.append(f"  Тихие часы: {d['quiet_label']}")
+    lines.append(f"  Сейчас ждут уведомления: <b>{d['pending']}</b> ПЗ")
+    # Заглушки — частая причина «напоминалка молчит»: владелец сам отключил
+    # уведомления по конкретным ПЗ и забыл. Без этой строки диагностика
+    # выглядела бы как поломка.
+    if d.get("muted"):
+        lines.append(
+            f"  🔇 Заглушено обращений: <b>{d['muted']}</b> — по ним "
+            "напоминания не приходят"
+        )
+
+    # Подсказка с решением — самое важное: не «что-то не так», а что делать.
+    hint = ""
+    if d["reason"] == REASON_NO_CHAT:
+        hint = "\n\n➕ <b>Что сделать:</b> привяжи «чат админов» в профиле."
+    elif d["reason"] == REASON_QUIET:
+        hint = ("\n\n➕ <b>Что сделать:</b> смени интервал тихих часов "
+                "кнопкой «🕒 Настройка времени».")
+    elif d["reason"] == REASON_OFF:
+        hint = ("\n\n➕ <b>Что сделать:</b> включи напоминалку кнопкой "
+                "«▶️ Вкл» в списке «📋 Мои напоминалки».")
+    elif d["reason"] == REASON_BOT_DOWN:
+        hint = "\n\n➕ <b>Что сделать:</b> проверь токен бота и журнал бота."
+    elif d.get("muted") and d["pending"] == 0 and d["reminders"]:
+        hint = ("\n\n➕ <b>Что сделать:</b> проверь заглушки — «🔇 Заглушённые». "
+                "Если обращение снова нужно напоминать, сними заглушку.")
+
+    text = "\n".join(lines) + hint
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="reminder_diag",
+                              style="primary")],
+        [InlineKeyboardButton(text="⬅️ Напоминалка", callback_data="reminder_menu",
+                              style="primary")],
+    ])
+    return text, kb
+
+
+@router.callback_query(F.data == "reminder_diag")
+async def cb_reminder_diag(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, kb = _diagnostics_payload(cb_uid(callback))
+    await render_callback(callback, text, kb)
 
 
 # ── Обработчики ────────────────────────────────────────────────────────────

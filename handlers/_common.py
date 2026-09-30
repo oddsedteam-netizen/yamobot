@@ -14,8 +14,7 @@ from aiogram.types import (
     MaybeInaccessibleMessage,
 )
 
-_logger = logging.getLogger(__name__)
-logger = _logger
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════ Нормализация ссылок ═══════════════════════════════════
@@ -68,7 +67,6 @@ ADMIN_CHAT_WELCOME = (
     "(только владелец).\n"
     "• <code>/perestart</code> — простой перезапуск без изменения привязки.\n\n"
     "🧭 <b>Команды для админов (работают в топиках):</b>\n"
-    "• <code>/smena</code> — сменить админа у ПЗ без подтверждения.\n"
     "• <code>/otkaz</code> — отказаться от ПЗ / сбросить админа.\n"
     "• <code>/ban</code> — забанить пользователя.\n"
     "• <code>/unban</code> — разбанить пользователя.\n"
@@ -104,7 +102,7 @@ async def _retry_send(coro_factory, attempts: int = 6):
             # Не «засыпаем» надолго: каптируем до 30с за попытку, чтобы не блокировать
             # обработку остальных сообщений. При 6 попытках это максимум ~30–180с.
             delay = min(delay, 30.0)
-            _logger.warning("Flood wait %.1fs (попытка %d/%d), жду", delay, attempt + 1, attempts)
+            logger.warning("Flood wait %.1fs (попытка %d/%d), жду", delay, attempt + 1, attempts)
             await asyncio.sleep(delay)
         except TelegramBadRequest as e:
             if _is_not_modified(e):
@@ -137,7 +135,10 @@ async def edit_or_answer(target: MaybeInaccessibleMessage | None, text: str,
             if _is_not_modified(e) and not force_answer:
                 return
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
     answer = getattr(target, "answer", None)
     if answer is not None:
         await answer(text, reply_markup=reply_markup)
@@ -174,7 +175,10 @@ async def safe_edit(target: MaybeInaccessibleMessage | None, text: str,
             try:
                 await edit(text, reply_markup=reply_markup)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
 
 
 # ═══════════════ Доступ к полям aiogram ═══════════════════════════════
@@ -245,7 +249,10 @@ async def try_edit(target: MaybeInaccessibleMessage | None, text: str,
         try:
             await edit(text, reply_markup=reply_markup)
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
 
 async def try_edit_answer(target: MaybeInaccessibleMessage | None, text: str,
@@ -259,7 +266,10 @@ async def try_edit_answer(target: MaybeInaccessibleMessage | None, text: str,
             await edit(text, reply_markup=reply_markup)
             return
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
     answer = getattr(target, "answer", None)
     if answer is not None:
         await answer(text, reply_markup=reply_markup)

@@ -24,22 +24,24 @@ from aiogram.types import (
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
+    BotCommand,
     Message,
     CallbackQuery,
     MessageEntity,
     MessageReactionUpdated,
     ReactionTypeCustomEmoji,
     ReactionTypeEmoji,
-    ReplyKeyboardMarkup,
 )
 
 from handlers._common import (cb_data, cb_uid, cb_username, cb_firstname,
                               msg_uid, msg_username, msg_firstname,
-                              try_edit_answer, try_edit)
+                              render_callback, try_edit_answer, try_edit)
 from services import premium_emoji as premium
 from services.config import proxy_settings
 from services.constants import BASE_WELCOME, BOT_CREDIT
+from services.delivery import get_outbox
+from services.guards import fire_and_forget
+from services.logging_setup import bot_context, bot_logger
 from services.polling import ResilientDispatcher, set_polling_problem_hook
 from services.promo import detect_promo_from_message
 from services.rich import rich_payload_from_json, send_rich
@@ -67,15 +69,19 @@ from services.storage import (
     get_feedback_chat,
     get_topic_by_user,
     get_topic_by_topic_id,
+    get_pinned_message_id,
+    set_pinned_message_id,
     create_topic_record,
     delete_topic_record,
     assign_admin_to_topic,
     reset_topic_admin,
     save_feedback_message,
+    touch_topic_activity,
+    set_topic_closed,
     get_feedback_msg_by_group_msg,
     get_feedback_msg_by_user_msg,
     get_bot_owner,
-    get_bot_keyboard_by_bot,
+    get_admin_greeting,
     bot_display_name,
     is_bot_anonymous,
     get_bound_chat,
@@ -455,6 +461,35 @@ def _is_thread_not_found(err: Exception) -> bool:
             or "topic not found" in msg)
 
 
+# ── Разбор callback_data кнопок в топиках ─────────────────────────
+# Кнопки одного экрана делят общий префикс: «refuse_<топик>_<чат>»,
+# «refuse_q_<топик>_<чат>_<0|1>», «refuse_cancel». Раньше на них стоял
+# startswith("refuse_"), из-за чего ЛЮБАЯ форма попадала в первый хендлер, а
+# он брал parts[1] числом: для «refuse_q_…» это давало int("q"), а для
+# «refuse_cancel» — int("cancel"). Нажатие «Анонимно», «Сообщить ПЗ» и
+# «Отмена» падало с ValueError и ничего не делало.
+#
+# Поэтому разбираем callback через единый безопасный хелпер: он не роняет
+# бота на битых или устаревших кнопках, а просто возвращает None.
+def parse_topic_ids(data: str, offset: int, limit: int | None = None) -> tuple[int, ...] | None:
+    """Числа из ``callback_data`` начиная с ``offset``.
+
+    ``None`` — данные не разобрались (битая кнопка, старый формат). Вызывающий
+    код обязан это обработать, а не полагаться на исключение.
+    """
+    parts = (data or "").split("_")
+    wanted = limit if limit is not None else (len(parts) - offset)
+    if len(parts) < offset + wanted:
+        return None
+    values: list[int] = []
+    for raw in parts[offset:offset + wanted]:
+        try:
+            values.append(int(raw))
+        except (TypeError, ValueError):
+            return None
+    return tuple(values)
+
+
 # ── Категория ПЗ (хэштег в первом сообщении) ───────────────────
 # ПЗ обычно помечает обращение категорией в первом сообщении после /start:
 # «#общение», «#поддержка», «#универсал» и т.п. Категорию показываем в
@@ -746,6 +781,269 @@ async def _on_polling_problem(bot: Bot, kind: str) -> None:
 set_polling_problem_hook(_on_polling_problem)
 
 
+def _topic_action_kb(topic_id: int, group_chat_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под новым ПЗ: взять или отказаться.
+
+    Раньше здесь была одна кнопка «Я беру», и админу, который не может
+    ответить, оставалось только молча переименовывать топик вручную — об
+    этом просили отдельную кнопку отказа.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✋ Я беру",
+                             callback_data=f"take_user_{topic_id}_{group_chat_id}",
+                             style="success"),
+        InlineKeyboardButton(text="🚫 Отказ",
+                             callback_data=f"refuse_{topic_id}_{group_chat_id}",
+                             style="danger"),
+    ]])
+
+
+def _topic_refuse_only_kb(topic_id: int, group_chat_id: int) -> InlineKeyboardMarkup:
+    """Только «Отказ» — то, что остаётся под шапкой ПЗ после «✋ Я беру».
+
+    Нажатие «Я беру» больше не убирает клавиатуру целиком (иначе админ терял
+    возможность отказаться от обращения, которое он уже взял): исчезает
+    только сама кнопка «Я беру», а «Отказ» остаётся.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚫 Отказ",
+                             callback_data=f"refuse_{topic_id}_{group_chat_id}",
+                             style="danger"),
+    ]])
+
+
+async def _pin_topic_action(bot_obj: Bot, bot_id: int, group_chat_id: int,
+                            topic_id: int, sent: Message | None) -> None:
+    """Закрепляет шапку ПЗ — сообщение с кнопками «✋ Я беру» / «🚫 Отказ».
+
+    Зачем нужен закреп
+    ------------------
+    Шапка — единственное место, где админ может взять обращение или отказаться
+    от него. В переписке ПЗ и админа она быстро уезжает вверх, кнопка
+    «теряется», и отказаться от ПЗ становится негде. Поэтому шапку держим в
+    закрепе.
+
+    Когда приходит НОВАЯ шапка (смена админа, отказ, повторный запрос) —
+    снимаем старый закреп и закрепляем новую: в закрепе не должно остаться
+    устаревшего «никто не взял».
+
+    Ошибки закрепа сценарий не ломают: если бот не админ чата или у него нет
+    права «Закреплять сообщения», Telegram вернёт ошибку — ПЗ всё равно
+    получит админа, просто без закрепа в журнале появится предупреждение.
+    """
+    message_id = int(getattr(sent, "message_id", 0) or 0)
+    if not message_id:
+        return
+
+    previous = get_pinned_message_id(bot_id, topic_id, group_chat_id)
+    if previous and previous != message_id:
+        try:
+            await bot_obj.unpin_chat_message(chat_id=group_chat_id,
+                                             message_id=previous)
+        except Exception:
+            logger.debug("Не удалось снять прошлый закреп в топике %s",
+                         topic_id, exc_info=True)
+
+    try:
+        await bot_obj.pin_chat_message(chat_id=group_chat_id,
+                                       message_id=message_id,
+                                       disable_notification=True)
+    except Exception as e:
+        logger.warning("Не удалось закрепить шапку ПЗ в топике %s: %s", topic_id, e)
+
+    try:
+        set_pinned_message_id(bot_id, topic_id, group_chat_id, message_id)
+    except Exception:
+        logger.debug("Не удалось сохранить id закреплённой шапки ПЗ %s",
+                     topic_id, exc_info=True)
+
+
+async def _release_and_announce(bot_obj: Bot, bot_id: int, topic_id: int,
+                                group_chat_id: int, user_chat_id: int) -> None:
+    """Освобождает ПЗ от админа и просит нового.
+
+    Используется кнопкой «Отказ» от админа и подтверждённым запросом смены
+    от самого ПЗ. ПЗ в обоих случаях получает сообщение о смене.
+    """
+    reset_topic_admin(bot_id, topic_id, group_chat_id)
+    touch_topic_activity(bot_id, topic_id, group_chat_id, "in")
+
+    try:
+        await _notify_admin_change(bot_id, group_chat_id, topic_id)
+    except Exception as e:
+        logger.warning("Не удалось уведомить о смене админа: %s", e)
+
+    try:
+        await bot_obj.send_message(
+            chat_id=user_chat_id,
+            text="🔄 Вашего администратора меняют. С вами скоро свяжется новый админ.",
+        )
+    except Exception:
+        logger.debug("Не удалось уведомить ПЗ о смене админа", exc_info=True)
+
+    await _rename_topic(bot_obj, group_chat_id, topic_id, "🔄 смена админа")
+
+    sent = await bot_obj.send_message(
+        chat_id=group_chat_id, message_thread_id=topic_id,
+        text="🔔 Пользователь запросил смену админа!",
+        reply_markup=_topic_action_kb(topic_id, group_chat_id),
+    )
+    # Новая шапка занимает место старой в закрепе: админ должен видеть
+    # актуальные кнопки, а не устаревшее «обращение уже взято».
+    await _pin_topic_action(bot_obj, bot_id, group_chat_id, topic_id, sent)
+
+
+async def _ask_change_admin(bot_obj: Bot, bot_id: int, user_chat_id: int,
+                            topic: dict) -> bool:
+    """Единый вход для смены админа: и команда ``/smena``, и текст.
+
+    Раньше эти пути различались: команда ``/smena`` сбрасывала админа сразу,
+    без подтверждения, без проверки суточного лимита и без записи в журнал
+    смен. Теперь оба пути приводят к одному экрану подтверждения, а сама
+    смена происходит только в ``confirm_change_yes`` — там уже есть проверка
+    лимита и ``log_admin_change``.
+
+    ПЗ сразу видит, сколько смен у него осталось на сегодня.
+    False — отвечать не о чем (нет обращения или нет назначенного админа),
+    текст уже отправлен.
+    """
+    topic_id = int(topic["topic_id"])
+    group_chat_id = int(topic["group_chat_id"])
+
+    if not topic.get("admin_user_id"):
+        await bot_obj.send_message(
+            chat_id=user_chat_id,
+            text="У вас сейчас нет назначенного админа.",
+        )
+        return False
+
+    # Показываем, сколько смен у юзера осталось (если лимит включён).
+    left = admin_changes_left(bot_id, user_chat_id)
+    if left == 0:
+        await bot_obj.send_message(
+            chat_id=user_chat_id,
+            text="⏳ <b>Смен на сегодня не осталось.</b>\n\n"
+                 "Лимит смен админа в сутки уже исчерпан. Завтра он "
+                 "обновится — или просто подожди ответа текущего админа.",
+        )
+        return False
+
+    # -1 — ограничение выключено: упоминать нечего.
+    left_line = f"\n\n🔄 Осталось смен сегодня: <b>{left}</b>." if left > 0 else ""
+    await bot_obj.send_message(
+        chat_id=user_chat_id,
+        text=f"❓ Вы уверены, что хотите сменить админа?{left_line}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да", style="success",
+                                 callback_data=f"confirm_change_yes_{topic_id}_{group_chat_id}"),
+            InlineKeyboardButton(text="❌ Нет", style="primary",
+                                 callback_data=f"confirm_change_no_{topic_id}_{group_chat_id}"),
+        ]]),
+    )
+    return True
+
+
+async def _send_admin_greeting(bot_obj: Bot, bot_id: int, user_chat_id: int,
+                              admin_user_id: int) -> None:
+    """Отправляет ПЗ заготовленное приветствие админа (если оно есть).
+
+    Приветствие заводится админом в основном боте: «🆔 YID» → «Моё
+    приветствие» → выбрать бота. Хранится на пару (бот, админ), потому что
+    стиль общения у каждого бота свой.
+
+    Не заменяет ответ админа — уходит первым сообщением, чтобы ПЗ сразу
+    получил представление о том, кто ему отвечает.
+    """
+    if not user_chat_id or not admin_user_id:
+        return
+    try:
+        greeting = get_admin_greeting(bot_id, admin_user_id)
+    except Exception:
+        logger.debug("Не удалось прочитать приветствие админа", exc_info=True)
+        return
+    if not greeting:
+        return
+
+    text = str(greeting.get("text") or "").strip()
+    photo = str(greeting.get("photo_id") or "").strip()
+    if not text and not photo:
+        return
+
+    entities = None
+    raw_entities = str(greeting.get("text_entities") or "[]")
+    if raw_entities and raw_entities != "[]":
+        try:
+            entities = json.loads(raw_entities)
+        except (TypeError, ValueError):
+            entities = None
+
+    # Подпись к фото ограничена 1024 символами.
+    caption = text[:1024] if photo else text
+
+    try:
+        if photo:
+            # file_id выдал ОСНОВНОЙ бот, а отправляет дочерний: такой файл ему
+            # не принадлежит, и Telegram отклоняет его. Поэтому качаем байты
+            # основным ботом и заливаем заново — как в _send_work_hours_reply.
+            # Раньше файл уходил «как есть», ошибка глоталась в except, и фото
+            # молча не отправлялось.
+            data = await _cached_media_bytes(photo)
+            if data is not None:
+                await bot_obj.send_photo(
+                    chat_id=user_chat_id,
+                    photo=BufferedInputFile(data, filename="greeting.jpg"),
+                    caption=caption or None,
+                    caption_entities=entities,
+                    parse_mode=None,
+                )
+            else:
+                # Файл скачать не вышло — шлём по исходному file_id.
+                logger.warning(
+                    "Приветствие админа: не удалось скачать фото, пробую file_id"
+                )
+                await bot_obj.send_photo(
+                    chat_id=user_chat_id,
+                    photo=photo,
+                    caption=caption or None,
+                    caption_entities=entities,
+                    parse_mode=None,
+                )
+        else:
+            await bot_obj.send_message(
+                chat_id=user_chat_id,
+                text=text,
+                entities=entities,
+                parse_mode=None,
+            )
+    except Exception:
+        # Приветствие — украшение: не отправка не должна ломать взятие
+        # обращения. Но молчать нельзя — админ должен видеть, что фото не ушло.
+        logger.warning("Не удалось отправить приветствие админа ПЗ", exc_info=True)
+        # Страховка: хотя бы текст. Иначе ПЗ не узнает, кто к нему пришёл.
+        if photo and text:
+            try:
+                await bot_obj.send_message(
+                    chat_id=user_chat_id,
+                    text=text,
+                    entities=entities,
+                    parse_mode=None,
+                )
+            except Exception:
+                logger.debug("Не удалось отправить текст приветствия",
+                             exc_info=True)
+
+
+async def _rename_topic(bot_obj: Bot, group_chat_id: int, topic_id: int,
+                        name: str) -> None:
+    """Переименовывает топик; ошибка не должна ломать сценарий."""
+    try:
+        await bot_obj.edit_forum_topic(
+            chat_id=group_chat_id, message_thread_id=topic_id, name=name
+        )
+    except Exception:
+        logger.debug("Не удалось переименовать топик %s", topic_id, exc_info=True)
+
+
 async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int,
                          promo_hint: str | None = None,
                          categories: str = "") -> None:
@@ -883,7 +1181,10 @@ async def _notify_protection(message: Message, owner_id: int) -> None:
             "мы снова сможем принять ваше обращение. Попробуйте позже.",
         )
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 def clear_antinakrutka_state(owner_id: int) -> None:
@@ -1217,45 +1518,90 @@ async def _send_welcome_photo(message: Message, photo_id: str, caption: str,
     Фото владелец загружал в диалог с основным ботом, поэтому файл
     перекачивается и заливается дочерним ботом заново (file_id чужого бота
     не работает).
+
+    Раньше здесь была одна попытка ``answer_photo`` с HTML-разметкой, и при
+    любой ошибке возвращался ``False`` — после чего приветствие уходило
+    обычным текстом БЕЗ фото. Главная причина: в тексте приветствия живут
+    теги ``<tg-emoji>`` (премиум-эмодзи), которые Telegram не понимает в
+    HTML-режиме и отвечает ``Bad Request``.
+
+    Поэтому отправляем тремя ступенями, каждая строже предыдущей:
+      1. сущностями без parse_mode — разметка и премиум-эмодзи сохраняются;
+      2. текстом без ``<tg-emoji>``-разметки — если HTML всё же не принят;
+      3. фото совсем без подписи, а текст приветствия уходит отдельным
+         сообщением следом: лучше текст без фото, чем молчаливое фото без текста.
     """
     data = await _cached_media_bytes(photo_id)
     if data is None:
+        logger.warning("Не удалось скачать фото приветствия — отправляю текстом")
         return False
-    # Подпись к фото ограничена 1024 символами.
-    cap = (caption or "").strip()[:1024]
+
     photo = BufferedInputFile(data, filename="welcome.jpg")
+    # Подпись к фото ограничена 1024 символами. Режем ДО конвертации в
+    # сущности, иначе можно разорвать открывающий тег и получить битый текст.
+    cap = (caption or "").strip()[:1024] or None
+
+    # ── 1. Сущностями без parse_mode: Telegram принимает разметку «как есть» ──
+    if cap:
+        raw, entities = premium.markup_to_entities(cap)
+        try:
+            await message.answer_photo(photo=photo, caption=raw,
+                                       caption_entities=entities or None,
+                                       parse_mode=None, reply_markup=reply_markup)
+            return True
+        except TelegramBadRequest as e:
+            logger.warning("Приветствие с фото не отправилось сущностями: %s", e)
+
+        # ── 2. Тот же текст, но уже без тегов премиум-эмодзи ──
+        plain = premium.EMOJI_TAG_RE.sub(r"\2", cap)
+        try:
+            await message.answer_photo(photo=photo, caption=plain,
+                                       reply_markup=reply_markup)
+            return True
+        except TelegramBadRequest as e:
+            logger.warning("Приветствие с фото не отправилось текстом: %s", e)
+
+    # ── 3. Фото гарантированно уходит, текст — отдельным сообщением ──
     try:
-        await message.answer_photo(photo=photo, caption=cap or None,
-                                   reply_markup=reply_markup)
-        return True
+        await message.answer_photo(photo=photo, reply_markup=reply_markup)
     except Exception as e:
-        logger.warning("Приветствие с фото не отправилось (%s)", e)
+        logger.warning("Не удалось отправить фото приветствия: %s", e)
         return False
+    if cap:
+        await _safe_answer(message, cap, reply_markup)
+    return True
 
 
-def _build_reply_kb(bot_data: dict) -> ReplyKeyboardMarkup | None:
-    """Строит reply-клавиатуру дочернего бота из его настроек.
+def _build_bot_commands() -> list[BotCommand]:
+    """Команды дочернего бота — то самое меню по кнопке у поля ввода.
 
-    Для анкетницы (anketa) reply-кнопки не используются — возвращает None.
-    Для обычного бота используются сохранённые кнопки (или дефолт «сменить админа»).
+    Раньше действие «сменить админа» висело на reply-кнопке под полем ввода,
+    и пользователи жаловались на случайные нажатия: сообщение отправлялось
+    вместо текста ПЗ. Команда такого не делает — её нужно выбрать руками.
+
+    Команда ``start`` добавлена тоже: без неё меню выглядит пустым, хотя /start
+    — самая частая команда.
     """
-    if bot_data.get("bot_type") == "anketa":
-        return None
+    return [
+        BotCommand(command="start", description="Перезапустить бота"),
+        BotCommand(command="smena", description="Сменить админа"),
+    ]
 
-    buttons = get_bot_keyboard_by_bot(bot_data["id"])
-    rows: list[list[KeyboardButton]] = []
-    for item in buttons:
-        if not isinstance(item, dict):
-            continue
-        text = item.get("text", "").strip()
-        if not text:
-            continue
-        rows.append([KeyboardButton(text=text)])
 
-    if not rows:
-        return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="сменить админа")]], resize_keyboard=True)
+async def _set_bot_commands(bot_obj: Bot) -> None:
+    """Публикует меню команд дочернего бота.
 
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    Ошибка здесь не критична (например, у бота могут быть ограничения на
+    команды), поэтому просто пишем в журнал и идём дальше — приветствие
+    пользователю всё равно покажем.
+    """
+    try:
+        await bot_obj.set_my_commands(_build_bot_commands())
+    except Exception:
+        logger.debug(
+            "Не удалось настроить команды бота",
+            exc_info=True,
+        )
 
 
 def _caption_kwargs(source_msg: Message, native: bool) -> dict[str, Any]:
@@ -1506,10 +1852,12 @@ async def _send_to_topic(source_msg: Message, bot: Bot,
 
     try:
         return await _copy_message_smart(source_msg, bot, kwargs)
-    except Exception as e:
+    except Exception:
         # НЕ глотаем ошибку: вызывающий код (_send_to_topic_retry) сам решает,
         # повторить отправку на временном сбое или пересоздать удалённый топик.
-        logger.error("Ошибка отправки в топик: %s", e)
+        # Пишем на уровне DEBUG: удалённый топик — штатная ситуация, и её
+        # обрабатывает вызывающий код, а не ошибка отправки.
+        logger.debug("Не удалось отправить в топик %s", topic_id, exc_info=True)
         raise
 
 
@@ -1584,7 +1932,10 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
     try:
         mark_user_blocked(bot_id, user_chat_id)
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
     topic = get_topic_by_user(bot_id, user_chat_id)
     if not topic:
@@ -1599,7 +1950,10 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
     try:
         await bot.edit_forum_topic(chat_id=g_id, message_thread_id=t_id, name="🚫 забанил бота")
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
     try:
         await bot.send_message(
@@ -1607,12 +1961,18 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
             text=f"🚫 Пользователь <code>{user_chat_id}</code> забанил бота.\nТопик закрыт."
         )
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
     try:
         await bot.close_forum_topic(chat_id=g_id, message_thread_id=t_id)
     except Exception:
-        pass
+        logger.debug(
+            "Исключение проглочено",
+            exc_info=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1738,6 +2098,8 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
     # логе — см. services/polling.py.
     child_dp = ResilientDispatcher()
     bot_id = bot_data["id"]
+    # Логгер этого бота: все его записи попадают в logs/bots/bot_<id>.log.
+    bot_log = bot_logger(bot_id, __name__)
 
     # Ошибки обработчиков пишем в журнал по этому боту: пользователь сможет
     # прислать их в поддержку, а владелец платформы — посмотреть в админке.
@@ -1753,11 +2115,20 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             )
         except Exception as log_error:  # журнал не должен ломать обработку
             logger.debug("Не удалось записать ошибку бота %s: %s", bot_id, log_error)
-        logger.error("Бот %s: ошибка обработчика: %s", bot_id, event.exception,
-                     exc_info=event.exception)
+        bot_log.error("Ошибка обработчика: %s", event.exception,
+                      exc_info=event.exception)
         return True
 
     child_dp.errors.register(_log_child_error)
+
+    # Помечаем контекст журналирования: пока обрабатывается апдейт этого бота,
+    # ВСЕ записи логов (наши и сторонних библиотек) относятся к нему и
+    # пишутся в logs/bots/bot_<id>.log. Иначе в журнале бота не оказалось бы
+    # ничего, а разбираться пришлось бы по общему файлу.
+    @child_dp.update.outer_middleware()
+    async def _bind_bot_context(handler, event, data):
+        with bot_context(bot_id, f"@{bot_data.get('username') or ''}"):
+            return await handler(event, data)
 
     sticker_counts: dict[int, list[float]] = defaultdict(list)
     sticker_warnings: dict[int, bool] = defaultdict(bool)
@@ -1832,12 +2203,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         # В самом низу любого приветствия — плашка-кредит.
         welcome = f"{welcome}{BOT_CREDIT}"
 
-        # Инлайн-кнопки (ссылки) прикрепляем ПРЯМО к приветствию.
-        # В одном сообщении reply- и inline-клавиатуру показать нельзя, поэтому
-        # приветствие отправляется РОВНО ОДИН раз, а reply-клавиатура (если она
-        # есть у стандартного бота) показывается отдельным коротким сообщением.
+        # Инлайн-кнопки (ссылки) крепим ПРЯМО к приветствию. Reply-клавиатуры
+        # больше нет: «сменить админа» живёт в меню команд бота (/smena),
+        # поэтому случайно отправить команду вместо текста ПЗ нельзя.
         welcome_kb = _build_welcome_kb(fresh)
-        reply_kb = _build_reply_kb(fresh)
 
         # ── Красивое приветствие: rich-«статья» или фото ──
         # Если владелец оформил приветствие как rich-сообщение (статью) или
@@ -1857,22 +2226,12 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                                                      welcome, welcome_kb)
 
         if sent_special:
-            # Приветствие ушло статьёй/фото — reply-клавиатуру показываем отдельно.
-            if reply_kb:
-                await _safe_answer(message, "👇 Меню действий — кнопкой ниже:", reply_kb)
             add_stat(bot_id, "message_out")
             return
 
-        if welcome_kb and reply_kb:
-            # Сначала приветствие с инлайн-кнопками, затем подсказка с reply.
+        if welcome_kb:
             if not await _safe_answer(message, welcome, welcome_kb):
                 await _safe_answer(message, welcome)
-            await _safe_answer(message, "👇 Меню действий — кнопкой ниже:", reply_kb)
-        elif welcome_kb:
-            if not await _safe_answer(message, welcome, welcome_kb):
-                await _safe_answer(message, welcome)
-        elif reply_kb:
-            await _safe_answer(message, welcome, reply_kb)
         else:
             await _safe_answer(message, welcome)
         add_stat(bot_id, "message_out")
@@ -2074,14 +2433,20 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 chat_id=group_chat_id, message_thread_id=thread_id, name="🚫 забанен"
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         try:
             await bot_obj.close_forum_topic(
                 chat_id=group_chat_id, message_thread_id=thread_id
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         reset_topic_admin(bot_id, thread_id, group_chat_id)
         # Забаненный/закрытый ПЗ не должен показываться в списках ПЗ.
@@ -2140,7 +2505,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 name="⏳ без админа"
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         # Открываем топик если был закрыт
         try:
@@ -2149,20 +2517,21 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 message_thread_id=thread_id
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         # Отправляем кнопку "Я беру"
-        await bot_obj.send_message(
+        sent = await bot_obj.send_message(
             chat_id=group_chat_id,
             message_thread_id=thread_id,
             text=f"🔓 Пользователь <code>{user_chat_id}</code> разбанен.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="✋ Я беру",
-                    callback_data=f"take_user_{thread_id}_{group_chat_id}"
-                )]
-            ])
+            reply_markup=_topic_action_kb(thread_id, group_chat_id),
         )
+        # Шапка с кнопками закрепляется: иначе админ не найдёт, от чего
+        # отказываться.
+        await _pin_topic_action(bot_obj, bot_id, group_chat_id, thread_id, sent)
 
         await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> разбанен.")
 
@@ -2191,7 +2560,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         await bot_obj.send_message(
             chat_id=user_chat_id,
@@ -2203,107 +2575,19 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         )
         await message.answer("✅ Пользователю отправлено уведомление.")
 
-# ═══════════════ Callback: пользователь нажал «подобрать нового» ═══════════════
-
-    @child_dp.callback_query(F.data.startswith("picknew_"))
-    async def cb_pick_new(callback: CallbackQuery) -> None:
-        parts = cb_data(callback).split("_")
-        thread_id = int(parts[1])
-        group_chat_id = int(parts[2])
-
-        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-        if not topic:
-            await callback.answer("❌ Топик не найден")
-            return
-
-        reset_topic_admin(bot_id, thread_id, group_chat_id)
-        try:
-            await _notify_admin_change(bot_id, group_chat_id, thread_id)
-        except Exception as e:
-            logger.warning("Не удалось уведомить о смене админа: %s", e)
-
-        try:
-            await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
-            )
-        except Exception:
-            pass
-
-        await bot_obj.send_message(
-            chat_id=group_chat_id, message_thread_id=thread_id,
-            text="🔔 Пользователь запросил нового админа!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✋ Я беру",
-                                       callback_data=f"take_user_{thread_id}_{group_chat_id}")]
-            ])
-        )
-
-        try:
-            await bot_obj.send_message(
-                chat_id=topic["user_chat_id"],
-                text="👀 Запрос на нового администратора отправлен. Скоро с вами свяжутся.",
-            )
-        except Exception:
-            pass
-
-        await try_edit(callback.message, "✅ Запрос нового админа отправлен.")
-        await callback.answer()
-
-    # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
-    # ═══════════════ /smena — смена админа без подтверждения (для админа) ═══════════════
-
-    @child_dp.message(
-        Command("smena"),
-        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-        F.message_thread_id.as_("thread_id")
-    )
-    async def cmd_smena(message: Message, thread_id: int) -> None:
-        group_chat_id = message.chat.id
-        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-        if not topic:
-            return
-
-        user_chat_id = topic["user_chat_id"]
-        reset_topic_admin(bot_id, thread_id, group_chat_id)
-        try:
-            await _notify_admin_change(bot_id, group_chat_id, thread_id)
-        except Exception as e:
-            logger.warning("Не удалось уведомить о смене админа: %s", e)
-
-        # Уведомляем самого юзера, что его админа меняют
-        try:
-            await bot_obj.send_message(
-                chat_id=user_chat_id,
-                text="🔄 Вашего администратора меняют. С вами скоро свяжется новый админ."
-            )
-        except Exception:
-            pass
-
-        try:
-            await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id, message_thread_id=thread_id, name="🔄 смена админа"
-            )
-        except Exception:
-            pass
-
-        await bot_obj.send_message(
-            chat_id=group_chat_id, message_thread_id=thread_id,
-            text="🔔 Пользователь запросил смену админа!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✋ Я беру",
-                                       callback_data=f"take_user_{thread_id}_{group_chat_id}")]
-            ])
-        )
-        await message.answer("✅ Запрос на смену админа отправлен.")
-
-
     # ═══════════════ Callback: "я беру" ═══════════════
 
-    @child_dp.callback_query(F.data.startswith("take_user_"))
+    @child_dp.callback_query(F.data.regexp(r"^take_user_-?\d+_-?\d+$"))
     async def cb_take_user(callback: CallbackQuery) -> None:
-        parts = cb_data(callback).split("_")
-        topic_id = int(parts[2])
-        group_chat_id = int(parts[3])
+        ids = parse_topic_ids(cb_data(callback), 2, 2)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id = ids
+
+        # Запись топика нужна для авто-приветствия: ПЗ отправляем именно ему.
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
 
         # Владелец чата — тот, кому принадлежит бот. После «передачи прав»
         # этим владельцем становится новый юзер, поэтому админа ищем именно у него.
@@ -2341,7 +2625,16 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         if admin:
             add_admin_message(bot_id, cb_uid(callback), "action")
 
-        # Только редактируем текст — НЕ удаляем инфу о юзере
+        # Заготовленное приветствие админа уходит ПЗ автоматически. Это
+        # ДОПОЛНИТЕЛЬНОЕ сообщение: админ сможет сразу дописать своё обычным
+        # ответом в топике и не теряет контроль над разговором.
+        await _send_admin_greeting(
+            bot_obj, bot_id, int(topic.get("user_chat_id") or 0), cb_uid(callback),
+        )
+
+        # Только редактируем текст — НЕ удаляем инфу о юзере. Клавиатуру НЕ
+        # снимаем целиком: исчезает лишь «✋ Я беру», а «🚫 Отказ» остаётся —
+        # иначе админ, взявший обращение, не мог от него отказаться.
         try:
             if callback.message:
                 rm = getattr(callback.message, "reply_markup", None)
@@ -2349,9 +2642,13 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     original_text = getattr(callback.message, "html_text", None) \
                         or getattr(callback.message, "text", None) or ""
                     new_text = f"{original_text}\n\n✅ Взял: <b>#{tag}</b>"
-                    await try_edit(callback.message, new_text, reply_markup=None)
+                    await try_edit(callback.message, new_text,
+                                    reply_markup=_topic_refuse_only_kb(topic_id, group_chat_id))
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
         # Если это была смена админа — уведомляем
         if result["is_change"]:
@@ -2362,17 +2659,155 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     text=f"🔄 Админ сменился на <b>#{tag}</b>"
                 )
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
 
         await callback.answer(f"Ты взял пользователя. Тег: #{tag}")
+# ═══════════════ Callback: «Отказ» от обращения ════════════════════
+
+    @child_dp.callback_query(F.data.regexp(r"^refuse_-?\d+_-?\d+$"))
+    async def cb_refuse(callback: CallbackQuery) -> None:
+        """Админ отказался от обращения — спрашиваем, как об этом узнать ПЗ.
+
+        Разница важна админу: «анонимно» — ПЗ ничего не узнает (выглядит как
+        обычная смена админа), «сообщить» — ПЗ получит уведомление об отказе.
+        В обоих случаях тема освобождается и нужен другой админ.
+
+        Фильтр — строго ``^refuse_<число>_<число>$``. Прежний
+        ``startswith("refuse_")`` перехватывал ещё и «refuse_q_…» / «refuse_cancel»,
+        потому что этот хендлер объявлен раньше остальных: кнопки «Анонимно»,
+        «Сообщить ПЗ» и «Отмена» попадали сюда и падали на int("q").
+        """
+        ids = parse_topic_ids(cb_data(callback), 1, 2)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id = ids
+
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
+        if not topic:
+            await callback.answer("❌ Обращение не найдено", show_alert=True)
+            return
+
+        # Отказаться может только тот, кто сейчас ведёт обращение.
+        current_admin = int(topic.get("admin_user_id") or 0)
+        if current_admin and current_admin != cb_uid(callback):
+            await callback.answer("❌ Это не твоё обращение", show_alert=True)
+            return
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🤫 Анонимно",
+                callback_data=f"refuse_q_{topic_id}_{group_chat_id}_0",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text="📣 Сообщить ПЗ",
+                callback_data=f"refuse_q_{topic_id}_{group_chat_id}_1",
+                style="danger",
+            ),
+        ], [
+            InlineKeyboardButton(text="⬅️ Отмена",
+                                  callback_data="refuse_cancel",
+                                  style="primary"),
+        ]])
+        await render_callback(
+            callback,
+            "🚫 <b>Отказаться от обращения?</b>\n\n"
+            "Как сообщить об этом пользователю?\n\n"
+            "🤫 <b>Анонимно</b> — пользователь ничего не узнает, увидит "
+            "только обычную смену админа.\n"
+            "📣 <b>Сообщить ПЗ</b> — пользователь получит уведомление, "
+            "что админ отказался и ему ищут нового.",
+            kb,
+        )
+
+    @child_dp.callback_query(F.data.regexp(r"^refuse_q_-?\d+_-?\d+_[01]$"))
+    async def cb_refuse_confirm(callback: CallbackQuery) -> None:
+        """Админ выбрал, уведомлять ли ПЗ об отказе."""
+        ids = parse_topic_ids(cb_data(callback), 2, 3)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id, notify_flag = ids
+        notify_pz = notify_flag == 1
+
+        topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
+        if not topic:
+            await callback.answer("❌ Обращение не найдено", show_alert=True)
+            return
+
+        user_chat_id = int(topic["user_chat_id"])
+        reset_topic_admin(bot_id, topic_id, group_chat_id)
+        # Последним писал ПЗ, а не админ: иначе напоминалка сочла бы тему
+        # отвеченной и не напомнила бы про неё новому админу.
+        touch_topic_activity(bot_id, topic_id, group_chat_id, "in")
+        add_admin_message(bot_id, cb_uid(callback), "action")
+
+        # Тема освобождена в обоих случаях — на неё нужен другой админ.
+        await _rename_topic(bot_obj, group_chat_id, topic_id, "🔄 смена админа")
+
+        if notify_pz:
+            try:
+                await bot_obj.send_message(
+                    chat_id=user_chat_id,
+                    text=(
+                        "😔 К сожалению, ваш админ отказался вести это "
+                        "обращение.\n\nМы уже ищем другого администратора — "
+                        "он скоро свяжется с вами."
+                    ),
+                )
+            except Exception:
+                logger.debug("Не удалось уведомить ПЗ об отказе", exc_info=True)
+        # При анонимном отказе ПЗ не получает НИЧЕГО — видит только обычную
+        # смену админа.
+
+        try:
+            sent = await bot_obj.send_message(
+                chat_id=group_chat_id,
+                message_thread_id=topic_id,
+                text=(
+                    "🚫 <b>Админ отказался от обращения</b>\n\n"
+                    + ("Пользователь уведомлён об отказе."
+                       if notify_pz else
+                       "Пользователь не уведомлён (анонимный отказ).")
+                    + "\nНужен другой админ."
+                ),
+                reply_markup=_topic_action_kb(topic_id, group_chat_id),
+            )
+        except Exception:
+            logger.debug("Не удалось отправить отметку об отказе", exc_info=True)
+        else:
+            # Шапка с кнопками встаёт в закреп вместо старой: иначе админ
+            # искал бы «Я беру» в переписке ПЗ, которая уже уехала вверх.
+            await _pin_topic_action(bot_obj, bot_id, group_chat_id, topic_id, sent)
+
+        await callback.answer("Отказ оформлен", show_alert=True)
+        await try_edit_answer(
+            callback.message,
+            "🚫 Отказ оформлен, обращение освобождено.",
+        )
+
+    @child_dp.callback_query(F.data == "refuse_cancel")
+    async def cb_refuse_cancel(callback: CallbackQuery) -> None:
+        await callback.answer("Отменено")
+        await try_edit_answer(callback.message, "👌 Отказ отменён.")
+
 
     # ═══════════════ Callback: "найти админа" ═══════════════
 
-    @child_dp.callback_query(F.data.startswith("find_admin_"))
+    @child_dp.callback_query(F.data.regexp(r"^find_admin_-?\d+_-?\d+$"))
     async def cb_find_admin(callback: CallbackQuery) -> None:
-        parts = cb_data(callback).split("_")
-        topic_id = int(parts[2])
-        group_chat_id = int(parts[3])
+        ids = parse_topic_ids(cb_data(callback), 2, 2)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id = ids
 
         reset_topic_admin(bot_id, topic_id, group_chat_id)
 
@@ -2381,62 +2816,58 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 chat_id=group_chat_id, message_thread_id=topic_id, name="⏳ без админа"
             )
         except Exception:
-            pass
+            logger.debug(
+                "Исключение проглочено",
+                exc_info=True,
+            )
 
-        await bot_obj.send_message(
+        sent = await bot_obj.send_message(
             chat_id=group_chat_id, message_thread_id=topic_id,
             text="🔔 Пользователь запросил нового админа!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✋ Я беру",
-                                       callback_data=f"take_user_{topic_id}_{group_chat_id}")]
-            ])
+            reply_markup=_topic_action_kb(topic_id, group_chat_id),
         )
+        await _pin_topic_action(bot_obj, bot_id, group_chat_id, topic_id, sent)
 
         await try_edit(callback.message, "✅ Запрос отправлен.")
         await callback.answer()
 
     # ═══════════════ Callback: подтверждение смены ═══════════════
 
-    @child_dp.callback_query(F.data.startswith("confirm_change_"))
+    @child_dp.callback_query(F.data.regexp(r"^confirm_change_(yes|no)_-?\d+_-?\d+$"))
     async def cb_confirm_change(callback: CallbackQuery) -> None:
         parts = cb_data(callback).split("_")
         answer = parts[2]
-        topic_id = int(parts[3])
-        group_chat_id = int(parts[4])
+        ids = parse_topic_ids(cb_data(callback), 3, 2)
+        if ids is None:
+            await callback.answer("⚠️ Кнопка устарела — обновите сообщение",
+                                  show_alert=True)
+            return
+        topic_id, group_chat_id = ids
         topic = get_topic_by_topic_id(bot_id, group_chat_id, topic_id)
 
         if answer == "yes":
             # Лимит смен в сутки: считаем здесь же, чтобы не пустить сверх лимита.
-            if topic is not None:
-                if admin_changes_left(bot_id, topic["user_chat_id"]) == 0:
-                    await try_edit(callback.message,
-                                   "⏳ Смен на сегодня не осталось — попробуй завтра.")
-                    await callback.answer("Лимит смен исчерпан", show_alert=True)
-                    return
-                log_admin_change(bot_id, topic["user_chat_id"])
+            if topic is None:
+                await try_edit(callback.message, "❓ Обращение не найдено")
+                await callback.answer("Обращение не найдено", show_alert=True)
+                return
 
-            reset_topic_admin(bot_id, topic_id, group_chat_id)
-            try:
-                await _notify_admin_change(bot_id, group_chat_id, topic_id)
-            except Exception as e:
-                logger.warning("Не удалось уведомить о смене админа: %s", e)
-
-            try:
-                await bot_obj.edit_forum_topic(
-                    chat_id=group_chat_id, message_thread_id=topic_id, name="🔄 смена админа"
+            if admin_changes_left(bot_id, topic["user_chat_id"]) == 0:
+                await try_edit(
+                    callback.message,
+                    "⏳ Смен на сегодня не осталось — попробуй завтра.",
                 )
-            except Exception:
-                pass
+                await callback.answer("Лимит смен исчерпан", show_alert=True)
+                return
 
-            await bot_obj.send_message(
-                chat_id=group_chat_id, message_thread_id=topic_id,
-                text="🔔 Пользователь запросил смену админа!",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="✋ Я беру",
-                                           callback_data=f"take_user_{topic_id}_{group_chat_id}")]
-                ])
+            log_admin_change(bot_id, topic["user_chat_id"])
+
+            # Общий сценарий смены: сбросить админа, предупредить ПЗ,
+            # переименовать топик и повесить кнопки «Я беру» / «Отказ».
+            await _release_and_announce(
+                bot_obj, bot_id, topic_id, group_chat_id,
+                int(topic["user_chat_id"]),
             )
-
             await try_edit(callback.message, "✅ Запрос на смену админа отправлен.")
         else:
             await try_edit(callback.message, "👌 Оставляем текущего админа.")
@@ -2464,6 +2895,33 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         await try_edit_answer(callback.message,
                               f"✅ <b>Категория: #{_html_escape(name)}</b>")
 
+    # ═══════════════ /smena в личке (было reply-кнопкой) ═════════════════
+
+    @child_dp.message(Command("smena"), F.chat.type == ChatType.PRIVATE)
+    async def cmd_smena_private(message: Message) -> None:
+        """Пользователь в личке попросил сменить админа.
+
+        Раньше это была reply-кнопка под полем ввода, и её регулярно отправляли
+        случайно — вместе с текстом обращения. Теперь действие нужно выбрать
+        руками из меню команд бота.
+
+        Команда работает ровно как текст «сменить админа»: показывает остаток
+        смен на сегодня и просит подтверждение. Раньше она сбрасывала админа
+        сразу — без подтверждения, без проверки суточного лимита и без записи
+        в журнал смен, из-за чего лимит можно было обходить бесконечно.
+        """
+        user_chat_id = msg_uid(message)
+        topic = get_topic_by_user(bot_id, user_chat_id)
+        if not topic:
+            await message.answer(
+                "🔄 <b>Сменить админа пока нельзя</b>\n\n"
+                "У тебя ещё нет обращения в работе. Как только напишешь — "
+                "появится кнопка, чтобы поменять админа.",
+            )
+            return
+
+        await _ask_change_admin(bot_obj, bot_id, user_chat_id, topic)
+
     # ═══════════════ Сообщения из ЛС → топик ═══════════════
 
     @child_dp.message(F.chat.type == ChatType.PRIVATE)
@@ -2483,7 +2941,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             try:
                 await message.answer("🔇 Вы временно ограничены в отправке сообщений. Попробуйте позже.")
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
             return
 
         add_stat(bot_id, "message_in")
@@ -2507,36 +2968,18 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 _work_hours_replied[_key] = time.time()
                 await _send_work_hours_reply(bot_obj, _work_owner, user_chat_id)
 
-        # Обработка "сменить админа"
+        # Обработка «сменить админа» — тот же вход, что и у команды /smena.
         if message.text and message.text.strip().lower() == "сменить админа":
             topic = get_topic_by_user(bot_id, user_chat_id)
-            if not topic or not topic["admin_user_id"]:
-                await message.answer("У вас сейчас нет назначенного админа.")
-                return
-
-            # Показываем, сколько смен у юзера осталось (если лимит включён).
-            left = admin_changes_left(bot_id, user_chat_id)
-            if left == 0:
+            if not topic:
                 await message.answer(
-                    "⏳ <b>Смен на сегодня не осталось.</b>\n\n"
-                    "Лимит смен админа в сутки уже исчерпан. Завтра он "
-                    "обновится — или просто подожди ответа текущего админа.",
+                    "🔄 <b>Сменить админа пока нельзя</b>\n\n"
+                    "У тебя ещё нет обращения в работе. Как только напишешь — "
+                    "появится кнопка, чтобы поменять админа.",
                 )
                 return
 
-            left_line = (f"\n\n🔄 Осталось смен сегодня: <b>{left}</b>."
-                         if left > 0 else "")
-            await message.answer(
-                f"❓ Вы уверены, что хотите сменить админа?{left_line}",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="✅ Да",
-                                              callback_data=f"confirm_change_yes_{topic['topic_id']}_{topic['group_chat_id']}"),
-                        InlineKeyboardButton(text="❌ Нет",
-                                              callback_data=f"confirm_change_no_{topic['topic_id']}_{topic['group_chat_id']}"),
-                    ]
-                ])
-            )
+            await _ask_change_admin(bot_obj, bot_id, user_chat_id, topic)
             return
 
         # Настройки антиспама
@@ -2578,7 +3021,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                         try:
                             await message.answer("🚫 Вас заблокировали в данном боте навсегда. Всего доброго.")
                         except Exception:
-                            pass
+                            logger.debug(
+                                "Исключение проглочено",
+                                exc_info=True,
+                            )
 
                         # Находим топик и закрываем его с плашкой "бан спам"
                         topic = get_topic_by_user(bot_id, user_chat_id)
@@ -2595,7 +3041,10 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                                     chat_id=g_id, message_thread_id=t_id
                                 )
                             except Exception:
-                                pass
+                                logger.debug(
+                                    "Исключение проглочено",
+                                    exc_info=True,
+                                )
                         return
             else:
                 # Если отправлен текст — сбрасываем контигуальный счетчик стикеров
@@ -2718,19 +3167,22 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 header_text += f"\n\n🔎 <b>{promo_hint}</b>"
 
             try:
-                await _send_with_gate(
+                header = await _send_with_gate(
                     bot_obj, group_chat_id,
                     lambda: bot_obj.send_message(
                         chat_id=group_chat_id, message_thread_id=new_topic_id,
                         text=header_text,
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text="✋ Я беру",
-                                                   callback_data=f"take_user_{new_topic_id}_{group_chat_id}")]
-                        ]),
+                        reply_markup=_topic_action_kb(new_topic_id, group_chat_id),
                     ),
                 )
             except Exception as e:
                 logger.warning("Не удалось отправить заголовок топика: %s", e)
+            else:
+                # Шапку нового ПЗ закрепляем сразу: в ней инфа об обращении и
+                # кнопки «✋ Я беру» / «🚫 Отказ». Дальше она уедет вверх под
+                # перепиской, и админ не найдёт, от чего отказываться.
+                await _pin_topic_action(bot_obj, bot_id, group_chat_id,
+                                        new_topic_id, header)
 
             sent, _ = await _send_to_topic_retry(message, bot_obj, group_chat_id, new_topic_id)
             if sent:
@@ -2789,6 +3241,9 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                 if message.text:
                     save_log_message(bot_id, user_chat_id, "in", message.text,
                                      msg_username(message) or "")
+                # ПЗ написал — значит ответ админа снова ждут: помечаем
+                # активность топика, чтобы напоминалка отсчитывала срок заново.
+                touch_topic_activity(bot_id, topic_id, group_chat_id, "in")
             elif thread_not_found:
                 # Топик реально удалён/устарел — пересоздаём ровно один раз
                 # под тем же локом, чтобы не наплодить дубликатов при спаме.
@@ -2807,6 +3262,53 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
                     topic_id, user_chat_id,
                 )
 
+    # ═══════════════ Закрытие/открытие топика ═══════════════
+    #
+    # Эти обработчики стоят ПЕРЕД group_topic_message не просто по порядку:
+    # сервисные сообщения Telegram (forum_topic_closed и т.п.) приходят в том
+    # же топике, с message_thread_id и БЕЗ from_user. Старый обработчик их не
+    # отфильтровывал, поэтому служебное «Топик закрыт» уходило в ПЗ пользователю
+    # как обычное сообщение. Здесь они обрабатываются по назначению, а
+    # group_topic_message ниже добавлен защитной проверкой на from_user.
+
+    @child_dp.message(
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.message_thread_id.as_("thread_id"),
+        F.forum_topic_closed,
+    )
+    async def topic_closed(message: Message, thread_id: int) -> None:
+        """Топик закрыт или удалён — убираем его из напоминалки.
+
+        Жалоба: «топик удалили, ПЗ не пишет, новый не создаётся — а бот
+        продолжает присылать "ПЗ без админа" по нему вечно».
+
+        Проверить существование топика через Bot API нельзя (метода
+        getForumTopic нет), поэтому единственный автоматический сигнал — это
+        сервисное сообщение. Запись ПЗ при этом НЕ удаляется: топик просто
+        помечается закрытым, и если админ откроет его снова, метка снимется
+        (см. topic_reopened) и напоминания возобновятся.
+        """
+        changed = set_topic_closed(bot_id, thread_id, message.chat.id, True)
+        if changed:
+            logger.info(
+                "Бот %s: топик %s закрыт/удалён — исключён из напоминалки",
+                bot_id, thread_id,
+            )
+
+    @child_dp.message(
+        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+        F.message_thread_id.as_("thread_id"),
+        F.forum_topic_reopened,
+    )
+    async def topic_reopened(message: Message, thread_id: int) -> None:
+        """Топик открыли снова — снимаем метку, напоминания возвращаются."""
+        changed = set_topic_closed(bot_id, thread_id, message.chat.id, False)
+        if changed:
+            logger.info(
+                "Бот %s: топик %s снова открыт — напоминалка возобновлена",
+                bot_id, thread_id,
+            )
+
     # ═══════════════ Сообщения из топика → юзеру ═══════════════
 
     @child_dp.message(
@@ -2814,6 +3316,11 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         F.message_thread_id.as_("thread_id")
     )
     async def group_topic_message(message: Message, thread_id: int) -> None:
+        # Служебные сообщения форума (закрытие/открытие/переименование топика)
+        # не являются репликой админа: у них нет from_user, и пересылать их
+        # пользователю бессмысленно. Разбираются выше отдельными хендлерами.
+        if message.from_user is None:
+            return
         if message.from_user and message.from_user.is_bot:
             return
 
@@ -2847,6 +3354,21 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             # Ответ админа тоже в логи: техподдержке видно всю переписку.
             if message.text:
                 save_log_message(bot_id, user_chat_id, "out", message.text)
+        else:
+            # Ответ админа БЫЛ, даже если сообщение не дошло до ПЗ (у него
+            # нерабочее время, он заблокировал бота, Telegram моргнул и т.п.).
+            # Раньше в этом случае запись не появлялась, и напоминалка
+            # приходила с «ПЗ без ответа!» на ПЗ, которому админ ответил.
+            # Поэтому отмечаем активность топика независимо от доставки.
+            logger.info(
+                "Бот %s: ответ админа в топик %s не доставлен ПЗ (%s), "
+                "но засчитан как ответ",
+                bot_id, thread_id, user_chat_id,
+            )
+
+        # Отметка активности топика: последним написал АДМИН, значит ПЗ
+        # отвечено и напоминалка «без ответа» по нему больше не придёт.
+        touch_topic_activity(bot_id, thread_id, group_chat_id, "out")
 
     # ═══════════════ Игнорируем general ═══════════════
 
@@ -2928,6 +3450,12 @@ class ChildManager:
             me = await child_bot.get_me()
             logger.info("Подключаю бот: @%s (%s)", me.username, me.id)
 
+            # Меню команд бота (/start, /smena). /smena — для ПЗ в личке:
+            # раньше «сменить админа» была reply-кнопкой под полем ввода, и её
+            # случайно отправляли вместо текста ПЗ — теперь действие нужно
+            # выбрать руками.
+            await _set_bot_commands(child_bot)
+
             child_dp = _make_child_dp(fresh, child_bot)
 
             # Проверяем, не используется ли токен посторонним сервером: если у
@@ -2979,6 +3507,11 @@ class ChildManager:
             self._tasks[bot_id] = task
             self._bots[bot_id] = child_bot
             self._dispatchers[bot_id] = child_dp
+            # Регистрируем бота в очереди доставки: сообщения, адресованные
+            # ему, не должны «висеть без дела», пока бот не поднят. При
+            # остановке (ниже) регистрация снимается, и очередь снова ждёт
+            # своего часа — так сообщения переживают перезапуск бота.
+            get_outbox().register_bot(bot_id, child_bot)
 
             # Успешный запуск: сбрасываем счётчик перезапусков и флаг остановки.
             self._restart_attempts[bot_id] = 0
@@ -2988,7 +3521,10 @@ class ChildManager:
             try:
                 clear_bot_dead(bot_id)
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
 
             logger.info("Бот @%s запущен", me.username)
             return True
@@ -3000,7 +3536,10 @@ class ChildManager:
             try:
                 mark_bot_dead(bot_id, "unauthorized")
             except Exception:
-                pass
+                logger.debug(
+                    "Исключение проглочено",
+                    exc_info=True,
+                )
             return False
         except Exception as e:
             logger.error("Не удалось запустить бот %s: %s", bot_id, e)
@@ -3028,7 +3567,7 @@ class ChildManager:
                     if bot_id not in _token_used_warned:
                         _token_used_warned.add(bot_id)
                         try:
-                            asyncio.create_task(notify_owner(
+                            fire_and_forget(notify_owner(
                                 bot_id,
                                 "⚠️ <b>Токен бота занят другим процессом</b>\n\n"
                                 "У этого бота второй экземпляр получает сообщения "
@@ -3037,9 +3576,12 @@ class ChildManager:
                                 "могут приходить не от нашей панели.\n\n"
                                 "Останови второго «слушателя» — и бот сам заработает "
                                 "нормально (перезапускать вручную не нужно).",
-                            ))
+                            ), name=f"notify_token_busy_{bot_id}")
                         except RuntimeError:
-                            pass
+                            logger.debug(
+                                "Исключение проглочено",
+                                exc_info=True,
+                            )
                 else:
                     logger.error(
                         "Дочерний бот %s аварийно завершился: %s\n%s",
@@ -3047,7 +3589,8 @@ class ChildManager:
                     )
                 # Планируем автоперезапуск (не из колбэка — это sync).
                 try:
-                    asyncio.create_task(self._restart_bot_later(bot_id))
+                    fire_and_forget(self._restart_bot_later(bot_id),
+                                    name=f"restart_bot_{bot_id}")
                 except RuntimeError:
                     logger.error("Не удалось запланировать перезапуск бота %s", bot_id)
         return _on_done
@@ -3093,6 +3636,10 @@ class ChildManager:
         task = self._tasks.pop(bot_id)
         dp = self._dispatchers.pop(bot_id, None)
         bot = self._bots.pop(bot_id, None)
+        # Бот выключается — снимаем регистрацию, чтобы воркер не слал в него
+        # сообщения и не получал ошибки. В очереди они останутся и уйдут, когда
+        # бот снова поднимется.
+        get_outbox().unregister_bot(bot_id)
 
         if dp:
             await dp.stop_polling()
