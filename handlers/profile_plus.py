@@ -44,20 +44,23 @@ from aiogram.types import (
 from handlers._common import (
     cb_data,
     cb_uid,
-    html_escape,
     render_callback,
 )
+from handlers.person_card import person_card_text, person_name
 from services.config import is_super_admin
 from services.storage import (
     bot_display_name,
     get_all_bots_flat,
     get_all_users_registry,
     get_bound_chat,
+    get_user_banned_bots,
     get_user_bots,
     get_user_registry,
+    get_yid,
     remove_user_bot,
     set_bound_chat,
     set_registry_user_blocked,
+    unban_user_everywhere,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,10 +110,12 @@ def _pager(prefix: str, page: int, total: int,
 
 
 def _user_name(user_id: int, row: dict | None = None) -> str:
-    """Как подписать человека: юзернейм, иначе имя, иначе ID."""
-    row = row or get_user_registry(user_id) or {}
-    name = row.get("username") or row.get("first_name") or ""
-    return f"@{html_escape(str(name))}" if name else f"ID:{user_id}"
+    """Как подписать человека: юзернейм, иначе имя, иначе ID.
+
+    Обёртка над ``person_name``: подпись человека теперь одна на весь проект,
+    иначе один и тот же человек в списке и в карточке выглядел по-разному.
+    """
+    return person_name(user_id, row)
 
 
 def _bots_line(bots: list[dict], with_state: bool = False) -> str:
@@ -231,12 +236,16 @@ def _users_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
     for u in window:
         uid = int(u["user_id"])
         banned = "🚫 " if u.get("blocked") else ""
+        # YID показываем прямо в списке: по нему человека зовут вслух
+        # («Y104, посмотри ПЗ»), и искать его потом поштучно неудобно.
+        yid = get_yid(uid)
         text.append(
-            f"\n{banned}<b>{_user_name(uid, u)}</b> <code>{uid}</code>"
+            f"\n{banned}<b>{person_name(uid, u)}</b> <code>{uid}</code>"
+            f"{f' · Y{yid}' if yid else ''}"
             f"\n   🤖 ботов: <b>{len(get_user_bots(uid))}</b>"
         )
         rows.append([InlineKeyboardButton(
-            text=f"{banned}{_user_name(uid, u)}"[:40],
+            text=f"{banned}{person_name(uid, u)}"[:40],
             callback_data=f"prfplus_user_{uid}",
             style="primary")])
     rows.extend(_pager("prfplus_users_p", page, total, BACK_TO_LIST))
@@ -256,17 +265,47 @@ async def cb_prfplus_users(callback: CallbackQuery) -> None:
 
 
 def _person_text(uid: int) -> str:
-    """Карточка человека: ID, дата, бан, боты."""
+    """Карточка человека из списка ВЛД.
+
+    Тело карточки живёт в ``handlers.person_card`` и общее для всех
+    экранов: раньше «карточка из ВЛД» и «карточка по боту» были двумя
+    разными функциями, поэтому поиск по людям показывал меньше данных,
+    чем поиск по ботам (жалоба владельца).
+    """
+    return person_card_text(uid)
+
+
+def _person_kb(uid: int) -> InlineKeyboardMarkup:
+    """Кнопки карточки человека.
+
+    Отдельная функция, а не сборка прямо в хендлере: набор кнопок нужен в
+    двух местах (открытие карточки и разбан после него), и при копировании
+    они разъехались бы — как уже разъехались тексты карточек.
+    """
     row = get_user_registry(uid) or {}
     bots = get_user_bots(uid)
-    return (
-        f"👤 <b>{_user_name(uid, row)}</b>\n\n"
-        f"🆔 ID: <code>{uid}</code>\n"
-        f"📛 Имя: {html_escape(str(row.get('first_name') or '—'))}\n"
-        f"📅 В системе с: {str(row.get('created_at') or '—')[:19]}\n"
-        f"📌 Забанен: {'да' if row.get('blocked') else 'нет'}\n\n"
-        f"🤖 <b>Ботов: {len(bots)}</b>\n{_bots_line(bots)}"
-    )
+    rows: list[list[InlineKeyboardButton]] = []
+    # Разбан администрации — только если человек действительно забанен:
+    # кнопка «разбанить» у живого человека вводит в заблуждение.
+    if row.get("blocked"):
+        rows.append([InlineKeyboardButton(text="✅ Разбанить",
+                                          callback_data=f"prfplus_unban_{uid}",
+                                          style="success")])
+    # Разбан в ПЗ (кто-то заблокировал бота) — это отдельный бан, хранится по
+    # ботам и в реестре не виден. Кнопка нужна и по жалобе владельца:
+    # «забанил бота, разбанил, а сообщения не доходят».
+    if get_user_banned_bots(uid):
+        rows.append([InlineKeyboardButton(
+            text="🔓 Снять бан в ПЗ",
+            callback_data=f"prfplus_pzunban_{uid}", style="success")])
+    if bots:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить всех ботов",
+                                          callback_data=f"prfplus_delbots_{uid}",
+                                          style="danger")])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку",
+                                      callback_data="prfplus_users",
+                                      style="primary")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.callback_query(F.data.regexp(r"^prfplus_user_(\d+)$"))
@@ -281,48 +320,46 @@ async def cb_prfplus_user(callback: CallbackQuery) -> None:
         await callback.answer("❌ Человек не найден", show_alert=True)
         return
 
-    bots = get_user_bots(uid)
-    rows: list[list[InlineKeyboardButton]] = []
-    # Разбан — только если человек действительно забанен: кнопка «разбанить»
-    # у живого человека вводит в заблуждение.
-    if row.get("blocked"):
-        rows.append([InlineKeyboardButton(text="✅ Разбанить",
-                                          callback_data=f"prfplus_unban_{uid}",
-                                          style="success")])
+    await render_callback(callback, _person_text(uid), _person_kb(uid))
+
+
+# ═══════════════ Разбан в ПЗ из карточки человека ═══════════════
+
+
+@router.callback_query(F.data.regexp(r"^prfplus_pzunban_(\d+)$"))
+async def cb_prfplus_pz_unban(callback: CallbackQuery) -> None:
+    """Снять бан в ПЗ у человека — из его карточки в админ-панели.
+
+    Бан в ПЗ (ПЗ заблокировал бота) хранится по ботам и в реестре не виден,
+    поэтому в карточке раньше нечего было снять — владельцу приходилось
+    искать человека в «Поиске» среди анкет. Теперь кнопка есть рядом с его
+    профилем, и работает так же: снимает бан во всех ботах разом.
+    """
+    if _deny(callback):
+        return
+
+    uid = int(cb_data(callback).rsplit("_", 1)[-1])
+    bots = unban_user_everywhere(uid)
     if bots:
-        rows.append([InlineKeyboardButton(text="🗑 Удалить всех ботов",
-                                          callback_data=f"prfplus_delbots_{uid}",
-                                          style="danger")])
-    rows.append([InlineKeyboardButton(text="⬅️ К списку",
-                                      callback_data="prfplus_users",
-                                      style="primary")])
-    await render_callback(callback, _person_text(uid),
-                          InlineKeyboardMarkup(inline_keyboard=rows))
+        where = ", ".join(f"#{b}" for b in bots)
+        await callback.answer(f"✅ Снят бан в ПЗ: боты {where}", show_alert=True)
+    else:
+        await callback.answer("ℹ️ Активных банов в ПЗ не найдено", show_alert=True)
+
+    await render_callback(callback, person_card_text(uid), _person_kb(uid))
 
 
 # ═══════════════ Полный профиль владельца бота ═══════════════
 
 
 def _owner_text(owner_id: int) -> str:
-    """Полный профиль владельца: привязки, боты, статус."""
-    row = get_user_registry(owner_id) or {}
-    bots = get_user_bots(owner_id)
-    work = get_bound_chat(owner_id, "work")
-    admin = get_bound_chat(owner_id, "admin")
+    """Полный профиль владельца бота.
 
-    def _chat(value: int | None) -> str:
-        return f"<code>{value}</code>" if value else "не привязан"
-
-    return (
-        f"👤 <b>Профиль {_user_name(owner_id, row)}</b>\n\n"
-        f"🆔 ID: <code>{owner_id}</code>\n"
-        f"📛 Имя: {html_escape(str(row.get('first_name') or '—'))}\n"
-        f"📅 В системе с: {str(row.get('created_at') or '—')[:19]}\n"
-        f"📌 Забанен: {'да' if row.get('blocked') else 'нет'}\n\n"
-        f"💼 Чат работы: {_chat(work)}\n"
-        f"🛡 Чат админов: {_chat(admin)}\n\n"
-        f"🤖 <b>Ботов: {len(bots)}</b>\n{_bots_line(bots, with_state=True)}"
-    )
+    Тот же рендер, что и в карточке из «👥 ВЛД»: обе точки входа ведут в
+    один экран. Иначе поиск по ботам и поиск по людям показывали разное
+    (жалоба владельца: «поиск по ВЛД показывает не всю инфу»).
+    """
+    return person_card_text(owner_id)
 
 
 def _owner_kb(owner_id: int) -> InlineKeyboardMarkup:

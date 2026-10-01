@@ -50,6 +50,7 @@ from handlers._common import (
     msg_firstname,
     msg_uid,
     msg_username,
+    quote_block,
     render_callback,
 )
 from services.constants import BOT_TYPE_ANKETA
@@ -63,21 +64,26 @@ from services.storage import (
     STATUS_DECLINED,
     STATUS_PENDING,
     add_offer,
-    bot_display_name,
     admin_profiles_feed,
-    bump_daily_sent,
+    admin_profiles_feed_count,
+    bot_display_name,
     bot_profiles_feed,
+    bot_profiles_feed_count,
+    bump_daily_sent,
     count_offers,
     count_offers_received,
     count_profile_views,
     get_admin_profile,
+    get_bot_by_id_any_owner,
     get_bot_profile,
     get_daily_sent,
     get_offer,
     get_user_banned_bots,
     get_user_bots,
     get_user_registry,
+    mark_offer_message_sent,
     mark_profile_viewed,
+    offer_message_left,
     offer_send_block,
     offers_inbox,
     set_admin_profile,
@@ -110,12 +116,16 @@ class SearchFSM(StatesGroup):
     bot_category = State()    # категория
     bot_gender = State()      # пол
     bot_text = State()        # текст владельца
+    admin_tag = State()       # «Ваш тег?» — первый вопрос анкеты админа
     admin_age = State()       # сколько лет
     admin_category = State()
     admin_pz = State()        # сколько ПЗ комфортно вести
     admin_tz = State()        # часовой пояс
     admin_hours = State()     # сколько времени уделять
     admin_text = State()
+
+    # Одно сообщение владельцу → принятому админу (см. ``cb_offer_message``).
+    offer_message = State()
 
 
 # ═══════════════ Карточка поиска ═══════════════
@@ -425,6 +435,12 @@ _SKIP_STEPS: dict = {
         _skip_kb(),
     ),
     # ── Анкета админа ──
+    SearchFSM.admin_tag: (
+        "🪪 <b>Анкета админа</b>\n\n"
+        "🎂 <b>Сколько вам лет?</b>\n\nНапиши число:",
+        SearchFSM.admin_age, "sa_tag",
+        _skip_kb(),
+    ),
     SearchFSM.admin_age: (
         "🪪 <b>Анкета админа</b>\n\n💬 <b>Какая у вас категория?</b>\n",
         SearchFSM.admin_category, "sa_age",
@@ -517,17 +533,118 @@ async def _save_bot_profile_by_callback(callback: CallbackQuery,
 
 
 # ═══════════════ Анкета админа ═══════════════
+# ═══════════════ Анкета админа ═══════════════
+
+
+def _known_tags(user_id: int) -> list[str]:
+    """Теги, под которыми человек уже известен в чужих ботах.
+
+    Источник — таблица ``admins``: там тег назначает владелец бота, когда
+    добавляет человека в админы. Часто он уже есть («Иван», «helper»), и
+    заставлять человека выдумывать второй раз тот же самый тег незачем —
+    поэтому показываем готовые кнопки.
+
+    Импорт ``_get_conn`` локальный: модуль уже работает с фасадом
+    ``services.storage``, а тут нужен прямой доступ к соединению.
+    """
+    from services.db.connection import _get_conn
+
+    try:
+        rows = _get_conn().execute(
+            "SELECT DISTINCT tag FROM admins "
+            "WHERE user_id = ? AND tag != '' ORDER BY tag",
+            (int(user_id),),
+        ).fetchall()
+    except Exception:
+        logger.debug("Не удалось прочитать теги админа", exc_info=True)
+        return []
+    return [str(r[0]).strip() for r in rows if str(r[0] or "").strip()][:8]
+
+
+def _tag_question(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст и кнопки вопроса «Ваш тег?»."""
+    hint_line = (
+        "\n\nТвои прежние теги в ботах — можно выбрать кнопкой ниже."
+        if _known_tags(user_id) else
+        "\n\nЭто то, как тебя увидят в «Просмотре профилей» — вместо юзернейма."
+    )
+    rows = [
+        [InlineKeyboardButton(text=_fit(f"🏷 {tag}", 30),
+                              callback_data=f"search_settag_{i}",
+                              style="primary")]
+        for i, tag in enumerate(_known_tags(user_id))
+    ]
+    rows.append([InlineKeyboardButton(text="⏭ Пропустить",
+                                      callback_data="search_step_skip",
+                                      style="primary")])
+    rows.append([InlineKeyboardButton(text="❌ Выйти",
+                                      callback_data="search_open",
+                                      style="primary")])
+    return (
+        "🪪 <b>Анкета админа</b>\n\n"
+        "🏷 <b>Ваш тег?</b>\n\n"
+        "Напиши, как тебя звать в анкете — например: <code>Иван</code> "
+        "или <code>хелпер</code>." + hint_line,
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
 
 @router.callback_query(F.data == "search_admin_profile")
 async def cb_admin_profile_start(callback: CallbackQuery,
                                  state: FSMContext) -> None:
-    """Начало анкеты админа: первый вопрос — сколько лет."""
+    """Начало анкеты админа: первый вопрос — «Ваш тег?».
+
+    Раньше первым спрашивался возраст, а карточка показывала ``@username``.
+    Владелец попросил наоборот: человек сам называет себя тегом, и именно
+    этот тег видно в «Просмотре профилей» — заодно не светятся юзернеймы
+    тех, кто не хочет их показывать.
+    """
+    await state.set_state(SearchFSM.admin_tag)
+    text, kb = _tag_question(cb_uid(callback))
+    await render_callback(callback, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^search_settag_(\d+)$"))
+async def cb_admin_set_tag(callback: CallbackQuery,
+                          state: FSMContext) -> None:
+    """Выбрал тег из подсказок — идём к следующему вопросу."""
+    user_id = cb_uid(callback)
+    tags = _known_tags(user_id)
+    index = int(cb_data(callback).rsplit("_", 1)[-1])
+    if index >= len(tags):
+        # Подсказки устарели (например, тег переименовали) — показываем вопрос
+        # заново и ВОЗВРАЩАЕМ состояние в admin_tag. Иначе человек увидел бы
+        # вопрос про тег, а его ответ ушёл бы в состояние предыдущего шага.
+        await callback.answer("⚠️ Тег больше неактуален, выбери заново",
+                              show_alert=True)
+        await state.set_state(SearchFSM.admin_tag)
+        text, kb = _tag_question(user_id)
+        await render_callback(callback, text, kb)
+        return
+
+    await state.update_data(sa_tag=tags[index])
     await state.set_state(SearchFSM.admin_age)
     await render_callback(
         callback,
         "🪪 <b>Анкета админа</b>\n\n"
         "🎂 <b>Сколько вам лет?</b>\n\nНапиши число:",
         _skip_kb(),
+    )
+
+
+@router.message(SearchFSM.admin_tag)
+async def fsm_admin_tag(message: Message, state: FSMContext) -> None:
+    """Тег админа: как его зовут в анкете."""
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("❌ Пустое значение. Напиши, как тебя звать.")
+        return
+    await state.update_data(sa_tag=value[:40])
+    await state.set_state(SearchFSM.admin_age)
+    await message.answer(
+        "🪪 <b>Анкета админа</b>\n\n"
+        "🎂 <b>Сколько вам лет?</b>\n\nНапиши число:",
+        reply_markup=_skip_kb(),
     )
 
 
@@ -628,6 +745,7 @@ async def _save_admin_profile(message: Message, state: FSMContext) -> None:
         timezone=str(data.get("sa_tz") or ""),
         hours=str(data.get("sa_hours") or ""),
         text=str(data.get("sa_text") or ""),
+        tag=str(data.get("sa_tag") or ""),
     )
     await state.clear()
     text, kb = search_payload(user_id)
@@ -669,6 +787,7 @@ async def _save_admin_profile_by_callback(callback: CallbackQuery,
         timezone=str(data.get("sa_tz") or ""),
         hours=str(data.get("sa_hours") or ""),
         text=str(data.get("sa_text") or ""),
+        tag=str(data.get("sa_tag") or ""),
     )
     await state.clear()
     text, kb = search_payload(user_id)
@@ -712,13 +831,30 @@ def _page_of(data: str, prefix: str) -> int:
 
 # ── Анкеты админов ─────────────────────────────────────────────────────────
 
+def _admin_label(row: dict) -> str:
+    """Как показывать админа: его тег, иначе юзернейм, иначе имя.
+
+    Владелец попросил: в карточках админ показывается под своим тегом из
+    анкеты («Ваш тег?»), а не под ``@username``. У людей, заполнивших анкету
+    до этого изменения, тега в базе нет — поэтому нужен запасной вариант,
+    иначе они стали бы безымянными «Админ».
+
+    Возвращает строку БЕЗ разметки: вызывающий сам решает, оборачивать ли
+    её в ``<b>``.
+    """
+    tag = str(row.get("tag") or "").strip()
+    if tag:
+        return f"#{tag}"
+    username = str(row.get("username") or "").strip()
+    if username:
+        return f"@{username}"
+    return str(row.get("first_name") or "").strip() or "Админ"
+
+
 def _admin_card(row: dict, page: int) -> str:
     """Карточка анкеты админа для ленты."""
-    who = f"@{html_escape(row['username'])}" if row.get("username") else (
-        html_escape(row.get("first_name") or "") or "Админ"
-    )
     parts = [
-        f"\n👤 <b>{who}</b>",
+        f"\n👤 <b>{html_escape(_admin_label(row))}</b>",
         f"🎂 возраст: {_dash(row.get('age'))}",
         f"💬 категория: {_dash(row.get('category'))}",
         f"📋 ПЗ: {_dash(row.get('pz_limit'))}",
@@ -727,13 +863,15 @@ def _admin_card(row: dict, page: int) -> str:
     ]
     text = row.get("text")
     if str(text or "").strip():
-        parts.append(f"\n✍️ {html_escape(str(text)[:500])}")
+        # Свёрнутая цитата: длинный текст больше не растягивает ленту и не
+        # мешает просматривать самих админов (см. quote_block).
+        parts.append(f"\n✍️ {quote_block(text)}")
     return "\n".join(parts)
 
 
 def _profiles_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
     """Лента анкет админов («👥 Просмотр профилей»)."""
-    rows = admin_profiles_feed(exclude_user_id=user_id, limit=FEED_PAGE * 3,
+    rows = admin_profiles_feed(exclude_user_id=user_id, limit=FEED_PAGE,
                                offset=(page - 1) * FEED_PAGE)
     window = rows[:FEED_PAGE]
     if not window:
@@ -744,7 +882,11 @@ def _profiles_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardM
             search_payload(user_id)[1],
         )
 
-    total = max(1, (len(rows) + FEED_PAGE - 1) // FEED_PAGE)
+    # Страницы считаем по реальному COUNT, а не по длине окна запроса:
+    # окно ограничено FEED_PAGE, поэтому раньше лента обрывалась на 15-м
+    # админе и дальше не листалась в принципе (см. admin_profiles_feed_count).
+    total = max(1, (admin_profiles_feed_count(exclude_user_id=user_id)
+                    + FEED_PAGE - 1) // FEED_PAGE)
     text = [f"👥 <b>Анкеты админов</b> (стр. {page}/{total})\n"]
     for row in window:
         text.append(_admin_card(row, page))
@@ -754,7 +896,7 @@ def _profiles_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardM
 
     kb_rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(
-            text=f"✉️ Пригласить {_fit(row.get('username') or row.get('first_name') or 'админа', 24)}",
+            text=f"✉️ Пригласить {_fit(_admin_label(row), 24)}",
             callback_data=f"search_invite_{row['user_id']}", style="success")]
         for row in window
     ]
@@ -765,7 +907,7 @@ def _profiles_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardM
         admin_id = int(row["user_id"])
         if get_user_banned_bots(admin_id):
             kb_rows.append([InlineKeyboardButton(
-                text=f"🚫 Разбанить {_fit(row.get('username') or 'админа', 24)}",
+                text=f"🚫 Разбанить {_fit(_admin_label(row), 24)}",
                 callback_data=f"search_unban_{admin_id}", style="danger")])
     kb_rows.extend(_page_rows("search_profiles_p", page, total))
     kb_rows.append([InlineKeyboardButton(text="⬅️ Поиск",
@@ -806,10 +948,29 @@ async def cb_search_profiles(callback: CallbackQuery, state: FSMContext) -> None
     await render_callback(callback, text, kb)
 # ── Карточки ботов ────────────────────────────────────────────────────────
 
+def _bot_title(row: dict) -> str:
+    """Имя бота для карточки: ``@username``, иначе название, иначе «бот<id>».
+
+    Раньше боты без ``username`` вообще не попадали в ленту (фильтр в SQL),
+    поэтому встретить «пустое» имя было нельзя. Теперь фильтра нет, и такой
+    бот показывается по ``first_name``, а если и его нет — как «бот<id>».
+
+    Своя функция вместо ``bot_display_name`` — потому что ключ id в разных
+    выборках называется по-разному (``id`` в таблице ботов, ``bot_id`` в
+    ленте), и передавать чужую строку с чужой схемой ключей здесь рискованно.
+    """
+    username = str(row.get("username") or "").strip()
+    if username:
+        return f"@{username}"
+    first_name = str(row.get("first_name") or "").strip()
+    if first_name:
+        return first_name
+    return f"бот{row.get('bot_id') or row.get('id') or ''}"
+
+
 def _bot_card(row: dict) -> str:
     """Карточка бота: анкета, если есть, иначе юзер + статистика."""
-    username = f"@{html_escape(row['username'])}"
-    parts = [f"\n🤖 <b>{username}</b>"]
+    parts = [f"\n🤖 <b>{html_escape(_bot_title(row))}</b>"]
     has_profile = bool(str(row.get("age_range") or "").strip()
                        or str(row.get("category") or "").strip()
                        or str(row.get("gender") or "").strip()
@@ -820,7 +981,9 @@ def _bot_card(row: dict) -> str:
         parts.append(f"🚻 пол: {_dash(row.get('gender'))}")
         text = row.get("text")
         if str(text or "").strip():
-            parts.append(f"\n✍️ {html_escape(str(text)[:500])}")
+            # Свёрнутая цитата: длинный текст больше не растягивает карточку
+            # и не мешает листать список ботов (см. quote_block).
+            parts.append(f"\n✍️ {quote_block(text)}")
     else:
         # Анкеты нет — показываем то, что есть, и говорим об этом прямо:
         # иначе человек решит, что бот «пустой» и его никто не зовёт.
@@ -832,7 +995,7 @@ def _bot_card(row: dict) -> str:
 
 def _bots_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
     """Лента ботов («🤖 Просмотр ботов»)."""
-    rows = bot_profiles_feed(exclude_owner_id=user_id, limit=FEED_PAGE * 3,
+    rows = bot_profiles_feed(exclude_owner_id=user_id, limit=FEED_PAGE,
                              offset=(page - 1) * FEED_PAGE)
     window = rows[:FEED_PAGE]
     if not window:
@@ -842,19 +1005,38 @@ def _bots_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMarku
             search_payload(user_id)[1],
         )
 
-    total = max(1, (len(rows) + FEED_PAGE - 1) // FEED_PAGE)
+    # Страницы — по реальному COUNT. Раньше считалось ceil(len(окно)/5) при
+    # limit=15, из-за чего лента обрывалась на 15-м боте и остальные боты
+    # площадки были недостижимы: уезжал на «Просмотр ботов» и не находил
+    # нужного бота (см. bot_profiles_feed_count).
+    total = max(1, (bot_profiles_feed_count(exclude_owner_id=user_id)
+                    + FEED_PAGE - 1) // FEED_PAGE)
     text = [f"🤖 <b>Боты</b> (стр. {page}/{total})\n"]
     for row in window:
         text.append(_bot_card(row))
         # Просмотр карточки бота засчитываем владельцу этого бота.
         mark_profile_viewed(user_id, "bot", int(row["bot_id"]))
 
-    kb_rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(
-            text=f"📨 Подать заявку @{html_escape(row['username'])[:20]}",
-            callback_data=f"search_apply_{row['bot_id']}", style="success")]
-        for row in window
-    ]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    # Заявку может подать только человек с заполненной анкетой админа. Без
+    # анкеты владелец получал бы заявку, в которой ничего нет (жалоба
+    # владельца), поэтому вместо кнопок заявки сразу предлагаем заполнить
+    # анкету — и кнопки появятся сами после этого.
+    if get_admin_profile(user_id) is None:
+        text.append(
+            "\n\nℹ️ <b>Чтобы подать заявку, нужна анкета админа.</b>\n"
+            "Заполни «🪪 Анкета админа» — и кнопки заявки появятся здесь."
+        )
+        kb_rows.append([InlineKeyboardButton(
+            text="🪪 Заполнить анкету админа",
+            callback_data="search_admin_profile", style="success")])
+    else:
+        kb_rows.extend(
+            [InlineKeyboardButton(
+                text=f"📨 Заявка {_fit(_bot_title(row), 24)}",
+                callback_data=f"search_apply_{row['bot_id']}", style="success")]
+            for row in window
+        )
     kb_rows.extend(_page_rows("search_bots_p", page, total))
     kb_rows.append([InlineKeyboardButton(text="⬅️ Поиск",
                                          callback_data="search_open",
@@ -890,8 +1072,7 @@ def _inbox_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMark
     text = [f"📬 <b>Отклики на твои анкеты</b> (стр. {page}/{total})\n"]
     kb_rows: list[list[InlineKeyboardButton]] = []
     for row in window:
-        who = f"@{html_escape(row.get('username') or '')}" if row.get("username") \
-            else html_escape(row.get("first_name") or "") or "Админ"
+        who = html_escape(_admin_label(row))
         bot_name = row.get("bot_username") or row.get("bot_first_name") or "бот"
         text.append(
             f"\n👤 <b>{who}</b> → 🤖 <b>{html_escape(str(bot_name))}</b>\n"
@@ -901,7 +1082,9 @@ def _inbox_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMark
         )
         note = row.get("text")
         if str(note or "").strip():
-            text.append(f"\n   ✍️ {html_escape(str(note)[:300])}")
+            # Свёрнутая цитата: текст админа не растягивает список откликов,
+            # поэтому по нему можно быстро прочитать самих админов (см. quote_block).
+            text.append(f"\n   ✍️ {quote_block(note, 300)}")
         kb_rows.append([
             InlineKeyboardButton(text="✅ Одобрить",
                                  callback_data=f"search_accept_{row['id']}",
@@ -971,9 +1154,13 @@ def _invites_payload(user_id: int, page: int = 1) -> tuple[str, InlineKeyboardMa
             f"\n🤖 <b>@{html_escape(str(bot_name))}</b>"
             + (f"\n   👤 от @{html_escape(str(who))}" if who else "")
         )
-        note = row.get("text")
+        note = row.get("bot_text") or row.get("text")
         if str(note or "").strip():
-            text.append(f"\n   ✍️ {html_escape(str(note)[:200])}")
+            # Свёрнутая цитата — длинное условие не растягивает список
+            # приглашений (см. quote_block). Берём текст АНКЕТЫ БОТА: именно
+            # он обещан админу («Этот текст увидят админы, когда ты их
+            # пригласишь»), а не анкета отправителя.
+            text.append(f"\n   ✍️ {quote_block(note, 200)}")
         offer_id = int(row["id"])
         kb_rows.append([
             InlineKeyboardButton(text="✅ Принять",
@@ -1017,7 +1204,7 @@ def _bot_profile_text(profile: dict | None, bot_name: str) -> str:
     lines.append(f"🚻 пол: {_dash(profile.get('gender'))}")
     note = profile.get("text")
     if str(note or "").strip():
-        lines.append(f"\n✍️ {html_escape(str(note)[:800])}")
+        lines.append(f"\n✍️ {quote_block(note, 800)}")
     return "\n".join(lines)
 
 
@@ -1033,7 +1220,7 @@ def _admin_profile_text(profile: dict | None, who: str) -> str:
     lines.append(f"⏳ время: {_dash(profile.get('hours'))}")
     note = profile.get("text")
     if str(note or "").strip():
-        lines.append(f"\n✍️ {html_escape(str(note)[:800])}")
+        lines.append(f"\n✍️ {quote_block(note, 800)}")
     return "\n".join(lines)
 
 
@@ -1133,19 +1320,46 @@ async def cb_search_invite(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.regexp(r"^search_apply_\d+$"))
-async def cb_search_apply(callback: CallbackQuery) -> None:
+async def cb_search_apply(callback: CallbackQuery, state: FSMContext) -> None:
     """«📨 Подать заявку» — владельцу бота уходит анкета админа."""
     bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
     user_id = cb_uid(callback)
 
-    row = next((r for r in bot_profiles_feed(exclude_owner_id=user_id)
-                if int(r["bot_id"]) == bot_id), None)
-    if row is None:
-        await callback.answer("Бот не найден", show_alert=True)
+    # Анкета админа обязательна. Без неё владелец получал заявку, в которой
+    # нет ни возраста, ни категории, ни ПЗ — то есть ровно ничего (жалоба
+    # владельца). Поэтому проверяем ДО создания заявки: и кнопку заявки, и
+    # лимит не тратим впустую.
+    profile = get_admin_profile(user_id)
+    if profile is None:
+        await callback.answer(
+            "🪪 Сначала заполни анкету админа — она уходит владельцу бота.",
+            show_alert=True,
+        )
+        await state.set_state(SearchFSM.admin_tag)
+        text, kb = _tag_question(user_id)
+        await render_callback(
+            callback,
+            "🪪 <b>Анкета админа</b>\n\n"
+            "⚠️ Подать заявку без анкеты нельзя: владелец не увидит, кто "
+            "ему пишет. Заполни анкету — это пять коротких вопросов.\n\n" + text,
+            kb,
+        )
         return
-    owner_id = int(row["owner_id"])
+
+    # Бота ищем НАПРЯМУЮ в базе, а не перебором ленты. Лента ограничена
+    # LIMIT'ом и могла «не найти» бота, который виден в кнопке: человек
+    # нажимал «Подать заявку» и получал «Бот не найден» (жалоба владельца).
+    bot_row = get_bot_by_id_any_owner(bot_id)
+    if bot_row is None:
+        await callback.answer("⚠️ Бот не найден — возможно, он удалён.",
+                              show_alert=True)
+        return
+    owner_id = int(bot_row.get("owner_id") or 0)
     if owner_id == user_id:
         await callback.answer("Это твой бот", show_alert=True)
+        return
+    if not owner_id:
+        await callback.answer("⚠️ У бота не записан владелец", show_alert=True)
         return
 
     sent_today = get_daily_sent(user_id)
@@ -1163,9 +1377,11 @@ async def cb_search_apply(callback: CallbackQuery) -> None:
         await callback.answer(blocked, show_alert=True)
         return
 
-    profile = get_admin_profile(user_id)
-    who = (profile or {}).get("username") or "Админ"
+    who = _admin_label(profile)
     offer_id = add_offer(OFFER_ADMIN_TO_BOT, user_id, owner_id, bot_id)
+    if not offer_id:
+        await callback.answer("⚠️ Не удалось создать заявку", show_alert=True)
+        return
 
     # Кнопки решения шлём СРАЗУ в уведомлении: владельцу не нужно искать
     # заявку в «Откликах», он решает прямо здесь.
@@ -1183,7 +1399,7 @@ async def cb_search_apply(callback: CallbackQuery) -> None:
     ok = await _send_private(
         callback.bot, owner_id,
         f"📩 <b>Новая заявка на вступление</b>\n\n"
-        f"🤖 Бот: <b>@{html_escape(str(row['username']))}</b>\n\n"
+        f"🤖 Бот: <b>{html_escape(_bot_title(bot_row))}</b>\n\n"
         + _admin_profile_text(profile, str(who)),
         kb,
     )
@@ -1203,9 +1419,11 @@ async def cb_search_apply(callback: CallbackQuery) -> None:
 async def cb_show_bot_profile(callback: CallbackQuery) -> None:
     """«📄 Открыть анкету» — показывает анкету бота из личного сообщения."""
     bot_id = int(cb_data(callback).rsplit("_", 1)[-1])
-    row = next((r for r in bot_profiles_feed(exclude_owner_id=0)
-                if int(r["bot_id"]) == bot_id), None)
-    bot_name = str(row["username"]) if row else f"бот {bot_id}"
+    # Имя берём из таблицы ботов, а не из ленты: лента ограничена LIMIT'ом,
+    # поэтому бот вне её окна показывался как «бот 12345» — без юзернейма
+    # и названия (жалоба владельца).
+    row = get_bot_by_id_any_owner(bot_id)
+    bot_name = _bot_title({"bot_id": bot_id, **(row or {})})
     profile = get_bot_profile(bot_id)
 
     await render_callback(
@@ -1231,8 +1449,7 @@ async def cb_show_admin_profile(callback: CallbackQuery) -> None:
     offer_id = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
     profile = get_admin_profile(admin_id)
-    who = str((profile or {}).get("username")
-              or (profile or {}).get("first_name") or "Админ")
+    who = _admin_label(profile or {})
 
     rows: list[list[InlineKeyboardButton]] = []
     if offer_id:
@@ -1328,13 +1545,21 @@ async def cb_search_decide(callback: CallbackQuery) -> None:
                 f"🆔 <b>ID:</b> <code>{sender_id}</code>\n\n"
                 f"Юзернейма у него нет — найдите его в чате админов по ID."
             )
+            # Кнопка «написать админу» — запасной канал, когда юзернейма нет
+            # и связаться больше нечем. Сообщение ОДНО (это прямо сказано в
+            # предупреждении), поэтому факт отправки хранится в БД.
+            contact_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✉️ Написать админу (1 раз)",
+                                     callback_data=f"search_msg_{offer_id}",
+                                     style="success"),
+            ]])
             await _send_private(
                 callback.bot, user_id,
                 "✅ <b>Заявка принята!</b>\n\n"
                 "Админ получит уведомление. Он не станет админом автоматически — "
                 "добавьте его в админы бота и напишите ему лично:\n\n"
                 + contact_line,
-                None,
+                contact_kb,
             )
 
     # ── Кому что уходит ────────────────────────────────────────────────
@@ -1394,3 +1619,175 @@ async def cb_search_decide(callback: CallbackQuery) -> None:
                               else "❌ Отклонено")
         text, kb = _inbox_payload(user_id, 1)
     await render_callback(callback, text, kb)
+# ═══════════════ Одно сообщение владельцу → принятому админу ═══════════════
+#
+# Зачем
+# ----
+# При принятии заявки владельцу уходит контакт админа. Но если у админа нет
+# юзернейма, написать ему напрямую нечем: владелец ищет его в чате админов по
+# ID — а человек под этим ID может вообще себя не найти. Тогда заявка
+# принимается и тихо умирает.
+#
+# Поэтому у владельца есть ровно ОДНО сообщение через бота. Ограничение не
+# косметическое: без него бот превратился бы в рассылку чужим людям, поэтому
+# факт отправки запоминается в БД (offer_message_left / mark_offer_message_sent)
+# и переживает перезапуск.
+
+
+def _accepted_offer_for_owner(offer_id: int, user_id: int) -> dict | None:
+    """Заявка, принятая этим владельцем, или None (нет/не его/не принята)."""
+    offer = get_offer(offer_id)
+    if not offer:
+        return None
+    # Право — по таблице, а не по нажавшему: кнопка висит в личке у владельца.
+    if int(offer["recipient_id"]) != user_id:
+        return None
+    if str(offer.get("kind") or "") != OFFER_ADMIN_TO_BOT:
+        return None
+    # Только принятая заявка: писать админу имеет смысл, когда владелец
+    # уже решил, что берёт его в админы.
+    if str(offer.get("status") or "") != STATUS_ACCEPTED:
+        return None
+    return offer
+
+
+@router.callback_query(F.data.regexp(r"^search_msg_(\d+)$"))
+async def cb_offer_message(callback: CallbackQuery,
+                           state: FSMContext) -> None:
+    """«✉️ Написать админу» — предупреждение перед единственным сообщением."""
+    offer_id = int(cb_data(callback).rsplit("_", 1)[-1])
+    user_id = cb_uid(callback)
+
+    offer = _accepted_offer_for_owner(offer_id, user_id)
+    if offer is None:
+        await callback.answer("❌ Это не твоя заявка", show_alert=True)
+        return
+    if offer_message_left(offer_id):
+        await callback.answer(
+            "✉️ Сообщение админу уже отправлено — оно одно.",
+            show_alert=True,
+        )
+        return
+
+    admin_id = int(offer["sender_id"])
+    profile = get_admin_profile(admin_id) or {}
+    who = _admin_label(profile)
+    bot_row = get_bot_by_id_any_owner(int(offer.get("bot_id") or 0))
+    bot_name = _bot_title({"bot_id": offer.get("bot_id"), **(bot_row or {})})
+
+    await state.set_state(SearchFSM.offer_message)
+    await state.update_data(offer_msg_id=offer_id,
+                            offer_msg_admin=admin_id,
+                            offer_msg_bot=bot_name)
+
+    # Предупреждение — обязательная часть сценария: человек должен понимать,
+    # что это последнее сообщение и что отвечать ему не будут.
+    await render_callback(
+        callback,
+        "✉️ <b>Написать админу — ровно одно сообщение</b>\n\n"
+        f"👤 Админ: <b>{html_escape(who)}</b>\n"
+        f"🤖 Бот: <b>{html_escape(bot_name)}</b>\n\n"
+        "⚠️ <b>Это единственное сообщение.</b> Админ получит его от бота и "
+        "не сможет ответить — так устроена привязка.\n\n"
+        "Напиши сразу, <b>как с вами связаться</b>: телефон, @username или "
+        "Telegram ID. Если контакта не будет — админ не найдёт вас.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Написать сообщение",
+                                  callback_data="search_msg_write",
+                                  style="success")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="search_open",
+                                  style="primary")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "search_msg_write")
+async def cb_offer_message_write(callback: CallbackQuery,
+                                 state: FSMContext) -> None:
+    """Ввод текста единственного сообщения."""
+    data = await state.get_data()
+    if not int(data.get("offer_msg_id") or 0):
+        await callback.answer("❌ Сообщение уже неактуально", show_alert=True)
+        text, kb = search_payload(cb_uid(callback))
+        await render_callback(callback, text, kb)
+        return
+
+    await render_callback(
+        callback,
+        "✍️ <b>Сообщение админу</b>\n\n"
+        "Напиши текст — он уйдёт админу от имени бота. Обязательно укажи, "
+        "<b>как с тобой связаться</b>: телефон, @username или Telegram ID.\n\n"
+        "<i>Сообщение будет одно — отправь то, что действительно пригодится.</i>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="search_open",
+                                  style="primary")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.message(SearchFSM.offer_message)
+async def fsm_offer_message(message: Message, state: FSMContext) -> None:
+    """Отправляет единственное сообщение админу от имени бота."""
+    data = await state.get_data()
+    offer_id = int(data.get("offer_msg_id") or 0)
+    admin_id = int(data.get("offer_msg_admin") or 0)
+    bot_name = str(data.get("offer_msg_bot") or "бот")
+
+    user_id = msg_uid(message)
+    body = (message.text or message.caption or "").strip()
+    if not body:
+        await message.answer("❌ Пустое сообщение — написать нечего.")
+        return
+    if not offer_id or not admin_id:
+        await state.clear()
+        await message.answer("ℹ️ Сообщение уже неактуально.")
+        return
+
+    # Повторная проверка: между нажатием и вводом могли нажать ещё раз или
+    # перезапустить бота — право и «одно сообщение» проверяем здесь, а не
+    # только на кнопке.
+    offer = _accepted_offer_for_owner(offer_id, user_id)
+    if offer is None:
+        await state.clear()
+        await message.answer("❌ Это не твоя заявка.")
+        return
+    if offer_message_left(offer_id):
+        await state.clear()
+        await message.answer("✉️ Сообщение админу уже отправлено — оно одно.")
+        return
+
+    await state.clear()
+    owner_name = (get_user_registry(user_id) or {}).get("username") or ""
+    sender_line = (
+        f"От: @{html_escape(str(owner_name))}" if owner_name
+        else f"От: <code>{user_id}</code>"
+    )
+    # Экранируем текст владельца: он пишет произвольно, а «<» или «&» сломали
+    # бы всю разметку и сообщение просто не ушло бы.
+    letter = (
+        "✉️ <b>Сообщение от владельца бота</b>\n\n"
+        f"🤖 Бот: <b>{html_escape(bot_name)}</b>\n"
+        f"👤 {sender_line}\n\n"
+        f"{html_escape(body[:1500])}\n\n"
+        "<i>Это единственное сообщение от бота: ответить здесь нельзя — "
+        "напишите напрямую по контакту, который указал владелец.</i>"
+    )
+    ok = await _send_private(message.bot, admin_id, letter, None)
+    if ok:
+        # Помечаем только после успеха: неудачная доставка не должна
+        # «съедать» единственное сообщение.
+        mark_offer_message_sent(offer_id)
+        await message.answer(
+            "✅ Сообщение отправлено админу.\n\n"
+            "Это было одно сообщение — он ответить не сможет, поэтому все "
+            "контакты должны быть в тексте."
+        )
+    else:
+        await message.answer(
+            "❌ Не удалось отправить: админ не начал диалог с ботом.\n\n"
+            "Чтобы бот мог ему писать, админ должен открыть бота и нажать "
+            "/start. Попробуй ещё раз — сообщение ещё не потрачено."
+        )
+        text, kb = search_payload(user_id)
+        await message.answer(text, reply_markup=kb)

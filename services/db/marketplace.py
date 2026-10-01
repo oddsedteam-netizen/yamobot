@@ -134,6 +134,11 @@ def bot_profiles_feed(exclude_owner_id: int = 0,
     Анкетниц нет, свои боты не показываем: человеку неинтересно предлагать
     себя же. Каждая строка идёт вместе со статистикой бота — её показывают
     даже когда анкеты нет.
+
+    Ботов без ``username`` больше НЕ отсекаем: такой бот тоже зарегистрирован
+    на площадке, и раньше он просто исчезал из поиска вместе с возможностью
+    подать на него заявку. Покажем его по ``first_name``, а если и его нет —
+    как «бот<id>» (см. ``bot_display_name``).
     """
     conn = _get_conn()
     placeholders = ",".join("?" for _ in _BOT_TYPE_EXCLUDED)
@@ -157,7 +162,6 @@ def bot_profiles_feed(exclude_owner_id: int = 0,
           FROM bots b
      LEFT JOIN bot_profiles p ON p.bot_id = b.id
          WHERE b.bot_type NOT IN ({placeholders})
-           AND b.username != ''
            {exclude}
       ORDER BY (p.bot_id IS NOT NULL) DESC, pz_count DESC, b.id
          LIMIT ? OFFSET ?
@@ -165,6 +169,38 @@ def bot_profiles_feed(exclude_owner_id: int = 0,
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def bot_profiles_feed_count(exclude_owner_id: int = 0) -> int:
+    """Сколько всего ботов попадёт в ленту (без ``LIMIT``).
+
+    Зачем отдельный счётчик
+    -----------------------
+    Раньше число страниц считалось как ``ceil(len(окно) / FEED_PAGE)``, то есть
+    по УЖЕ ОБРЕЗАННОМУ окну запроса. При ``limit=15`` и ``FEED_PAGE=5`` это
+    всегда давало 3 страницы: сколько бы ботов ни было на площадке, дальше
+    пятнадцатого они были недостижимы — а владелец видел пустые «хвосты»
+    списка и думал, что заявку отправляет в пустоту. Теперь количество
+    страниц считается по реальному ``COUNT(*)`` с тем же WHERE.
+    """
+    conn = _get_conn()
+    placeholders = ",".join("?" for _ in _BOT_TYPE_EXCLUDED)
+    params: list = [*_BOT_TYPE_EXCLUDED]
+    exclude = ""
+    if exclude_owner_id:
+        exclude = "AND b.owner_id != ?"
+        params.append(int(exclude_owner_id))
+
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*)
+          FROM bots b
+         WHERE b.bot_type NOT IN ({placeholders})
+           {exclude}
+        """,
+        params,
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
 # ═══════════════ Анкета админа ═══════════════
 
 def get_admin_profile(user_id: int) -> dict | None:
@@ -179,23 +215,31 @@ def get_admin_profile(user_id: int) -> dict | None:
 def set_admin_profile(user_id: int, username: str = "", first_name: str = "",
                       age: str = "", category: str = "", pz_limit: str = "",
                       timezone: str = "", hours: str = "",
-                      text: str = "") -> bool:
-    """Сохраняет анкету админа (создаёт или обновляет)."""
+                      text: str = "", tag: str = "") -> bool:
+    """Сохраняет анкету админа (создаёт или обновляет).
+
+    ``tag`` — как админа зовут в анкетах и карточках («Ваш тег?» — первый
+    вопрос анкеты). Это НЕ админский тег из ``admins``: он принадлежит
+    владельцу бота и у одного человека в разных ботах он разный. Здесь
+    человек называет себя сам, и именно это имя видно в «Просмотре
+    профилей» вместо юзернейма.
+    """
     conn = _get_conn()
     with _lock:
         conn.execute(
             "INSERT INTO admin_profiles "
             "(user_id, username, first_name, age, category, pz_limit, "
-            "timezone, hours, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "timezone, hours, text, tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "username=excluded.username, first_name=excluded.first_name, "
             "age=excluded.age, category=excluded.category, "
             "pz_limit=excluded.pz_limit, timezone=excluded.timezone, "
-            "hours=excluded.hours, text=excluded.text, "
+            "hours=excluded.hours, text=excluded.text, tag=excluded.tag, "
             "updated_at=CURRENT_TIMESTAMP",
             (int(user_id), _clean(username, 64), _clean(first_name, 64),
              _clean(age, 40), _clean(category, 40), _clean(pz_limit, 60),
-             _clean(timezone, 60), _clean(hours, 60), _clean(text)),
+             _clean(timezone, 60), _clean(hours, 60), _clean(text),
+             _clean(tag, 40)),
         )
         conn.commit()
     return True
@@ -236,6 +280,27 @@ def admin_profiles_feed(exclude_user_id: int = 0,
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def admin_profiles_feed_count(exclude_user_id: int = 0) -> int:
+    """Сколько всего анкет админов попадёт в ленту (без ``LIMIT``).
+
+    Та же причина, что и в ``bot_profiles_feed_count``: число страниц нельзя
+    считать по обрезанному окну запроса — иначе лента обрывается на пятнадцатом
+    админе и дальше не листается в принципе.
+    """
+    conn = _get_conn()
+    exclude = ""
+    params: list = []
+    if exclude_user_id:
+        exclude = "AND user_id != ?"
+        params.append(int(exclude_user_id))
+
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM admin_profiles WHERE 1 = 1 {exclude}",
+        params,
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
 # ═══════════════ Предложения и отклики ═══════════════
 
 def offer_send_block(kind: str, sender_id: int, recipient_id: int,
@@ -349,6 +414,30 @@ def set_offer_status(offer_id: int, status: str) -> bool:
         return cur.rowcount > 0
 
 
+def offer_message_left(offer_id: int) -> bool:
+    """Отправлял ли уже владелец сообщение админу по этой заявке.
+
+    Сообщение одно: это запасной канал, когда юзернейма нет и написать
+    напрямую нечем. Повторные отправки превратили бы бота в массовую рассылку
+    чужим людям, поэтому факт отправки запоминается в БД.
+    """
+    offer = get_offer(offer_id)
+    return bool(offer and str(offer.get("contact_msg_sent_at") or "").strip())
+
+
+def mark_offer_message_sent(offer_id: int) -> bool:
+    """Помечает, что одно сообщение по заявке уже отправлено."""
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE search_offers SET contact_msg_sent_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (int(offer_id),),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def offers_inbox(kind: str, recipient_id: int,
                  status: str = STATUS_PENDING) -> list[dict]:
     """Входящие предложения получателя («Отклики» / «Приглашения»).
@@ -360,6 +449,14 @@ def offers_inbox(kind: str, recipient_id: int,
     (``admin_profiles``). Для «Приглашений» всё наоборот: отправитель —
     владелец бота, свою анкету он не заполняет, и вместо неё нужен его
     username из реестра (``owner_username``).
+
+    ``a.tag`` и ``a.username`` тянутся из анкеты админа: карточка «Откликов»
+    показывает админа по его тегу, а не по юзернейму.
+
+    ``bot_text`` — текст из анкеты БОТА. Нужен для «Приглашений»: там
+    показывается то, что владелец обещал админу приглашением («Этот текст
+    увидят админы, когда ты их пригласишь»). Раньше там брался ``a.text`` —
+    анкета АДМИНА, то есть приглашал владелец, а текст показывался чужой.
     """
     conn = _get_conn()
     rows = conn.execute(
@@ -368,11 +465,14 @@ def offers_inbox(kind: str, recipient_id: int,
                b.username AS bot_username,
                b.first_name AS bot_first_name,
                a.age, a.category, a.pz_limit, a.timezone, a.hours, a.text,
+               a.tag, a.username AS admin_username,
+               p.text AS bot_text,
                r.username AS owner_username,
                r.first_name AS owner_first_name
           FROM search_offers o
      LEFT JOIN bots b ON b.id = o.bot_id
      LEFT JOIN admin_profiles a ON a.user_id = o.sender_id
+     LEFT JOIN bot_profiles p ON p.bot_id = o.bot_id
      LEFT JOIN users_registry r ON r.user_id = o.sender_id
          WHERE o.kind = ? AND o.recipient_id = ? AND o.status = ?
       ORDER BY o.id

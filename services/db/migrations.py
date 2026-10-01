@@ -129,6 +129,44 @@ def _migrate_registry_pending_bind(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_admin_profile_tag(conn: sqlite3.Connection) -> None:
+    """Добавляет в анкету админа поле ``tag`` — «Ваш тег?».
+
+    Зачем
+    ----
+    Владелец попросил: в «Просмотре профилей» админ должен показываться под
+    своим тегом, а не под юзернеймом, а сам тег спрашивается первым вопросом
+    анкеты. Пока колонки нет, в карточках остаётся юзернейм (у старых анкет
+    тега просто не будет — интерфейс падает на это обратно).
+
+    У уже существующих анкет значение пустое: переписывать их чужим тегом
+    нельзя, человек сам его выбирает.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(admin_profiles)").fetchall()]
+    if "tag" not in cols:
+        conn.execute("ALTER TABLE admin_profiles ADD COLUMN tag TEXT DEFAULT ''")
+    conn.commit()
+
+
+def _migrate_offer_contact_message(conn: sqlite3.Connection) -> None:
+    """Добавляет в ``search_offers`` метку «сообщение уже отправлено».
+
+    Зачем
+    ----
+    При принятии заявки владельцу предлагается одно сообщение админу — на
+    случай, если у того нет юзернейма и связаться больше нечем. Оно должно
+    быть РОВНО одним, поэтому факт отправки хранится в БД, а не во временном
+    состоянии бота: после перезапуска кнопка не должна снова разрешать слать.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(search_offers)").fetchall()]
+    if "contact_msg_sent_at" not in cols:
+        conn.execute(
+            "ALTER TABLE search_offers "
+            "ADD COLUMN contact_msg_sent_at TIMESTAMP"
+        )
+    conn.commit()
+
+
 def _migrate_yid(conn: sqlite3.Connection) -> None:
     """Внутренний номер пользователя вида Y100, Y101… (раздел «🆔 YID»).
 
@@ -1046,6 +1084,8 @@ def ensure_db() -> None:
     _migrate_registry_chats(conn)
     _migrate_registry_pending_bind(conn)
     _migrate_yid(conn)
+    _migrate_admin_profile_tag(conn)
+    _migrate_offer_contact_message(conn)
     _migrate_admin_greetings(conn)
     _migrate_topic_activity(conn)
     # Метка «топик закрыт/удалён» и заглушки напоминалок: без них бот продолжал

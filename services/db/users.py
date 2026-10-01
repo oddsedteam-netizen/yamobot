@@ -283,6 +283,40 @@ def get_user_registry(user_id: int) -> dict | None:
     row = conn.execute("SELECT * FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()
     return dict(row) if row else None
 
+
+def get_user_by_yid(yid: int) -> dict | None:
+    """Человек по внутреннему номеру YID (без префикса «Y»).
+
+    Нужен админ-панели: владелец ищет человека то по номеру («Y104»), то по
+    настоящему Telegram ID. Раньше номер находился только перебором всего
+    реестра внутри хендлера — здесь поиск делает сама база.
+    """
+    if not yid:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM users_registry WHERE yid = ?", (int(yid),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_by_username(username: str) -> dict | None:
+    """Человек по ``@username`` (регистр не важен).
+
+    Юзернейм в реестре может быть пустым или с ведущим ``@`` — сравниваем
+    по очищенному значению, иначе поиск «@ivan» не находил «ivan».
+    """
+    name = (username or "").strip().lstrip("@").lower()
+    if not name:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM users_registry "
+        "WHERE LOWER(TRIM(username, '@')) = ? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return dict(row) if row else None
+
 _CHAT_BIND_COLUMNS = {"work": "work_chat_id", "admin": "admin_chat_id"}
 
 def get_bound_chat(user_id: int, kind: str) -> int | None:

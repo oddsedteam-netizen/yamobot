@@ -166,8 +166,11 @@ def admin_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list", style="primary"),
         ],
         # YID — поиск человека по номеру и списки «с номером / без номера».
+        # Поиск понимает Telegram ID, YID и @username (см. yid_admin).
         [
-            InlineKeyboardButton(text="🆔 YID: поиск", callback_data="yid_list",
+            InlineKeyboardButton(text="🔎 Найти по ID", callback_data="yid_find",
+                                 style="success"),
+            InlineKeyboardButton(text="🆔 Список YID", callback_data="yid_list",
                                  style="primary"),
         ],
         # Рейтинг — управление топом вручную: убрать админа или бота, чтобы

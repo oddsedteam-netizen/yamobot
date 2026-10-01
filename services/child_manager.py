@@ -56,8 +56,8 @@ from services.storage import (
     is_user_muted,
     save_banned_topic,
     get_banned_topic_user,
+    get_banned_topics_for_user,
     delete_banned_topics_for_user,
-    get_orphan_banned_topics,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
@@ -2857,6 +2857,173 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
         except Exception as e:
             logger.warning("Не удалось поздравить с подключением: %s", e)
 
+    # ═══════════════ /unban: разбор команды и восстановление ═══════════════
+    #
+    # Почему это отдельные функции
+    # ---------------------------
+    # Разбан нужен в двух сценариях — «напиши в топике /unban» и «напиши
+    # /unban <id>», когда топик уже удалён и найти человека по нему нельзя.
+    # Общая часть (снять бан, починить топик, честно сказать, если топик
+    # восстановить не удалось) живёт в ``_do_unban``, чтобы не разъезжалась
+    # между сценариями.
+
+    def _parse_unban_id(message: Message) -> int | None:
+        """ID пользователя из ``/unban 123456`` (None, если ID не указан).
+
+        Разбираем вручную, а не через аргументы ``Command``: в группе
+        Telegram дописывает ``/unban@MyBot``, и простой разбор текста
+        надёжнее, чем попытка угадать формат аргумента.
+        """
+        text = (message.text or "").split()
+        if len(text) < 2:
+            return None
+        # Отрезаем возможный «@username» у самой команды.
+        raw = text[1].split("@", 1)[0].strip()
+        return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+    async def _revive_topic(bot_obj: Bot, chat_id: int, topic_id: int) -> bool:
+        """Открывает и переименовывает топик. False — вернуть НЕ вышло.
+
+        Раньше тут стояли два ``try/except`` с ``logger.debug``, и обе ошибки
+        проглатывались. В итоге админ видел «✅ разбанен», а топик оставался
+        закрытым (или вообще удалённым) — и сообщения ПЗ не доходили никуда,
+        хотя разбан «прошёл». Теперь результат возвращается вызывающему,
+        чтобы он сказал правду.
+        """
+        try:
+            await bot_obj.edit_forum_topic(
+                chat_id=chat_id, message_thread_id=topic_id, name="⏳ без админа"
+            )
+        except Exception as e:
+            logger.info("Не удалось переименовать топик %s: %s", topic_id, e)
+        try:
+            await bot_obj.reopen_forum_topic(chat_id=chat_id,
+                                             message_thread_id=topic_id)
+            return True
+        except Exception as e:
+            logger.info("Не удалось открыть топик %s: %s", topic_id, e)
+            return False
+
+    async def _unban_topic_notice(bot_obj: Bot, chat_id: int, topic_id: int,
+                                  user_chat_id: int) -> None:
+        """Сообщение админу: топик вернуть не вышло — будет новый.
+
+        Пишем и в топик (если он ещё отвечает), и в чат админов: если топик
+        удалён, сообщение в него не уйдёт, а человек должен всё равно узнать,
+        что происходит.
+        """
+        text = (
+            f"⚠️ <b>Пользователь {user_chat_id} разбанен</b>, но старый топик "
+            "вернуть не удалось — он удалён или у бота нет прав.\n\n"
+            "<b>Новый топик бот создаст сам</b>, как только пользователь снова "
+            "напишет в бота. До этого момента писать ему можно — сообщения "
+            "дойдут."
+        )
+        try:
+            await bot_obj.send_message(chat_id=chat_id,
+                                       message_thread_id=topic_id, text=text)
+        except Exception:
+            logger.debug("Не удалось написать в топик", exc_info=True)
+        admin_chat = get_bound_chat(get_bot_owner(bot_id) or 0, "admin")
+        if admin_chat:
+            try:
+                await bot_obj.send_message(chat_id=admin_chat, text=text)
+            except Exception:
+                logger.debug("Не удалось написать в чат админов", exc_info=True)
+
+    async def _do_unban(message: Message, bot_obj: Bot, user_chat_id: int,
+                         group_chat_id: int, topic_id: int) -> bool:
+        """Снимает бан и восстанавливает обращение. True — топик вернулся.
+
+        Порядок именно такой: сначала снимаем бан (человеку можно писать),
+        потом чистим маппинги, и только потом пробуем вернуть топик. Если
+        вернуть не вышло — запись ПЗ на мёртвый топик НЕ создаётся, иначе
+        бот продолжит слать сообщения в удалённый топик и считать, что
+        обращение живо: это и было причиной «разбанили, а сообщения не
+        доходят».
+        """
+        if not unban_user(bot_id, user_chat_id):
+            await message.answer("⚠️ Пользователь не найден в базе.")
+            return False
+
+        # Убираем ВСЕ маппинги «топик → юзер» этого человека: после
+        # пересоздания топика у него могло остаться несколько записей, и старые
+        # мешали бы разбану в следующий раз.
+        delete_banned_topics_for_user(bot_id, user_chat_id)
+
+        revived = await _revive_topic(bot_obj, group_chat_id, topic_id)
+        if not revived:
+            # Топик мёртв: запись о нём не восстанавливаем — иначе бот будет
+            # писать в пустоту и считать обращение открытым.
+            delete_topic_record(bot_id, user_chat_id)
+            await _unban_topic_notice(bot_obj, group_chat_id, topic_id,
+                                      user_chat_id)
+            await message.answer(
+                f"✅ Пользователь <code>{user_chat_id}</code> разбанен.\n\n"
+                "⚠️ Старый топик вернуть не удалось (удалён или нет прав). "
+                "Новый топик бот создаст сам, как только пользователь снова "
+                "напишет в бота."
+            )
+            return False
+
+        create_topic_record(bot_id, user_chat_id, group_chat_id, topic_id)
+        reset_topic_admin(bot_id, topic_id, group_chat_id)
+
+        # Отправляем юзеру сообщение: у него мог быть открыт старый чат.
+        try:
+            await bot_obj.send_message(
+                chat_id=user_chat_id,
+                text="✅ Вас разбанили в боте, можете снова писать."
+            )
+        except Exception as e:
+            # Человек мог заблокировать бота обратно — это не мешает разбану.
+            logger.info("Не удалось отправить разбан-уведомление: %s", e)
+
+        sent = await bot_obj.send_message(
+            chat_id=group_chat_id,
+            message_thread_id=topic_id,
+            text=f"🔓 Пользователь <code>{user_chat_id}</code> разбанен.",
+            reply_markup=_topic_action_kb(topic_id, group_chat_id),
+        )
+        # Шапка с кнопками закрепляется: иначе админ не найдёт, от чего
+        # отказываться.
+        await _pin_topic_action(bot_obj, bot_id, group_chat_id, topic_id, sent)
+        await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> разбанен.")
+        return True
+
+    async def _unban_by_id(message: Message, bot_obj: Bot,
+                           user_chat_id: int) -> None:
+        """«/unban 123456» — разбан по Telegram ID.
+
+        Сценарий владельца: ПЗ заблокировал бота, топик удалили или закрыли,
+        разбан «в топике» не сработал (топик старый, а человека по нику не
+        найти). Здесь ID известен точно, поэтому и топик восстанавливаем
+        точный — из маппинга ЭТОГО человека, а не «первый попавшийся
+        осиротевший», который мог принадлежать другому ПЗ.
+        """
+        if not is_user_banned(bot_id, user_chat_id):
+            await message.answer(
+                f"ℹ️ Пользователь <code>{user_chat_id}</code> не забанен "
+                "в этом боте."
+            )
+            return
+
+        mappings = get_banned_topics_for_user(bot_id, user_chat_id)
+        if not mappings:
+            # Бан есть, а маппинга нет — снимаем бан и честно говорим, что
+            # топик восстановить не из чего.
+            unban_user(bot_id, user_chat_id)
+            await message.answer(
+                f"✅ Пользователь <code>{user_chat_id}</code> разбанен.\n\n"
+                "⚠️ Его топик не найден в базе — новый топик бот создаст сам, "
+                "как только пользователь снова напишет в бота."
+            )
+            return
+
+        for row in mappings:
+            await _do_unban(message, bot_obj, user_chat_id,
+                            int(row["group_chat_id"]), int(row["topic_id"]))
+
     # ═══════════════ /ban в топике ═══════════════
 
     @child_dp.message(
@@ -2932,93 +3099,45 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             await _deny_not_admin(message)
             return
 
-        topic = get_topic_by_topic_id(bot_id, group_chat_id, thread_id)
-        # При бане запись ПЗ удаляется, поэтому ищем юзера по маппингу забаненных топиков.
-        if topic:
-            user_chat_id = topic["user_chat_id"]
-        else:
+        # ── Разбан по ID: «/unban 123456» ──────────────────────────────
+        # С айди разбаниваем ИМЕННО этого человека — топик не нужен вовсе,
+        # поэтому команда работает из любого топика (часто из «General»).
+        target = _parse_unban_id(message)
+        if target is not None:
+            await _unban_by_id(message, bot_obj, target)
+            return
+
+        # ── Разбан без айди: только ПЗ ЭТОГО топика ────────────────────
+        user_chat_id = get_topic_by_topic_id(
+            bot_id, group_chat_id, thread_id,
+        )
+        # Запись ПЗ при бане удаляется, поэтому добираемся через маппинг
+        # «топик → юзер»: он остаётся, даже если обращения в базе уже нет.
+        if user_chat_id is None:
             user_chat_id = get_banned_topic_user(bot_id, group_chat_id, thread_id)
 
         if user_chat_id is None:
-            # Топик могли УДАЛИТЬ и создать новый — тогда topic_id другой и
-            # точный поиск по нему ничего не находит. Берём самый свежий
-            # «осиротевший» маппинг: иначе разбан этого человека был бы
-            # невозможен в принципе (кроме как вручную по ID).
-            orphans = get_orphan_banned_topics(bot_id)
-            if orphans:
-                user_chat_id = orphans[0]["user_chat_id"]
-                logger.info(
-                    "Разбан бота %s: топик %s не найден точно, беру "
-                    "последний забаненный %s",
-                    bot_id, thread_id, user_chat_id,
-                )
-
-        if user_chat_id is None:
-            await message.answer("⚠️ Не удалось найти ПЗ для этого топика.")
+            # Здесь раньше подставлялся «самый свежий осиротевший маппинг»
+            # бота — то есть разбанивался ПЕРВЫЙ ПОПАВШИЙСЯ человек, а не тот,
+            # чей топик открыт. В топике это выглядело как «разбанило
+            # неправильного человека», а если у него не было маппинга —
+            # разбанивался тот, у кого он был.
+            #
+            # Теперь такого подменного разбана нет: разбан без айди
+            # трогает только написанный топик, а если ПЗ в нём определить
+            # нельзя — честно говорим об этом и подсказываем разбан по ID.
+            # Сценарий «топик удалили, человека ищем по ID» теперь покрыт
+            # командой «/unban 123456» и не требует угадывания.
+            await message.answer(
+                "⚠️ В этом топике не нашёл ПЗ, который его вёл — "
+                "разбанить некого.\n\n"
+                "Если человек известен — разбанить можно прямо по его ID: "
+                "<code>/unban 123456789</code>\n"
+                "(ID виден в уведомлении о бане)."
+            )
             return
 
-        # Снимаем бан
-        success = unban_user(bot_id, user_chat_id)
-        if not success:
-            await message.answer("⚠️ Пользователь не найден в базе.")
-            return
-
-        # Убираем ВСЕ маппинги «топик → юзер» этого человека и восстанавливаем ПЗ.
-        # Чистим по пользователю, а не по текущему топику: после пересоздания
-        # топика у него могло остаться несколько записей, и старые мешали бы
-        # разбану в следующий раз.
-        delete_banned_topics_for_user(bot_id, user_chat_id)
-        create_topic_record(bot_id, user_chat_id, group_chat_id, thread_id)
-
-        # Отправляем юзеру сообщение
-        try:
-            await bot_obj.send_message(
-                chat_id=user_chat_id,
-                text="✅ Вас разбанили в боте, можете снова писать."
-            )
-        except Exception as e:
-            logger.warning("Не удалось отправить разбан-уведомление: %s", e)
-
-        # Сбрасываем админа
-        reset_topic_admin(bot_id, thread_id, group_chat_id)
-
-        # Переименовываем топик
-        try:
-            await bot_obj.edit_forum_topic(
-                chat_id=group_chat_id,
-                message_thread_id=thread_id,
-                name="⏳ без админа"
-            )
-        except Exception:
-            logger.debug(
-                "Исключение проглочено",
-                exc_info=True,
-            )
-
-        # Открываем топик если был закрыт
-        try:
-            await bot_obj.reopen_forum_topic(
-                chat_id=group_chat_id,
-                message_thread_id=thread_id
-            )
-        except Exception:
-            logger.debug(
-                "Исключение проглочено",
-                exc_info=True,
-            )
-
-        # Отправляем кнопку "Я беру"
-        sent = await bot_obj.send_message(
-            chat_id=group_chat_id,
-            message_thread_id=thread_id,
-            text=f"🔓 Пользователь <code>{user_chat_id}</code> разбанен.",
-            reply_markup=_topic_action_kb(thread_id, group_chat_id),
-        )
-        # Шапка с кнопками закрепляется: иначе админ не найдёт, от чего
-        # отказываться.
-        await _pin_topic_action(bot_obj, bot_id, group_chat_id, thread_id, sent)
-
-        await message.answer(f"✅ Пользователь <code>{user_chat_id}</code> разбанен.")
+        await _do_unban(message, bot_obj, user_chat_id, group_chat_id, thread_id)
 
     # ═══════════════ /otkaz в топике ═══════════════
 

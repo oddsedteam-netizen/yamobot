@@ -41,16 +41,14 @@ from handlers._common import (
     render_callback,
 )
 from services.config import is_super_admin
+from handlers.person_card import person_card_text
 from handlers.yid import show_yid_card
 from services.storage import (
-    bot_display_name,
-    get_admins_all,
     get_all_users_registry,
-    get_user_bots,
+    get_user_banned_bots,
+    get_user_by_username,
     get_user_registry,
-    get_yid,
     get_yid_owner,
-    utc_to_msk,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,34 +78,89 @@ def _parse_yid(raw: str) -> int | None:
     return int(text) if text.isdigit() and int(text) > 0 else None
 
 
+# ═══════════════ Поиск человека по ID (YID, Telegram ID, @username) ══════════
+#
+# Зачем
+# ----
+# Владелец попросил искать человека в админ-панели «по айди — айди телеграм
+# и YID, если есть». Раньше понимался только номер YID, а настоящий Telegram
+# ID (тот, что пишут в уведомлениях о бане) найти было нельзя.
+#
+# Разбор по форме строки:
+#   «Y104» / «104»       — внутренний номер;
+#   «123456789» (≥6 цифр) — Telegram ID: у YID числа трёхзначные, а у
+#                           Telegram ID — всегда длинные;
+#   «@ivan» / «ivan»     — юзернейм.
+
+
+def _find_user(raw: str) -> tuple[dict | None, str]:
+    """Человек по строке запроса. Возвращает ``(запись, как искали)``."""
+    text = (raw or "").strip()
+    if not text:
+        return None, ""
+
+    # Сначала номер с буквой: «Y104» содержит и букву, и цифры, поэтому
+    # проверка «это username?» и «это цифры?» его не поймала бы.
+    if text.upper().startswith("Y"):
+        number = _parse_yid(text)
+        if number is not None:
+            owner = get_yid_owner(number)
+            return (get_user_registry(int(owner)), "yid") if owner else (None, "yid")
+
+    if text.lstrip("@").isalpha() or (text.startswith("@") and
+                                      text.lstrip("@").replace("_", "").isalnum()):
+        return get_user_by_username(text), "username"
+
+    digits = text.lstrip("@").strip()
+    if digits.isdigit():
+        number = int(digits)
+        # Длинное число — это Telegram ID, короткое — YID. Сначала пробуем
+        # ID: номер YID может совпасть с ID какого-то бота, и тогда человек
+        # и бот «склеились» бы в одну карточку.
+        if len(digits) >= 6:
+            registry = get_user_registry(number)
+            if registry:
+                return registry, "tgid"
+        owner = get_yid_owner(number)
+        if owner:
+            return get_user_registry(int(owner)), "yid"
+        # Короткое число могло быть ID — проверяем и его.
+        return get_user_registry(number), "tgid" if len(digits) >= 6 else "yid"
+
+    return None, ""
+
+
+def _query_help() -> str:
+    """Подсказка формата для экрана поиска."""
+    return (
+        "🔎 <b>Найти человека по ID</b>\n\n"
+        "Напиши любое из трёх — понимаю все:\n"
+        "• <b>Telegram ID</b> — <code>123456789</code>\n"
+        "• <b>YID</b> — <code>Y104</code> или <code>104</code>\n"
+        "• <b>@username</b> — <code>@ivan</code>\n\n"
+        "Найду и покажу полную карточку: боты, чаты, YID, бан."
+    )
+
+
 # ═══════════════ Поиск по номеру ═══════════════
 
 def _user_card(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Карточка человека по его номеру YID."""
-    yid = get_yid(user_id)
-    registry = get_user_registry(user_id) or {}
-    bots = get_user_bots(user_id)
-    admins = get_admins_all(user_id)
+    """Карточка человека: полная, как в «Профиль+».
 
-    name = registry.get("username") or registry.get("first_name") or "—"
-    username = registry.get("username") or ""
-    registered = (registry.get("created_at") or "—")[:19].replace("T", " ")
+    Раньше здесь был свой, более бедный вариант (имя, ID, YID, счётчики без
+    чатов), из-за чего поиск по YID и поиск в «Профиль+» показывали разное.
+    Теперь обе точки входа ведут в один рендер — ``person_card_text``.
+    """
+    text = person_card_text(user_id)
 
-    lines = [
-        f"🆔 <b>{('Y' + str(yid)) if yid else 'номер не выдан'}</b>\n",
-        f"👤 Имя: <b>{html_escape(str(name))}</b>",
-        f"🔗 Юзернейм: {'@' + html_escape(str(username)) if username else '—'}",
-        f"🆔 ID: <code>{user_id}</code>",
-        f"📅 В системе с: <b>{utc_to_msk(registered)[:10]}</b>",
-        f"🤖 Ботов: <b>{len(bots)}</b>",
-        f"👥 Админов у владельцев: <b>{len(admins)}</b>",
-    ]
-    if bots:
-        lines.append("")
-        for b in bots[:5]:
-            lines.append(f"  • {html_escape(bot_display_name(b))}")
-
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=[
+    return text, InlineKeyboardMarkup(inline_keyboard=[
+        # Разбан в ПЗ — по жалобе владельца («забанил бота, разбанил, а
+        # сообщения не доходят»): бан хранится по ботам, в карточке без
+        # отдельной кнопки его снять было негде.
+        ([InlineKeyboardButton(
+            text="🔓 Снять бан в ПЗ",
+            callback_data=f"prfplus_pzunban_{user_id}", style="success")]
+         if get_user_banned_bots(user_id) else []),
         [InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list",
                               style="primary")],
         # «👤 Профиль+» — открыть карточку YID этого человека в самом боте.
@@ -139,15 +192,13 @@ async def cb_yid_show_card(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "yid_find")
 async def cb_yid_find(callback: CallbackQuery, state: FSMContext) -> None:
-    """Запрашивает номер для поиска."""
+    """Запрашивает ID для поиска: Telegram ID, YID или @username."""
     if _deny(callback):
         return
     await state.set_state(YidAdminFSM.waiting_number)
     await render_callback(
         callback,
-        "🔎 <b>Найти по YID</b>\n\n"
-        "Напиши номер — можно с буквой или без: <code>Y104</code> или "
-        "<code>104</code>.",
+        _query_help(),
         InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="⬅️ Список YID", callback_data="yid_list",
                                  style="primary"),
@@ -157,30 +208,30 @@ async def cb_yid_find(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(YidAdminFSM.waiting_number)
 async def fsm_yid_find(message: Message, state: FSMContext) -> None:
-    """Ищет человека по номеру YID."""
+    """Ищет человека по Telegram ID, YID или @username.
+
+    Раньше понимался только номер YID, поэтому по настоящему Telegram ID —
+    тому, что написан в уведомлении о бане, — найти человека было нельзя
+    (жалоба владельца).
+    """
     if not is_super_admin(msg_uid(message)):
         await state.clear()
         return
 
-    number = _parse_yid(message.text or "")
-    if number is None:
+    query = (message.text or "").strip()
+    registry, _kind = _find_user(query)
+    if registry is None:
+        # Показываем ту же подсказку, а не «не понял номер»: формат теперь
+        # не один, и человеку надо видеть все варианты.
         await message.answer(
-            "❌ Не понял номер.\n\nНапиши так: <code>Y104</code> или "
-            "<code>104</code>.")
+            f"🤷 <b>Не нашёл</b> по запросу <code>{html_escape(query)}</code>\n\n"
+            + _query_help()
+        )
         return
 
-    user_id = get_yid_owner(number)
+    user_id = int(registry["user_id"])
     await state.clear()
-
-    if not user_id:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Список YID", callback_data="yid_list",
-                                 style="primary"),
-        ]])
-        await message.answer(f"🤷 <b>Y{number}</b> никому не выдан.", reply_markup=kb)
-        return
-
-    text, kb = _user_card(int(user_id))
+    text, kb = _user_card(user_id)
     await message.answer(text, reply_markup=kb)
 # ═══════════════ Список: кто получил номер, а кто нет ═══════════════
 
