@@ -20,6 +20,7 @@ from aiogram.types import (
 
 from handlers._common import (cb_data, cb_uid, event_bot, html_escape, msg_uid,
                               safe_edit)
+from handlers.admin_left_pz import offer_left_pz_mailing
 from services.storage import (
     add_admin,
     get_admin_by_user_id,
@@ -222,23 +223,28 @@ async def cb_leave_no(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.regexp(r"^adm_leave_yes_\d+$"))
 async def cb_leave_yes(callback: CallbackQuery) -> None:
-    """Убираем админа из списка."""
+    """Убираем админа из списка — и предлагаем рассылку по его ПЗ.
+
+    Раньше здесь был только молчаливый «🗑 Убран из списка админов»: владелец
+    узнавал об уходе лишь тогда, когда ему писали ПЗ. Теперь используется тот
+    же сценарий, что и при удалении из списка админов вручную.
+    """
     user_id = int(cb_data(callback).rsplit("_", 1)[-1])
-    removed = remove_admin(cb_uid(callback), user_id)
-    await callback.answer("🗑 Убрал" if removed else "Не найден")
-    if callback.message:
-        if removed:
-            await safe_edit(
-                callback.message,
-                "🗑 <b>Убран из списка админов.</b>",
-                InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📋 Список админов", callback_data="gadmins_list",
-                                          style="primary")]
-                ]),
-            )
-        else:
+    owner_id = cb_uid(callback)
+    admin = get_admin_by_user_id(owner_id, user_id)
+    removed = remove_admin(owner_id, user_id)
+    if not removed:
+        await callback.answer("Не найден")
+        if callback.message:
             await safe_edit(callback.message, "⚠️ Его не было в списке админов.",
                             InlineKeyboardMarkup(inline_keyboard=[]))
+        return
+
+    uname = f"@{admin['username']}" if admin and admin["username"] else f"ID:{user_id}"
+    tag = admin["tag"] if admin else "?"
+    await callback.answer("🗑 Убрал")
+    if callback.message:
+        await offer_left_pz_mailing(callback.message, owner_id, user_id, uname, tag)
 
 
 # ═══════════════ Заходы и выходы в чат админов ═══════════════

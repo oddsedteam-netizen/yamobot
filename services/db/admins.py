@@ -392,12 +392,87 @@ def is_user_banned(bot_id: int, chat_id: int) -> bool:
     return False
 
 def unban_user(bot_id: int, chat_id: int) -> bool:
-    """Снимает бан с юзера."""
+    """Снимает бан с юзера — во всех его видах.
+
+    Бан у пользователя хранится в ДВУХ местах: постоянный флаг
+    ``users.blocked`` и (для банов из «чата админов») ``user_restrictions.
+    ban_until``. Проверка ``is_user_banned`` смотрит оба.
+
+    Раньше здесь снимался только ``users.blocked``. Если у человека был ещё и
+    второй флаг, он оставался «забаненным» навсегда: сообщения ПЗ молча
+    терялись, и пересоздание топика не помогало — запрет был не в топике, а
+    в флаге. Поэтому снимаем оба.
+
+    True, если запись о бане вообще была (иначе команда /unban ругалась бы
+    «пользователь не найден» на уже разбаненном).
+    """
     conn = _get_conn()
     with _lock:
         cur = conn.execute(
             "UPDATE users SET blocked = 0 WHERE bot_id = ? AND chat_id = ?",
             (bot_id, chat_id)
         )
+        changed = cur.rowcount > 0
+        # Второй флаг: «чат админов» мог повесить свой бан на тот же ID.
+        cleared = conn.execute(
+            "UPDATE user_restrictions SET ban_until = NULL "
+            "WHERE bot_id = ? AND user_chat_id = ? AND ban_until IS NOT NULL",
+            (bot_id, chat_id)
+        )
         conn.commit()
-        return cur.rowcount > 0
+        return changed or cleared.rowcount > 0
+
+
+def get_user_banned_bots(chat_id: int) -> list[int]:
+    """В каких ботах этот человек забанен.
+
+    Бан держится в двух местах (см. ``is_user_banned``), поэтому и собираем
+    оба: иначе список показывал бы не все баны и кнопка «разбанить» снимала
+    бы не всё. Версия с ``ban_until`` в прошлом считается только пока срок не
+    вышел — истёкший бан уже не мешает писать.
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        """
+        SELECT bot_id FROM users
+         WHERE chat_id = ? AND blocked != 0
+        UNION
+        SELECT bot_id FROM user_restrictions
+         WHERE user_chat_id = ? AND ban_until IS NOT NULL
+           AND ban_until > ?
+        """,
+        (int(chat_id), int(chat_id), _now_utc_str()),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def unban_user_everywhere(chat_id: int) -> list[int]:
+    """Снимает бан человека во ВСЕХ ботах, где он забанен.
+
+    Нужно для кнопки «🚫 Разбанить» в карточке ПЗ: в поиске видно, что
+    человек забанен, но конкретный бот там не указан — спрашивать, в каком
+    именно, неудобно. Поэтому разбаниваем везде и возвращаем список ботов,
+    где бан был снят, — чтобы в ответе честно сказать, что именно изменилось.
+
+    Заодно чистим маппинги «топик → юзер»: после бана они остаются, и при
+    пересоздании топика разбан по нему иначе не находится.
+    """
+    bots = get_user_banned_bots(chat_id)
+    conn = _get_conn()
+    with _lock:
+        for bot_id in bots:
+            conn.execute(
+                "UPDATE users SET blocked = 0 WHERE bot_id = ? AND chat_id = ?",
+                (bot_id, int(chat_id)),
+            )
+            conn.execute(
+                "UPDATE user_restrictions SET ban_until = NULL "
+                "WHERE bot_id = ? AND user_chat_id = ?",
+                (bot_id, int(chat_id)),
+            )
+            conn.execute(
+                "DELETE FROM banned_topics WHERE bot_id = ? AND user_chat_id = ?",
+                (bot_id, int(chat_id)),
+            )
+        conn.commit()
+    return bots

@@ -881,6 +881,159 @@ def ensure_db() -> None:
             next_attempt_at TIMESTAMP
         );
 
+        -- ПЗ ушедшего админа, ждущие рассылки-оповещения.
+        --
+        -- Зачем: при удалении админа его ПЗ надо СРАЗУ освободить (иначе они
+        -- навсегда остаются «за» несуществующим админом, и напоминалка стучит
+        -- по его тегу). Но владельцу перед этим предлагается разослать ПЗ
+        -- сообщение «ваш админ ушёл». Список таких ПЗ кладём сюда ДО сброса —
+        -- иначе после ``reset_topic_admin`` он был бы пуст, и перезапуск бота
+        -- между «удалить админа» и «разослать» обнулил бы саму возможность
+        -- предложить рассылку.
+        CREATE TABLE IF NOT EXISTS admin_left_pz (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id      INTEGER NOT NULL,
+            admin_user_id INTEGER NOT NULL,
+            bot_id        INTEGER NOT NULL,
+            topic_id      INTEGER NOT NULL,
+            group_chat_id INTEGER NOT NULL,
+            user_chat_id  INTEGER NOT NULL,
+            tag           TEXT DEFAULT '',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_id, admin_user_id, bot_id, topic_id, group_chat_id)
+        );
+
+        -- Скрытие из рейтинга.
+        --
+        -- Человек не обязан светиться в общем топе: владелец бота может скрыть
+        -- себя как админа, а любой владелец — своих ботов. Храним в одной
+        -- таблице с полем ``kind``, потому что логика «скрыть/показать» и
+        -- прочерк в интерфейсе у админов и ботов одинаковая.
+        CREATE TABLE IF NOT EXISTS rating_optout (
+            kind       TEXT NOT NULL,
+            entity_id  INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (kind, entity_id)
+        );
+
+        -- Ручное скрытие из рейтинга владельцем платформы.
+        --
+        -- Отдельная таблица НЕ потому, что логика другая, а потому что
+        -- ``rating_optout`` — это добровольный отказ самого человека: он
+        -- может нажать «Вернуть меня в рейтинг» и снова попасть в топ.
+        -- Здесь решение администратора, и пользователь его перебить не может:
+        -- его кнопка «Вернуть в рейтинг» не снимет эту запись. Хранится
+        -- отдельно, чтобы «вернуть себя» и «вернуть по решению админа» не
+        -- путались в одном флаге.
+        CREATE TABLE IF NOT EXISTS rating_manual_hide (
+            kind       TEXT NOT NULL,
+            entity_id  INTEGER NOT NULL,
+            hidden_by  INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (kind, entity_id)
+        );
+
+        -- Уведомления по конкретным ботам.
+        --
+        -- Жалоба владельцев: «бот пишет в чат админов уведомления о новом ПЗ
+        -- и напоминания по ботам поддержки и анкетниц, а это не нужно».
+        -- Поэтому уведомления выключаются ПО БОТУ, а не целиком.
+        --
+        -- Отсутствие строки = уведомления включены (обратное совместимо с
+        -- базами, где раздел ещё не открывали).
+        CREATE TABLE IF NOT EXISTS bot_notify_settings (
+            owner_id        INTEGER NOT NULL,
+            bot_id          INTEGER NOT NULL,
+            notify_new_pz   INTEGER DEFAULT 1,
+            notify_reminders INTEGER DEFAULT 1,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (owner_id, bot_id)
+        );
+
+        -- Анкеты и поиск (раздел «🔎 Поиск» в YID).
+        --
+        -- Два разных типа людей: владелец бота ищет админов, админ ищет бот.
+        -- Поэтому анкеты разнесены по двум таблицам, а не в одну с флагом —
+        -- у них разный набор вопросов.
+        --
+        -- «—» (прочерк) хранится как пустая строка и означает «вопрос
+        -- пропущен». Это не то же самое, что «не заполнено»: анкета может
+        -- состоять из одного прочерка, и она всё равно считается заполненной.
+        CREATE TABLE IF NOT EXISTS bot_profiles (
+            bot_id      INTEGER PRIMARY KEY,
+            owner_id    INTEGER NOT NULL,
+            age_range   TEXT DEFAULT '',
+            category    TEXT DEFAULT '',
+            gender      TEXT DEFAULT '',
+            text        TEXT DEFAULT '',
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_profiles (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT DEFAULT '',
+            first_name  TEXT DEFAULT '',
+            age         TEXT DEFAULT '',
+            category    TEXT DEFAULT '',
+            pz_limit    TEXT DEFAULT '',
+            timezone    TEXT DEFAULT '',
+            hours       TEXT DEFAULT '',
+            text        TEXT DEFAULT '',
+            updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bot_profiles_owner
+            ON bot_profiles (owner_id);
+
+        -- Предложения и отклики между владельцами ботов и админами.
+        --
+        -- Один столбец ``kind`` на оба сценария: различаются они только тем,
+        -- кто и кому пишет. Отдельная таблица на каждый сценарий заставила бы
+        -- дублировать всю логику статусов и подсчёта откликов.
+        CREATE TABLE IF NOT EXISTS search_offers (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind         TEXT NOT NULL,
+            sender_id    INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            bot_id       INTEGER NOT NULL DEFAULT 0,
+            status       TEXT DEFAULT 'pending',
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            decided_at   TIMESTAMP,
+            UNIQUE(kind, sender_id, recipient_id, bot_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_offers_recipient
+            ON search_offers (kind, recipient_id, status);
+
+        CREATE INDEX IF NOT EXISTS idx_search_offers_sender
+            ON search_offers (kind, sender_id, status);
+
+        -- Кто смотрел чужую карточку: из этого считается «сколько админов
+        -- просмотрели карточку». Пишем по (зритель, карточка), повторный
+        -- просмотр того же не считаем.
+        CREATE TABLE IF NOT EXISTS search_views (
+            viewer_id   INTEGER NOT NULL,
+            target_kind TEXT NOT NULL,
+            target_id   INTEGER NOT NULL,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (viewer_id, target_kind, target_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_views_target
+            ON search_views (target_kind, target_id);
+
+        -- Сколько предложений человек уже разослал. Счётчик обнуляется по
+        -- суткам: окно нужно, чтобы рассылка не превращалась в спам.
+        CREATE TABLE IF NOT EXISTS search_daily (
+            user_id INTEGER NOT NULL,
+            day     TEXT NOT NULL,
+            sent    INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, day)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_admin_left_pz_owner
+            ON admin_left_pz (owner_id, admin_user_id);
+
         CREATE INDEX IF NOT EXISTS idx_outbox_pending
             ON outbox (status, next_attempt_at);
     """)

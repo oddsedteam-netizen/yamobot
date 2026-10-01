@@ -48,6 +48,10 @@ def register_all_handlers(dp: Dispatcher) -> None:
     from handlers.editor import router as editor_router
     from handlers.mailing import router as mailing_router
     from handlers.admins import router as admins_router
+    # Рассылка ПЗ об уходе админа. Общий код для всех путей удаления админа
+    # (карточка, ввод тега, админ вышел из чата) — подключаем рядом с админами,
+    # потому что его кнопки живут на экранах раздела админов.
+    from handlers.admin_left_pz import router as admin_left_pz_router
     from handlers.coowners import router as coowners_router
     from handlers.pz import router as pz_router
     from handlers.overview import router as overview_router
@@ -67,6 +71,17 @@ def register_all_handlers(dp: Dispatcher) -> None:
     from handlers.reminder_mutes import router as reminder_mutes_router
     # Раздел YID (внутренний номер и личная статистика админа).
     from handlers.yid import router as yid_router
+    # «🔎 Поиск» (анкеты, ленты, предложения) — кнопка в карточке YID.
+    from handlers.search import router as search_router
+    # Поиск по YID и списки номеров — только для владельца платформы.
+    from handlers.yid_admin import router as yid_admin_router
+    # «👤 Профиль+» — обзор ботов и людей с действиями над чужими
+    # профилями (отвязка чатов, удаление ботов, бан). Только супер-админ.
+    from handlers.profile_plus import router as profile_plus_router
+    # Рейтинг админов и ботов (кнопка «🏆 Рейтинг» в YID).
+    from handlers.rating import router as rating_router
+    # «🔔 Мои уведомления» в профиле: от каких ботов слать уведомления.
+    from handlers.notify_settings import router as notify_settings_router
     # Диагностика: проверка ботов и привязок с подсказками «что делать».
     from handlers.diagnostics import router as diagnostics_router
     from handlers.other import router as other_router
@@ -91,6 +106,7 @@ def register_all_handlers(dp: Dispatcher) -> None:
     dp.include_router(editor_router)
     dp.include_router(mailing_router)
     dp.include_router(admins_router)
+    dp.include_router(admin_left_pz_router)
     # Заходы/выходы в чат админов.
     dp.include_router(admin_chat_watch_router)
     dp.include_router(coowners_router)
@@ -118,6 +134,11 @@ def register_all_handlers(dp: Dispatcher) -> None:
     # YID держим после напоминалки: его кнопки живут в профиле, и порядок
     # не влияет на фильтры — регистрируем рядом с профилем для читаемости.
     dp.include_router(yid_router)
+    dp.include_router(search_router)
+    dp.include_router(yid_admin_router)
+    dp.include_router(profile_plus_router)
+    dp.include_router(rating_router)
+    dp.include_router(notify_settings_router)
     # Диагностика идёт следом: кнопка живёт в профиле рядом с YID.
     dp.include_router(diagnostics_router)
     # Нормы админов: кнопка «📊 Норма» в профиле + уведомления о недоборе.

@@ -302,6 +302,57 @@ def delete_banned_topic(bot_id: int, group_chat_id: int, topic_id: int) -> None:
         )
         conn.commit()
 
+def delete_banned_topics_for_user(bot_id: int, user_chat_id: int) -> int:
+    """Убирает ВСЕ маппинги «топик → юзер» указанного пользователя.
+
+    Нужно при разбане: у человека могло остаться несколько записей (например,
+    после пересоздания топика у него появился новый ``topic_id``). Чистим только
+    по ТОЧНОМУ топику, старые осиротевшие записи оставались бы и мешали
+    разбану в следующий раз.
+    """
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "DELETE FROM banned_topics WHERE bot_id = ? AND user_chat_id = ?",
+            (bot_id, user_chat_id),
+        )
+        conn.commit()
+        return cur.rowcount
+
+def get_orphan_banned_topics(bot_id: int) -> list[dict]:
+    """Забаненные топики бота, у которых больше НЕТ записи ПЗ.
+
+    Зачем
+    -----
+    Маппинг «топик → юзер» ищется по ``topic_id``. Если админ УДАЛИЛ топик
+    (а не просто закрыл) и создал новый, у нового топика другой
+    ``topic_id`` — маппинг по нему не находится, и ``/unban`` отвечал
+    «не удалось найти ПЗ для этого топика», хотя человек в списке числился
+    забаненным.
+
+    Поэтому, когда точный поиск не дал результата, ищем «осиротевшие»
+    маппинги: забаненные топики, для которых обращения в БД уже нет. Их
+    возвращаем от свежих к старым, чтобы первым в списке был самый
+    вероятный кандидат.
+    """
+    conn = _get_conn()
+    rows = conn.execute(
+        """
+        SELECT b.* FROM banned_topics b
+         WHERE b.bot_id = ?
+           AND NOT EXISTS (
+                 SELECT 1 FROM feedback_topics t
+                  WHERE t.bot_id = b.bot_id
+                    AND t.topic_id = b.topic_id
+                    AND t.group_chat_id = b.group_chat_id
+               )
+      ORDER BY b.banned_at DESC, b.rowid DESC
+        """,
+        (int(bot_id),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_all_topics_for_bot(bot_id: int) -> list[dict]:
     """Все топики бота."""
     conn = _get_conn()

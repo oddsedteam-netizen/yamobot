@@ -16,16 +16,21 @@ from aiogram.types import (
 )
 
 from handlers._common import (render_callback, cb_uid, msg_uid,
-                              msg_username, msg_firstname, try_edit,
-                              try_edit_answer)
+                              msg_username, msg_firstname, normalize_link,
+                              try_edit, try_edit_answer)
 from services.child_manager import ChildManager
 from services.config import is_super_admin
-from services.constants import BOT_VERSION
+from services.constants import (
+    BOT_VERSION,
+    SETTING_CHAT_URL,
+    SETTING_TGK_URL,
+)
 from services.storage import (
     get_admin_invite,
     consume_admin_invite,
     add_admin,
     get_admin_by_user_id,
+    get_app_setting,
     register_user,
     is_registry_user_banned,
     get_user_bots,
@@ -109,8 +114,59 @@ async def _show_main(message: Message) -> None:
             [InlineKeyboardButton(text="❓ FAQ", callback_data="faq", style="success")],
             [InlineKeyboardButton(text="📚 Обучение", callback_data="other_tutorial",
                                   style="primary")],
+            *_welcome_links_row(),
         ]),
     )
+
+
+def _welcome_links_row() -> list[list[InlineKeyboardButton]]:
+    """Зелёный ряд «ТГК» / «Чат» под FAQ и обучением.
+
+    Ссылки задаёт владелец платформы: «🛡 Админ-панель → 🔗 Настройки ссылок».
+    Пока ссылка не задана, кнопки не показываются вовсе — пустая кнопка,
+    которая никуда не ведёт, только сбивает с толку. Заданы обе — стоят в
+    ряд; задана одна — занимает весь ряд.
+    """
+    row: list[InlineKeyboardButton] = []
+    for setting_key, label in ((SETTING_TGK_URL, "📢 ТГК"),
+                               (SETTING_CHAT_URL, "💬 Чат")):
+        url = normalize_link(get_app_setting(setting_key))
+        if url:
+            row.append(InlineKeyboardButton(text=label, url=url, style="success"))
+    return [row] if row else []
+
+
+async def _open_profile_link(message: Message, state: FSMContext) -> bool:
+    """Открывает профиль по deep-link ``?start=profile_<user_id>``.
+
+    Кнопка «👤 Профиль+» в админ-панели и в поиске по YID ведёт сюда.
+
+    Доступ — только владельцу платформы. Ссылка формально открыта любому,
+    кто её получил, но профиль другого человека показывать нельзя: в нём
+    статистика и внутренние разделы. Поэтому чужая ссылка честно отвечает
+    отказом, а не «молча» уходит в главное меню.
+
+    Возвращает ``True``, если профиль показан (апдейт обработан).
+    """
+    text = message.text or ""
+    raw = text.split("profile_", 1)[1].strip().split()[0]
+    if not raw.isdigit() or int(raw) <= 0:
+        return False
+
+    target_id = int(raw)
+    if not is_super_admin(msg_uid(message)):
+        await message.answer("⛔ Доступ запрещён")
+        return True
+    if target_id != msg_uid(message):
+        await message.answer("⛔ Доступ запрещён")
+        return True
+
+    await state.clear()
+    from handlers.yid import show_yid_card
+
+    text, kb = show_yid_card(target_id)
+    await message.answer(text, reply_markup=kb)
+    return True
 
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -174,6 +230,9 @@ async def cmd_start(message: Message, state: FSMContext,
         token = message.text.split("config_", 1)[1].strip().split()[0]
         await _apply_config_link(message, token, child_manager)
         return
+    if message.text and "profile_" in message.text:
+        if await _open_profile_link(message, state):
+            return
     await _show_main(message)
 
 

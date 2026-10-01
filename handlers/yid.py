@@ -40,6 +40,11 @@ from services.storage import (
     set_admin_greeting,
 )
 from services.db.yid import admin_bots_of, yid_card
+from services.storage import (
+    RATING_ADMIN,
+    is_hidden_from_rating,
+    set_rating_optout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,7 @@ def _card_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     card = yid_card(user_id)
     label = f"Y{card['yid']}" if card["yid"] else "—"
     registered = (card["registered_at"] or "—")[:19].replace("T", " ")
+    i_am_hidden = is_hidden_from_rating(RATING_ADMIN, user_id)
 
     name_line = f"👤 Имя: <b>{html_escape(card['first_name']) or '—'}</b>"
     if card["username"]:
@@ -119,15 +125,64 @@ def _card_payload(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         "\nℹ️ Здесь только твои цифры. Общая статистика ботов тебе не показывается."
     )
 
+    # Порядок кнопок — по убыванию важности, как просил владелец:
+    #   1. «Я — админ»   — во весь ширину: личная статистика по админским ботам.
+    #   2. «Моё приветствие» — во весь ширину: настройка текста под себя.
+    #   3. «Поиск» и «Рейтинг» — в один ряд: два главных действия раздела.
+    #   4. «Вне рейтинга» — во весь ширину: осознанный выход из топа.
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👤 Я — админ",
                               callback_data="yid_my_admins", style="primary")],
         [InlineKeyboardButton(text="💬 Моё приветствие",
                               callback_data="yid_greeting_bots", style="primary")],
+        [InlineKeyboardButton(text="🔎 Поиск",
+                              callback_data="search_open", style="success"),
+         InlineKeyboardButton(text="🏆 Рейтинг",
+                              callback_data="yid_rating", style="success")],
+        [InlineKeyboardButton(
+            text=("🔙 Вернуть меня в рейтинг" if i_am_hidden
+                  else "🚫 Вне рейтинга (я)"),
+            callback_data="yid_rating_out", style="danger")],
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile_show",
                               style="primary")],
     ])
     return "\n".join(lines), kb
+
+
+def show_yid_card(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Карточка YID для показа СНАРУЖИ раздела (например, по deep-link).
+
+    Публичная обёртка над ``_card_payload``: кнопка «👤 Профиль+» в
+    админ-панели ведёт в бота по ссылке ``?start=profile_<id>``, и там
+    нужно собрать тот же экран, что и по кнопке «🆔 YID». Дублировать
+    сборку карточки нельзя — разъедутся со временем.
+    """
+    return _card_payload(user_id)
+
+
+@router.callback_query(F.data == "yid_rating_out")
+async def cb_yid_rating_out(callback: CallbackQuery) -> None:
+    """Кнопка «🚫 Вне рейтинга» прямо в карточке YID.
+
+    Отвечает тем же тумблером, что и кнопка в самом рейтинге: нажать второй
+    раз — вернуться в топ. Сразу объясняем, что будет: молча убрать
+    человека из общего топа неудобно, человек решит, что это ошибка.
+    """
+    user_id = cb_uid(callback)
+    hidden = is_hidden_from_rating(RATING_ADMIN, user_id)
+    set_rating_optout(RATING_ADMIN, user_id, not hidden)
+
+    if hidden:
+        await callback.answer("✅ Ты снова в рейтинге админов")
+    else:
+        await callback.answer(
+            "🙈 Ты убран из рейтинга админов.\n\n"
+            "Твои личные цифры по-прежнему видны тебе здесь и в разделе "
+            "«👤 Я — админ». Нажми ещё раз, чтобы вернуться.",
+            show_alert=True,
+        )
+    text, kb = _card_payload(user_id)
+    await render_callback(callback, text, kb)
 
 
 @router.callback_query(F.data == "yid_card")

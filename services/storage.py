@@ -20,9 +20,9 @@ from services.db.admins import (
     get_admin_by_tag, get_admin_by_user_id, get_admin_invite, get_admin_invite_owner,
     get_admin_message_stats, get_admin_tag_history, get_admins_all,
     get_all_admins_stats, get_bot_owner, get_coowners, get_owner_admin_invites,
-    import_users_bulk, is_coowner, is_user_banned, remove_admin,
-    remove_coowner, set_bot_keyboard, unban_user, update_admin_invite_uses,
-    update_admin_tag
+    get_user_banned_bots, import_users_bulk, is_coowner, is_user_banned,
+    remove_admin, remove_coowner, set_bot_keyboard, unban_user,
+    unban_user_everywhere, update_admin_invite_uses, update_admin_tag
 )
 from services.db.bots import (
     ACTION_ADMIN, DEFAULT_ADMIN_CHANGE_LIMIT, DEFAULT_PZ_CATEGORIES,
@@ -61,6 +61,20 @@ from services.db.logs_db import (
     format_user_logs, get_bot_errors, get_owner_bot_errors, get_user_logs,
     save_bot_error, save_log_message
 )
+from services.db.marketplace import (
+    DAILY_OFFER_LIMIT, DASH, OFFER_ADMIN_TO_BOT, OFFER_BOT_TO_ADMIN,
+    REOFFER_COOLDOWN_HOURS, STATUS_ACCEPTED, STATUS_DECLINED, STATUS_PENDING, add_offer,
+    admin_profiles_feed, bot_profiles_feed, bump_daily_sent, count_offers,
+    count_offers_received, count_profile_views, delete_admin_profile,
+    delete_bot_profile, find_offer, get_admin_profile, get_bot_profile,
+    get_daily_sent, get_offer, mark_profile_viewed, offer_send_block,
+    offers_inbox, purge_old_search_days, set_admin_profile, set_bot_profile,
+    set_offer_status
+)
+from services.db.notify_settings import (
+    delete_bot_notify_settings, get_bot_notify_settings, get_notify_settings_map,
+    is_bot_notify_enabled, set_bot_notify_field
+)
 from services.db.norms import (
     clear_antinakrutka_snapshot, get_admin_period_messages, get_all_norm_settings,
     get_norm_period_stats, get_norm_settings, set_norm_field
@@ -72,11 +86,17 @@ from services.db.outbox import (
     purge_outbox, reschedule_outbox
 )
 from services.db.protection import (
-    get_admin_active_topics_list, get_antinakrutka_settings, get_antiraid_settings,
-    is_registry_user_banned, reset_all_antiraid_triggered, set_antinakrutka_field,
-    set_antinakrutka_triggered, set_antiraid_del_links, set_antiraid_del_members,
-    set_antiraid_enabled, set_antiraid_field, set_antiraid_threshold,
-    set_antiraid_triggered, set_registry_user_blocked
+    count_admin_left_pz, delete_admin_left_pz, get_admin_active_topics_list,
+    get_admin_left_pz, get_antinakrutka_settings, get_antiraid_settings,
+    is_registry_user_banned, release_admin_from_topics, reset_all_antiraid_triggered,
+    set_antinakrutka_field, set_antinakrutka_triggered, set_antiraid_del_links,
+    set_antiraid_del_members, set_antiraid_enabled, set_antiraid_field,
+    set_antiraid_threshold, set_antiraid_triggered, set_registry_user_blocked
+)
+from services.db.rating import (
+    RATING_ADMIN, RATING_BOT, RATING_LIMIT, admin_rating, bot_rating,
+    get_manual_hides, get_rating_optouts, is_hidden_from_rating,
+    is_manually_hidden, set_manual_hide, set_rating_optout
 )
 from services.db.reminders import (
     MUTE_DAY, MUTE_DAY_HOURS, MUTE_FOREVER, add_reminder, add_reminder_mute,
@@ -103,9 +123,9 @@ from services.db.support import (
 )
 from services.db.topics import (
     assign_admin_to_topic, clear_feedback_chat, create_topic_record,
-    delete_banned_topic, delete_topic_record, delete_topics_for_owner_user,
+    delete_banned_topic, delete_banned_topics_for_user, delete_topic_record, delete_topics_for_owner_user,
     get_all_topics_for_bot, get_banned_topic_user, get_feedback_chat,
-    get_feedback_msg_by_group_msg, get_feedback_msg_by_user_msg,
+    get_feedback_msg_by_group_msg, get_feedback_msg_by_user_msg, get_orphan_banned_topics,
     get_pinned_message_id, get_pz_stats, get_topic_by_topic_id,
     get_topic_by_user, get_topic_by_user_id_search, get_user_info_from_pz,
     is_topic_reserved, reserve_topic_slot, reset_topic_admin, save_banned_topic,
@@ -144,48 +164,52 @@ __all__ = [
     "ACTION_ADMIN", "BASE_DIR", "DATA_DIR", "DB_PATH", "DEFAULT_ADMIN_CHANGE_LIMIT", "DEFAULT_PZ_CATEGORIES",
     "DEFAULT_WORK_END", "DEFAULT_WORK_MESSAGE", "DEFAULT_WORK_START", "ERRORS_PER_BOT", "LOG_MAX_CHARS", "LOG_MAX_MESSAGES",
     "MAX_ADMIN_CHANGE_LIMIT", "MAX_CUSTOM_CATEGORIES", "MUTE_DAY", "MUTE_DAY_HOURS", "MUTE_FOREVER", "OUTBOX_FAILED",
-    "OUTBOX_PENDING", "OUTBOX_SENT", "TICKET_CATEGORIES", "TICKET_CATEGORY_TITLES", "YID_START", "_get_conn",
+    "OUTBOX_PENDING", "OUTBOX_SENT", "OFFER_ADMIN_TO_BOT", "OFFER_BOT_TO_ADMIN", "RATING_ADMIN", "RATING_BOT", "RATING_LIMIT", "REOFFER_COOLDOWN_HOURS",
+    "STATUS_ACCEPTED", "STATUS_DECLINED", "STATUS_PENDING", "TICKET_CATEGORIES", "TICKET_CATEGORY_TITLES", "YID_START", "_get_conn",
+    "DASH", "DAILY_OFFER_LIMIT",
     "_lock", "add_admin", "add_admin_chat_moderator", "add_admin_message", "add_channel_giveaway", "add_channel_post",
-    "add_child_user", "add_coowner", "add_custom_category", "add_reminder", "add_reminder_mute", "add_stat",
-    "add_user_bot", "add_user_warn", "admin_bots_of", "admin_changes_left", "admin_stats_in_bot", "assign_admin_to_topic",
-    "ban_user", "bind_channel", "bot_display_name", "clear_antinakrutka_snapshot", "clear_bot_dead", "clear_channel_bind_request",
+    "add_child_user", "add_coowner", "add_custom_category", "add_offer", "add_reminder", "add_reminder_mute", "add_stat",
+    "add_user_bot", "add_user_warn", "admin_bots_of", "admin_changes_left", "admin_profiles_feed", "admin_rating", "admin_stats_in_bot", "assign_admin_to_topic",
+    "ban_user", "bind_channel", "bot_display_name", "bot_profiles_feed", "bot_rating", "bump_daily_sent", "clear_antinakrutka_snapshot", "clear_bot_dead", "clear_channel_bind_request",
     "clear_feedback_chat", "clear_stats_offsets", "clear_user_mute_for_owner", "clear_user_restriction", "clear_user_restriction_for_owner", "close_ticket",
-    "complaints_count", "consume_admin_invite", "count_active_mutes", "count_admin_changes_today", "count_channel_posts", "create_admin_invite",
+    "complaints_count", "consume_admin_invite", "count_active_mutes", "count_admin_changes_today", "count_admin_left_pz",
+    "count_channel_posts", "count_offers", "count_offers_received", "count_profile_views", "create_admin_invite",
     "create_bot_config", "create_complaint", "create_ticket", "create_topic_record", "create_transfer", "default_bot_keyboard",
-    "delete_admin_greeting", "delete_admin_invite", "delete_banned_topic", "delete_bot_config", "delete_channel_post", "delete_reminder",
+    "delete_admin_greeting", "delete_admin_invite", "delete_admin_left_pz", "delete_admin_profile", "delete_banned_topic", "delete_banned_topics_for_user", "delete_bot_config", "delete_bot_notify_settings", "delete_bot_profile",
+    "delete_channel_post", "delete_reminder",
     "delete_reminder_mute", "delete_topic_record", "delete_topics_for_owner_user", "delete_transfer", "enqueue_outbox", "ensure_admin",
-    "ensure_db", "ensure_yid", "fail_outbox", "fail_pending_for_chat", "fetch_due_outbox", "format_bot_errors", "format_user_logs",
+    "ensure_db", "ensure_yid", "fail_outbox", "fail_pending_for_chat", "fetch_due_outbox", "find_offer", "format_bot_errors", "format_user_logs",
     "get_accessible_bots", "get_admin_active_topics", "get_admin_active_topics_list", "get_admin_by_tag", "get_admin_by_user_id", "get_admin_change_settings",
-    "get_admin_chat_moderators", "get_admin_greeting", "get_admin_invite", "get_admin_invite_owner", "get_admin_message_stats", "get_admin_period_messages",
+    "get_admin_chat_moderators", "get_admin_greeting", "get_admin_invite", "get_admin_invite_owner", "get_admin_left_pz", "get_admin_message_stats", "get_admin_period_messages",
     "get_admin_tag_history", "get_admins_all", "get_all_admins_stats", "get_all_bots_flat", "get_all_enabled_reminders", "get_all_norm_settings",
     "get_all_stats", "get_all_tickets", "get_all_topics_for_bot", "get_all_users_registry", "get_antinakrutka_settings", "get_antiraid_settings",
     "get_antispam_mode", "get_app_setting", "get_banned_topic_user", "get_bot_by_id", "get_bot_by_id_any_owner", "get_bot_config",
     "get_bot_config_by_bot", "get_bot_errors", "get_bot_keyboard", "get_bot_keyboard_by_bot", "get_bot_keyboard_raw", "get_bot_links",
-    "get_bot_owner", "get_bot_type", "get_bound_channel", "get_bound_chat", "get_cat_ask_settings", "get_cat_custom",
+    "get_bot_owner", "get_bot_type", "get_bound_channel", "get_bound_chat", "get_bot_notify_settings", "get_bot_profile", "get_cat_ask_settings", "get_cat_custom",
     "get_categories_for_pz", "get_channel_bind_request", "get_channel_giveaways", "get_channel_owner", "get_channel_post", "get_channel_posts",
-    "get_child_users", "get_child_users_count", "get_complaint", "get_complaints", "get_coowners", "get_dead_bots",
-    "get_due_channel_posts", "get_emoji_map", "get_feedback_chat", "get_feedback_msg_by_group_msg", "get_feedback_msg_by_user_msg", "get_last_admin_reply_at",
-    "get_muted_topic_keys", "get_norm_period_stats", "get_norm_settings", "get_owner_admin_invites", "get_owner_bot_errors", "get_owner_by_admin_chat",
-    "get_owner_users", "get_pending_bind", "get_pinned_message_id", "get_pz_stats", "get_raw_counts", "get_reminder_mutes", "get_reminder_quiet",
+    "get_admin_profile", "get_child_users", "get_child_users_count", "get_complaint", "get_complaints", "get_coowners", "get_dead_bots",
+    "get_due_channel_posts", "get_daily_sent", "get_emoji_map", "get_feedback_chat", "get_feedback_msg_by_group_msg", "get_feedback_msg_by_user_msg", "get_last_admin_reply_at",
+    "get_muted_topic_keys", "get_manual_hides", "get_norm_period_stats", "get_notify_settings_map", "get_norm_settings", "get_offer", "get_orphan_banned_topics", "get_owner_admin_invites", "get_owner_bot_errors", "get_owner_by_admin_chat",
+    "get_owner_users", "get_pending_bind", "get_pinned_message_id", "get_pz_stats", "get_raw_counts", "get_rating_optouts", "get_reminder_mutes", "get_reminder_quiet",
     "get_reminder_tick", "get_reminders", "get_stats", "get_stats_offsets", "get_ticket", "get_topic_by_topic_id",
-    "get_topic_by_user", "get_topic_by_user_id_search", "get_topics_waiting_admin", "get_topics_without_admin", "get_transfer", "get_user_bot_configs",
+    "get_topic_by_user", "get_topic_by_user_id_search", "get_topics_waiting_admin", "get_topics_without_admin", "get_transfer", "get_user_banned_bots", "get_user_bot_configs",
     "get_user_bot_types", "get_user_bots", "get_user_info_from_pz", "get_user_logs", "get_user_registry", "get_user_restriction",
     "get_user_tickets", "get_warn_settings", "get_work_hours", "get_yid", "get_yid_owner", "import_users_bulk",
-    "is_admin_chat_moderator", "is_bot_anonymous", "is_bot_dead", "is_coowner", "is_registry_user_banned", "is_topic_reserved",
+    "is_admin_chat_moderator", "is_bot_anonymous", "is_bot_dead", "is_bot_notify_enabled", "is_coowner", "is_hidden_from_rating", "is_manually_hidden", "is_registry_user_banned", "is_topic_reserved",
     "is_user_banned", "is_user_muted", "is_within_work_hours", "log_admin_change", "mark_bot_dead",
-    "mark_outbox_sent", "mark_user_blocked", "normalize_config_code", "outbox_counts", "outbox_counts_for_bots", "outbox_counts_for_owner", "outbox_failed_list", "owner_topic_keys",
-    "purge_expired_mutes", "purge_outbox", "purge_topic_reminder_state", "register_user", "remember_custom_emoji", "remove_admin",
+    "mark_outbox_sent", "mark_profile_viewed", "mark_user_blocked", "normalize_config_code", "offer_send_block", "outbox_counts", "outbox_counts_for_bots", "outbox_counts_for_owner", "outbox_failed_list", "offers_inbox", "owner_topic_keys",
+    "purge_expired_mutes", "purge_old_search_days", "purge_outbox", "purge_topic_reminder_state", "register_user", "release_admin_from_topics", "remember_custom_emoji", "remove_admin",
     "remove_admin_chat_moderator", "remove_coowner", "remove_custom_category", "remove_dead_bots", "remove_user_bot", "reschedule_outbox",
     "reserve_topic_slot", "reset_all_antiraid_triggered", "reset_reminder_countdown", "reset_topic_admin", "reset_user_warns",
     "reset_user_warns_for_owner", "save_banned_topic", "save_bot_error", "save_feedback_message", "save_log_message", "save_mailing",
-    "set_admin_change_enabled", "set_admin_change_limit", "set_admin_greeting", "set_antinakrutka_field", "set_antinakrutka_triggered", "set_antiraid_del_links",
+    "set_admin_change_enabled", "set_admin_change_limit", "set_admin_greeting", "set_admin_profile", "set_antinakrutka_field", "set_antinakrutka_triggered", "set_antiraid_del_links",
     "set_antiraid_del_members", "set_antiraid_enabled", "set_antiraid_field", "set_antiraid_threshold", "set_antiraid_triggered", "set_antispam_mode",
-    "set_app_setting", "set_bot_anonymous", "set_bot_keyboard", "set_bot_links", "set_bot_type", "set_bound_chat",
+    "set_app_setting", "set_bot_anonymous", "set_bot_keyboard", "set_bot_links", "set_bot_notify_field", "set_bot_profile", "set_bot_type", "set_bound_chat", "set_offer_status",
     "set_cat_ask_categories", "set_cat_ask_enabled", "set_cat_custom", "set_channel_bind_request", "set_complaint_status", "set_feedback_chat",
-    "set_links_for_all", "set_norm_field", "set_pending_bind", "set_pinned_message_id", "set_registry_user_blocked", "set_reminder_enabled", "set_reminder_quiet",
+    "set_links_for_all", "set_manual_hide", "set_norm_field", "set_pending_bind", "set_pinned_message_id", "set_rating_optout", "set_registry_user_blocked", "set_reminder_enabled", "set_reminder_quiet",
     "set_reminder_tick", "set_stats_offsets", "set_topic_closed", "set_topic_id", "set_user_ban", "set_user_mute",
     "set_warn_settings", "set_welcome_bundle_for_all", "set_welcome_for_all", "set_work_hours_enabled", "set_work_hours_message", "set_work_hours_time",
     "ticket_counts", "ticket_photos", "toggle_custom_category", "touch_topic_activity", "transfer_all_rights", "transfer_bot",
-    "unban_user", "unbind_channel", "update_admin_invite_uses", "update_admin_tag", "update_bot_config", "update_bot_field",
+    "unban_user", "unban_user_everywhere", "unbind_channel", "update_admin_invite_uses", "update_admin_tag", "update_bot_config", "update_bot_field",
     "update_channel_info", "update_channel_post", "utc_to_msk", "yid_card", "yid_label",
 ]

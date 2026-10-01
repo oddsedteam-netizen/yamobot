@@ -23,8 +23,10 @@ from services.child_manager import ChildManager
 from services.config import is_super_admin, proxy_settings
 from services.constants import (
     BOT_VERSION,
+    SETTING_CHAT_URL,
     SETTING_DONATE_URL,
     SETTING_TEST_BOT_URL,
+    SETTING_TGK_URL,
     SETTING_YAMOCHAN_URL,
 )
 from services.storage import (
@@ -149,7 +151,10 @@ def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🎫 Тикеты", callback_data="tickets_admin", style="primary"),
-            InlineKeyboardButton(text="👤 Владелец бота", callback_data="adm_owner_pick",
+            # «👤 Профиль+» вместо прежнего «👤 Владелец бота»: он открывал
+            # только список ботов, и посмотреть человека, у которого ботов
+            # нет, было невозможно. Теперь это развилка «боты / ВЛД».
+            InlineKeyboardButton(text="👤 Профиль+", callback_data="profile_plus",
                                  style="primary"),
         ],
         [
@@ -159,6 +164,17 @@ def admin_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Сводка", callback_data="adm_overview", style="primary"),
             InlineKeyboardButton(text="👥 Профили", callback_data="profiles_list", style="primary"),
+        ],
+        # YID — поиск человека по номеру и списки «с номером / без номера».
+        [
+            InlineKeyboardButton(text="🆔 YID: поиск", callback_data="yid_list",
+                                 style="primary"),
+        ],
+        # Рейтинг — управление топом вручную: убрать админа или бота, чтобы
+        # они не попадали в топ и не вернулись сами (см. handlers/rating).
+        [
+            InlineKeyboardButton(text="🏆 Рейтинг", callback_data="rating_admin",
+                                 style="primary"),
         ],
         [
             # Удаление ОДНОГО бота — с подтверждением (не «удалить всё сразу»).
@@ -1010,6 +1026,11 @@ def _profile_payload(user_id: int, first_name: str) -> tuple[str, InlineKeyboard
         # YID — зелёным и на всю ширину: это про сотрудника (его номер Y100+
         # и личная статистика по админским ботам), а не про владельца.
         [InlineKeyboardButton(text="🆔 YID", callback_data="yid_card", style="success")],
+        # Мои уведомления — зелёным и на всю ширину: от каких ботов слать
+        # «новое ПЗ» и напоминания. Частая жалоба — лишние уведомления от
+        # ботов поддержки и анкетниц, поэтому раздел должен быть виден сразу.
+        [InlineKeyboardButton(text="🔔 Мои уведомления",
+                              callback_data="profile_notify", style="success")],
         [InlineKeyboardButton(text="📂 Мои ссылки и конфиги", callback_data="my_links",
                               style="success")],
     ])
@@ -1121,6 +1142,58 @@ def _user_display(user_id: int) -> str:
     if u:
         return u.get("username") or u.get("first_name") or f"ID:{user_id}"
     return f"ID:{user_id}"
+
+
+# ═══════════════ Кнопка «👤 Профиль+» ═══════════════
+#
+# Что это
+# -------
+# Кнопка-ссылка, которая открывает ПРОФИЛЬ конкретного человека в основном
+# боте — так, как его увидит сам он: с его YID, его статистикой и его
+# собственными кнопками («Я — админ», «Моё приветствие», «Поиск»).
+#
+# Зачем
+# -----
+# Раньше карточка в админ-панели и в поиске по YID показывала данные
+# администратору, но не давала «показать человеку его же профиль» — то
+# есть нельзя было открыть в боте ровно то, что увидит владелец. Эта
+# кнопка решает именно это: один тап — и профиль открыт в боте.
+#
+# Почему это deep-link, а не ``callback_data``
+# ------------------------------------------
+# Профиль — это ЭКРАН пользователя, а не админский раздел. Открывать его
+# должен бот от первого лица пользователя, а колбэк всегда обрабатывается
+# от того, кто НАЖАЛ. Поэтому кнопка ведёт по ссылке ``t.me/<bot>?start=...``:
+# бот открывается у пользователя, проверяет, что он super_admin (иначе
+# чужой профиль ему не показываем), и рисует его карточку.
+#
+# Ссылка собирается из username мастер-бота, а не из настройки: username
+# бота — его визитка и меняется только владельцем Telegram, в отличие от
+# ссылки, которую можно случайно очистить в настройках.
+
+
+async def _profile_deep_link(bot, user_id: int) -> str:
+    """Ссылка «открыть профиль <user_id> в боте».
+
+    Возвращает пустую строку, если username бота неизвестен: тогда кнопку
+    не показываем вовсе, чтобы не вести в никуда.
+    """
+    try:
+        me = await bot.get_me()
+    except Exception:
+        return ""
+    username = getattr(me, "username", "") or ""
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=profile_{int(user_id)}"
+
+
+async def profile_link_row(bot, user_id: int) -> list[InlineKeyboardButton]:
+    """Ряд с кнопкой «👤 Профиль+» (пустой ряд, если ссылка недоступна)."""
+    url = await _profile_deep_link(bot, user_id)
+    if not url:
+        return []
+    return [InlineKeyboardButton(text="👤 Профиль+", url=url, style="success")]
 
 
 def _rights_lines_from(transfer: dict) -> list[str]:
@@ -1397,6 +1470,18 @@ _LINK_FIELDS: dict[str, tuple[str, str, str]] = {
         "Ссылка на тестового бота. Используется кнопкой «➡️ Перейти» "
         "в разделе «✨ Прочее».",
     ),
+    "tgk": (
+        SETTING_TGK_URL,
+        "📢 ТГК",
+        "Ссылка на Telegram-канал. Появится зелёной кнопкой «📢 ТГК» "
+        "в приветственном сообщении бота — рядом с FAQ и обучением.",
+    ),
+    "chat": (
+        SETTING_CHAT_URL,
+        "💬 Чат",
+        "Ссылка на чат поддержки. Появится зелёной кнопкой «💬 Чат» "
+        "в приветственном сообщении бота — рядом с FAQ и обучением.",
+    ),
 }
 
 
@@ -1407,6 +1492,9 @@ def _links_settings_text() -> str:
         "",
         "Здесь задаются ссылки для раздела «🟢 Прочее». Если ссылка не задана, "
         "кнопки в разделе покажут подсказку вместо перехода.",
+        "",
+        "Ссылки на <b>ТГК</b> и <b>Чат</b> показываются в приветственном "
+        "сообщении бота — под FAQ и обучением.",
         "",
     ]
     for key, (setting_key, title, _hint) in _LINK_FIELDS.items():
@@ -1612,7 +1700,15 @@ async def cb_profile_view(callback: CallbackQuery) -> None:
         f"🤖 Ботов: <b>{len(bots)}</b>\n"
         f"📌 Статус: {status}"
     )
-    await render_callback(callback, text, profile_admin_kb(uid))
+    # «👤 Профиль+» — открыть профиль этого человека в боте (deep-link).
+    # Если username бота неизвестен, ряд пустой и кнопки не будет вовсе.
+    rows: list[list[InlineKeyboardButton]] = []
+    link_row = await profile_link_row(callback.bot, uid)
+    if link_row:
+        rows.append(link_row)
+    for row in profile_admin_kb(uid).inline_keyboard:
+        rows.append(list(row))
+    await render_callback(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(F.data.startswith("profile_ban_"))

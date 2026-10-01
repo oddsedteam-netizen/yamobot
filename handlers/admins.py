@@ -11,7 +11,7 @@ from aiogram.types import (
 from handlers._common import (render_callback, cb_data, cb_uid, event_bot, msg_uid,
                               try_edit_answer)
 from handlers.admin_chat_watch import chat_human_count
-from services.child_manager import ChildManager
+from handlers.admin_left_pz import offer_left_pz_mailing
 from services.constants import MIN_ADMIN_INVITE_USES, MAX_ADMIN_INVITE_USES
 from services.storage import (
     get_bound_chat,
@@ -24,7 +24,6 @@ from services.storage import (
     get_admin_tag_history,
     get_admin_message_stats,
     get_admin_active_topics,
-    get_admin_active_topics_list,
     get_all_admins_stats,
     create_admin_invite,
     utc_to_msk,
@@ -308,6 +307,11 @@ async def cb_delete_one_admin(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.callback_query(F.data.regexp(r"^gadmins_delconfirm_\d+$"))
 async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    """Удаляет админа и предлагает рассылку по его ПЗ.
+
+    Само предложение живёт в ``handlers.admin_left_pz`` — тем же кодом
+    пользуются удаление по тегу и сценарий «админ вышел из чата админов».
+    """
     await state.clear()
     admin_user_id = int(cb_data(callback).split("_")[-1])
     owner_id = cb_uid(callback)
@@ -317,95 +321,11 @@ async def cb_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     tag = admin["tag"] if admin else "?"
 
     remove_admin(owner_id, admin_user_id)
-
-    # Сколько ПЗ закреплено за этим админом (для опроса о рассылке).
-    topics = get_admin_active_topics_list(owner_id, admin_user_id)
-    n = len(topics)
-
-    if n == 0:
-        await _finish_admin_deleted(callback, uname, tag)
-        return
-
-    text = (
-        f"🗑 <b>Админ удалён</b>\n\n"
-        f"👤 {uname}\n🏷 #{tag}\n\n"
-        f"У него было ПЗ: <b>{n}</b>\n\n"
-        f"Хотите сделать рассылку по ПЗ админа с оповещением об уходе?"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, разослать", callback_data=f"gadmins_delmail_yes_{admin_user_id}", style="success")],
-        [InlineKeyboardButton(text="❌ Нет", callback_data=f"gadmins_delmail_no_{admin_user_id}")],
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
-    ])
-    await render_callback(callback, text, kb)
+    await offer_left_pz_mailing(callback, owner_id, admin_user_id, uname, tag)
 
 
-async def _finish_admin_deleted(callback: CallbackQuery, uname: str, tag: str) -> None:
-    """Финальный экран после удаления админа (когда рассылка не нужна)."""
-    text = f"✅ <b>Админ удалён!</b>\n\n👤 {uname}\n🏷 #{tag}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
-    ])
-    await render_callback(callback, text, kb)
-
-
-@router.callback_query(F.data.regexp(r"^gadmins_delmail_no_\d+$"))
-async def cb_delmail_no(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await render_callback(callback, "👌 Ок", InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")]
-    ]))
-
-
-@router.callback_query(F.data.regexp(r"^gadmins_delmail_yes_\d+$"))
-async def cb_delmail_yes(callback: CallbackQuery,
-                         child_manager: ChildManager) -> None:
-    admin_user_id = int(cb_data(callback).split("_")[-1])
-    owner_id = cb_uid(callback)
-
-    topics = get_admin_active_topics_list(owner_id, admin_user_id)
-    sent = 0
-    failed = 0
-
-    for t in topics:
-        bot_id = t["bot_id"]
-        user_chat_id = t["user_chat_id"]
-        bot = child_manager.get_bot(bot_id)
-        if bot is None:
-            failed += 1
-            continue
-        try:
-            await bot.send_message(
-                chat_id=user_chat_id,
-                text="⚠️ <b>Ваш администратор покинул бота.</b>\n\n"
-                     "Мы подберём вам нового. Нажмите кнопку ниже, чтобы ускорить процесс.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="👀 Подобрать нового",
-                        # Именно find_admin_: такой callback_data обрабатывает
-                        # хендлер «Найти админа» в дочернем боте. Раньше здесь
-                        # был picknew_, под который обработчика не существовало —
-                        # кнопка просто не работала.
-                        callback_data=f"find_admin_{t['topic_id']}_{t['group_chat_id']}",
-                    )]
-                ]),
-            )
-            sent += 1
-        except Exception:
-            failed += 1
-
-    text = (
-        f"📨 <b>Рассылка завершена</b>\n\n"
-        f"✅ Отправлено ПЗ: <b>{sent}</b>\n"
-        f"❌ Ошибок: <b>{failed}</b>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
-        [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
-    ])
-    await render_callback(callback, text, kb)
+# Обработчики «разослать / не разослать» живут в handlers/admin_left_pz.py:
+# тем же кодом пользуются удаление по тегу и сценарий «админ вышел из чата».
 
 
 # ═══════════════ Статистика ═══════════════
@@ -670,13 +590,12 @@ async def fsm_delete_admin(message: Message, state: FSMContext) -> None:
     remove_admin(msg_uid(message), admin["user_id"])
     await state.clear()
 
-    await message.answer(
-        f"✅ <b>Админ удалён!</b>\n\n👤 {uname} #{tag}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Список", callback_data="gadmins_list", style="primary")],
-            [InlineKeyboardButton(text="⬅️ Меню админов", callback_data="gadmins", style="primary")],
-        ])
-    )
+    # Тот же вопрос о рассылке, что и при удалении из карточки. Раньше путь
+    # «удалить по тегу» удалял админа молча, и владелец узнавал об уходе
+    # только тогда, когда ему писали ПЗ — то есть предложение рассылки
+    # работало лишь на одном из двух путей удаления.
+    await offer_left_pz_mailing(message, msg_uid(message),
+                                admin["user_id"], uname, tag)
 # ═══════════════ Редактор тегов ═══════════════
 
 @router.callback_query(F.data == "gadmins_edit")

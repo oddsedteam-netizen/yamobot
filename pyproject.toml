@@ -1,6 +1,6 @@
 [project]
 name = "yamobot"
-version = "1.22.0"
+version = "1.32.0"
 description = "YamoBot — конструктор Telegram-ботов с ПЗ, админами и защитой"
 requires-python = ">=3.11"
 dependencies = [

@@ -92,6 +92,90 @@ def get_admin_active_topics_list(owner_id: int, admin_user_id: int) -> list[dict
     ).fetchall()
     return [dict(r) for r in rows]
 
+def release_admin_from_topics(owner_id: int, admin_user_id: int) -> int:
+    """Снимает админа со всех его активных ПЗ и ЗАПОМИНАЕТ их список.
+
+    Зачем запоминать
+    ----------------
+    Владельцу удаляют админа, и сразу после этого бот предлагает «разослать ПЗ
+    сообщение об уходе». Список обращений нужен ДЛЯ рассылки, но к этому
+    моменту ``admin_user_id`` в топиках уже обнулён — выбрать их снова
+    нечем. Поэтому «запоминание» делается здесь же, в одной транзакции с
+    освобождением: сначала складываем строки в ``admin_left_pz``, потом чистим
+    топики.
+
+    Что это чинит
+    -------------
+    Раньше ПЗ оставались в статусе ``assigned`` с уже удалённым админом:
+    * в «ПЗ без админа» они не попадали (статус не ``open``) — брать их было
+      некому, обращения висели вечно;
+    * напоминалка продолжала слать «#тег ПЗ без ответа» по тегу человека,
+      которого в списке админов уже нет.
+
+    Возвращает число освобождённых ПЗ (0 — освобождать было нечего).
+    """
+    topics = get_admin_active_topics_list(owner_id, admin_user_id)
+    if not topics:
+        return 0
+    conn = _get_conn()
+    with _lock:
+        for t in topics:
+            conn.execute(
+                "INSERT OR IGNORE INTO admin_left_pz "
+                "(owner_id, admin_user_id, bot_id, topic_id, group_chat_id, "
+                "user_chat_id, tag) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (owner_id, admin_user_id, int(t["bot_id"]), int(t["topic_id"]),
+                 int(t["group_chat_id"]), int(t["user_chat_id"]),
+                 str(t.get("admin_tag") or "")),
+            )
+            conn.execute(
+                "UPDATE feedback_topics SET admin_user_id = 0, admin_tag = '', "
+                "status = 'open', admin_assigned_at = NULL "
+                "WHERE bot_id = ? AND topic_id = ? AND group_chat_id = ?",
+                (int(t["bot_id"]), int(t["topic_id"]), int(t["group_chat_id"])),
+            )
+        conn.commit()
+    return len(topics)
+
+
+def get_admin_left_pz(owner_id: int, admin_user_id: int) -> list[dict]:
+    """ПЗ ушедшего админа, ждущие рассылки-оповещения."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM admin_left_pz WHERE owner_id = ? AND admin_user_id = ? "
+        "ORDER BY id",
+        (owner_id, admin_user_id),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_admin_left_pz(owner_id: int, admin_user_id: int) -> int:
+    """Сколько ПЗ осталось разослать по ушедшему админу."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM admin_left_pz WHERE owner_id = ? AND admin_user_id = ?",
+        (owner_id, admin_user_id),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def delete_admin_left_pz(owner_id: int, admin_user_id: int) -> int:
+    """Убирает записи ПЗ ушедшего админа (рассылка сделана или отменена).
+
+    Вызывается и после успешной рассылки, и после «не надо»: иначе таблица
+    росла бы, а при повторном удалении того же админа показывался бы СТАРЫЙ
+    список ПЗ. Возвращает число удалённых записей.
+    """
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "DELETE FROM admin_left_pz WHERE owner_id = ? AND admin_user_id = ?",
+            (owner_id, admin_user_id),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
 def is_registry_user_banned(user_id: int) -> bool:
     conn = _get_conn()
     row = conn.execute("SELECT blocked FROM users_registry WHERE user_id = ?", (user_id,)).fetchone()

@@ -56,7 +56,8 @@ from services.storage import (
     is_user_muted,
     save_banned_topic,
     get_banned_topic_user,
-    delete_banned_topic,
+    delete_banned_topics_for_user,
+    get_orphan_banned_topics,
     get_all_bots_flat,
     get_bot_by_id_any_owner,
     get_child_users,
@@ -87,6 +88,7 @@ from services.storage import (
     get_admin_greeting,
     bot_display_name,
     is_bot_anonymous,
+    is_bot_notify_enabled,
     get_bound_chat,
     get_user_bots,
     update_bot_field,
@@ -1379,6 +1381,17 @@ async def _notify_new_pz(bot_id: int, group_chat_id: int, topic_id: int,
     if not admin_chat:
         return
 
+    # Владелец мог выключить уведомления по этому боту («🔔 Мои уведомления»):
+    # чаще всего это боты поддержки и анкетницы, чьи ПЗ в «чате админов» не
+    # нужны. Проверяем ДО сборки текста — зачем готовить сообщение, если оно
+    # всё равно не уйдёт.
+    if not is_bot_notify_enabled(owner_id, bot_id, "notify_new_pz"):
+        logger.info(
+            "Уведомление о новом ПЗ бота %s не отправлено: выключено "
+            "владельцем в «Мои уведомления»", bot_id,
+        )
+        return
+
     bot_info = get_bot_by_id_any_owner(bot_id)
     bot_name = bot_display_name(bot_info) if bot_info else f"bot_{bot_id}"
     link = _topic_web_link(group_chat_id, topic_id)
@@ -2381,6 +2394,11 @@ async def _handle_user_blocked(bot: Bot, bot_id: int, user_chat_id: int) -> None
     reset_topic_admin(bot_id, t_id, g_id)
     # ПЗ пользователя, заблокировавшего бота, скрываем из списков ПЗ.
     delete_topic_record(bot_id, user_chat_id)
+    # …но маппинг «топик → юзер» ОБЯЗАТЕЛЬНО сохраняем. Раньше здесь его не
+    # было, и /unban в этом топике отвечал «Не удалось найти ПЗ для этого
+    # топика»: запись ПЗ удалена, а найти, кого разбанивать, было не по чему.
+    # Восстановить пользователя можно было только вручную по ID.
+    save_banned_topic(bot_id, user_chat_id, g_id, t_id)
 
     try:
         await bot.edit_forum_topic(chat_id=g_id, message_thread_id=t_id, name="🚫 забанил бота")
@@ -2922,6 +2940,20 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             user_chat_id = get_banned_topic_user(bot_id, group_chat_id, thread_id)
 
         if user_chat_id is None:
+            # Топик могли УДАЛИТЬ и создать новый — тогда topic_id другой и
+            # точный поиск по нему ничего не находит. Берём самый свежий
+            # «осиротевший» маппинг: иначе разбан этого человека был бы
+            # невозможен в принципе (кроме как вручную по ID).
+            orphans = get_orphan_banned_topics(bot_id)
+            if orphans:
+                user_chat_id = orphans[0]["user_chat_id"]
+                logger.info(
+                    "Разбан бота %s: топик %s не найден точно, беру "
+                    "последний забаненный %s",
+                    bot_id, thread_id, user_chat_id,
+                )
+
+        if user_chat_id is None:
             await message.answer("⚠️ Не удалось найти ПЗ для этого топика.")
             return
 
@@ -2931,8 +2963,11 @@ def _make_child_dp(bot_data: dict, bot_obj: Bot) -> Dispatcher:
             await message.answer("⚠️ Пользователь не найден в базе.")
             return
 
-        # Убираем флаг «забаненный топик» и восстанавливаем запись ПЗ.
-        delete_banned_topic(bot_id, group_chat_id, thread_id)
+        # Убираем ВСЕ маппинги «топик → юзер» этого человека и восстанавливаем ПЗ.
+        # Чистим по пользователю, а не по текущему топику: после пересоздания
+        # топика у него могло остаться несколько записей, и старые мешали бы
+        # разбану в следующий раз.
+        delete_banned_topics_for_user(bot_id, user_chat_id)
         create_topic_record(bot_id, user_chat_id, group_chat_id, thread_id)
 
         # Отправляем юзеру сообщение

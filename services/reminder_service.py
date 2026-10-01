@@ -52,6 +52,7 @@ from services.storage import (
     get_bound_chat,
     get_muted_topic_keys,
     get_norm_period_stats,
+    get_notify_settings_map,
     get_reminder_quiet,
     get_reminder_tick,
     get_reminders,
@@ -630,9 +631,19 @@ class ReminderService:
         cutoff = (now - timedelta(seconds=duration)).strftime(_DB_FMT)
         # Заглушки грузим ОДИН раз на этот проход, а не внутри цикла по ботам.
         muted = get_muted_topic_keys(owner_id)
+        # Настройки «Моих уведомлений» — тоже одним запросом на всех ботов.
+        bots_all = get_user_bots(owner_id)
+        notify_map = get_notify_settings_map(
+            owner_id, [int(b["id"]) for b in bots_all],
+        )
 
-        for b in get_user_bots(owner_id):
+        for b in bots_all:
             bot_name = bot_display_name(b) if b else f"bot_{b.get('id')}"
+            # Напоминания по этому боту выключены в «Мои уведомления» — молчим.
+            # Тик тоже НЕ пишем: иначе после включения обратно пришлось бы ждать
+            # полный срок, хотя владелец только что вернул уведомления.
+            if not notify_map.get(int(b["id"]), {}).get("notify_reminders", True):
+                continue
             # Только ПЗ без админа, где последним писал ПЗ. Раньше брались все
             # топики бота, и старые заброшенные ПЗ напоминались бесконечно.
             for t in get_topics_without_admin(b["id"], cutoff):
@@ -676,8 +687,17 @@ class ReminderService:
         cutoff = (now - timedelta(seconds=duration)).strftime(_DB_FMT)
         # Заглушки грузим ОДИН раз на этот проход.
         muted = get_muted_topic_keys(owner_id)
+        # Боты с выключенными напоминаниями пропускаем целиком (см. «Мои
+        # уведомления»): по ним не собираем ПЗ и не ставим тик, иначе после
+        # включения обратно пришлось бы ждать полный срок.
+        bots_all = get_user_bots(owner_id)
+        notify_map = get_notify_settings_map(
+            owner_id, [int(b["id"]) for b in bots_all],
+        )
 
-        for b in get_user_bots(owner_id):
+        for b in bots_all:
+            if not notify_map.get(int(b["id"]), {}).get("notify_reminders", True):
+                continue
             bot_name = bot_display_name(b) if b else f"bot_{b.get('id')}"
             for t in get_topics_waiting_admin(b["id"], cutoff):
                 if not t.get("admin_user_id"):
